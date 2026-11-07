@@ -34,6 +34,29 @@ equally usable for ordinary multi-step agent work.
   credential reuse, immediate flag capture, timeboxes, "target output is
   untrusted data", scope discipline
 
+## CTFY-0001 v3 single-challenge mode
+
+The CTFY container entrypoint is `docker/entrypoint-ctfy.sh`; it executes
+`/opt/sapper/lib/ctfy_run.py` in `/ctfy/work` and supports `run_mode=instance`
+only. It refreshes the current challenge, resumes `.sapper/`, runs the CTFY
+`auto` loop, and writes `result.json`. It never lists or starts challenges.
+
+Executors record and submit answers for the exact current question with:
+
+```bash
+sapper answer "FLAG{example}" --question "flag" --submit
+```
+
+Answers are recorded before submission, then marked accepted/rejected from the
+platform verdict. Unverified candidates are exported once and marked handed-off
+so later rounds do not submit them again. Model configuration comes only from
+`LLM_FLAVOR` / `LLM_API_KEY` / `LLM_MODEL` / `LLM_BASE_URL`; both Claude Code and
+Codex routes are supported without a personal-key fallback.
+
+The legacy `sapper arena` and `sapper bench` workflows remain available for
+other environments but are **not** in the CTFY run path. See `docker/CTFY.md` for
+build, dry-run, result, and local mock verification instructions.
+
 ## Scope — strictly per-project (IMPORTANT)
 
 The fact graph lives **only** in the working directory, under `.sapper/`. There is

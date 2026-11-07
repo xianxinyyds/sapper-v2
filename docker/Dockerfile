@@ -1,24 +1,13 @@
-# sapper agent image for TSecBench hosted mode ( Throne Protocol qualifier ).
+# sapper agent image for CTFY-0001 v3 single-challenge instance runs.
 #
-# Match rules (2026-10-17/18 online round):
-#   - ONE submission attempt, 8h task limit, 50 challenges / 100 flags
-#   - ranked by score, then elapsed time, then TOKEN USAGE
-#   - no hints; model rate-limits are NOT grounds for a retry
-#   - logs/trace are NOT viewable -> the image must fail loud, never hang
-#
-# Build:  docker build -f docker/Dockerfile -t sapper-agent:latest .
+# Build:  docker build -f docker/Dockerfile -t sapper-ctfy:latest .
 # Export: bash docker/build.sh          ->  dist/sapper-agent.tar.gz
 FROM kalilinux/kali-rolling:latest
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/home/agent/.local/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    SAPPER_MODEL=glm-5.3-flash[1m] \
-    SAPPER_TOTAL_MINUTES=470 \
-    SAPPER_MINUTES_PER_CHALLENGE=9 \
-    SAPPER_MAX_STEPS=10 \
-    SAPPER_RETRY_MODEL=3 \
-    SAPPER_ROOT=/work/runs
+    SAPPER_RETRY_MODEL=3
 
 # --- offensive tooling (kali repo, curated to stay < 3GB) -------------------
 # Pin a reliable mirror: the default http.kali.org redirect can land on
@@ -68,14 +57,20 @@ RUN unzip -o /tmp/nuclei.zip -d /usr/local/bin nuclei \
 # --- model CLI --------------------------------------------------------------
 # --allow-scripts: kali's npm blocks postinstall by default, but claude-code
 # ships a native binary that its postinstall (node install.cjs) must fetch.
-RUN npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code \
+RUN npm install -g --allow-scripts=@anthropic-ai/claude-code \
+        @anthropic-ai/claude-code @openai/codex \
     && claude --version \
+    && codex --version \
     && npm cache clean --force
 
 # --- python extras ----------------------------------------------------------
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip3 install --no-cache-dir --break-system-packages \
         requests pyjwt "unicorn==2.0.1.post1" pwntools \
-        pycryptodome sympy ROPgadget ropper
+        pycryptodome sympy ROPgadget
+# ropper's filebytes dependency still uses ast.Str, removed in Python 3.14.
+RUN pip3 install --no-cache-dir --break-system-packages ropper \
+        || echo "WARN: ropper unavailable — continuing without it"
 # heavy/compiled extras: failure here must not kill the build (kb mentions them
 # as optional; stdlib+sympy covers most crypto)
 RUN pip3 install --no-cache-dir --break-system-packages gmpy2 z3-solver \
@@ -91,14 +86,15 @@ COPY README.md LICENSE SKILL.md /opt/sapper/
 # Claude Code refuses --dangerously-skip-permissions as root; run unprivileged
 # with a writable HOME for the model CLI's state.
 RUN useradd -m -s /bin/bash agent \
-    && mkdir -p /home/agent/.local/bin /work/runs \
+    && mkdir -p /home/agent/.local/bin /ctfy/work \
     && ln -sf /opt/sapper/lib/sapper.py /home/agent/.local/bin/sapper \
     && chmod +x /opt/sapper/lib/sapper.py \
-    && chown -R agent:agent /work /opt/sapper /home/agent
+        /opt/sapper/lib/ctfy_run.py /opt/sapper/lib/codex_engine.py \
+    && chown -R agent:agent /ctfy/work /opt/sapper /home/agent
 
-COPY docker/entrypoint.sh /usr/local/bin/sapper-entrypoint
+COPY docker/entrypoint-ctfy.sh /usr/local/bin/sapper-entrypoint
 RUN chmod +x /usr/local/bin/sapper-entrypoint
 
 USER agent
-WORKDIR /work
+WORKDIR /ctfy/work
 ENTRYPOINT ["/usr/local/bin/sapper-entrypoint"]

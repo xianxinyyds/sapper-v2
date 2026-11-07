@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import sapper  # noqa: E402
+import ctfy  # noqa: E402
 
 SETTINGS_PATH = ROOT / "lib" / "_settings_patch.py"
 _spec = importlib.util.spec_from_file_location("settings_patch_for_tests", SETTINGS_PATH)
@@ -385,6 +387,199 @@ class FlagLedgerTests(unittest.TestCase):
         self.assertIn("flag(s)", text)
         self.assertIn("status=submitted", text)
         self.assertIn("challenge=c09", text)
+
+
+class CtfyAnswerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.store = sapper.Store(self.work / ".sapper")
+        self.store.init("ctfy:challenge-1", "Solve current CTFY questions")
+        self.task = self._write_task(["flag", "q2"])
+        self.challenge = {
+            "id": "challenge-1", "name": "Web", "description": "Solve it",
+            "questions": list(self.task["questions"]),
+            "my_solved_question_ids": [], "my_fully_solved": False,
+        }
+
+        test = self
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = []
+                self.calls = []
+                self.challenge_calls = []
+                self.observed_statuses = []
+
+            def submit_answer(self, instance_id, question_id, answer):
+                self.calls.append((instance_id, question_id, answer))
+                answers = [f for f in test.store.list_facts()
+                           if f.get("kind") == "flag" and (f.get("data") or {}).get("platform") == "ctfy"]
+                self.observed_statuses.append(answers[-1]["data"]["status"] if answers else None)
+                response = self.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+            def get_challenge(self, challenge_id):
+                self.challenge_calls.append(challenge_id)
+                return test.challenge
+
+        self.client = FakeClient()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_task(self, question_ids):
+        task = {
+            "schema_version": 3, "run_mode": "instance",
+            "challenge": {"id": "challenge-1", "name": "Web", "description": "Solve it"},
+            "questions": [{"id": qid, "prompt": f"Prompt {qid}"} for qid in question_ids],
+            "gated_questions": 0, "target_instance": "instance-1",
+            "target_endpoints": [{"label": "web", "type": "http", "url": "http://target:80"}],
+            "attachments": [], "scope": [], "rules_of_engagement": [],
+        }
+        (self.work / "task.json").write_text(json.dumps(task), encoding="utf-8")
+        return task
+
+    @staticmethod
+    def _reply(correct):
+        return {
+            "id": "submission-1", "correct": correct, "solve_time_s": 1.0,
+            "solve_rank": 1, "question_id": "flag", "challenge_fully_solved": correct,
+            "attempts_remaining": None, "ranked": True, "unranked_reason": "",
+        }
+
+    def _answer(self, value="FLAG{x}", question="flag", submit=True):
+        module = types.SimpleNamespace(
+            load_task=ctfy.load_task,
+            require_instance_task=ctfy.require_instance_task,
+            CtfyError=ctfy.CtfyError,
+            CtfyClient=types.SimpleNamespace(from_env=lambda: self.client),
+        )
+        args = types.SimpleNamespace(
+            store=str(self.store.root), value=value, question=question,
+            submit=submit, title=None, creator="test",
+        )
+        with mock.patch.object(sapper, "_load_ctfy_module", return_value=module, create=True), \
+                mock.patch.dict("os.environ", {
+                    "CTFY_WORK_DIR": str(self.work),
+                    "CTFY_EVAL_CHALLENGE_ID": "different-challenge",
+                    "CTFY_EVAL_TARGET_INSTANCE": "different-instance",
+                }, clear=True):
+            return sapper.cmd_answer(args)
+
+    def test_answer_records_before_submit_and_applies_verdict(self):
+        self.client.responses = [self._reply(True)]
+        self.assertEqual(self._answer(), 0)
+        self.assertEqual(self.client.observed_statuses, ["recorded"])
+        fact = [f for f in self.store.list_facts() if f.get("kind") == "flag"][0]
+        self.assertEqual(fact["data"]["status"], "accepted")
+        self.assertEqual(fact["data"]["question_id"], "flag")
+        self.assertTrue(json.loads(fact["data"]["result"])["correct"])
+        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+
+    def test_incorrect_answer_is_rejected(self):
+        self.client.responses = [self._reply(False)]
+        self.assertEqual(self._answer(), 1)
+        fact = [f for f in self.store.list_facts() if f.get("kind") == "flag"][0]
+        self.assertEqual(fact["data"]["status"], "rejected")
+        self.assertEqual(self.client.challenge_calls, [])
+
+    def test_transport_failure_keeps_recorded_answer(self):
+        self.client.responses = [ctfy.CtfyError("network unavailable")]
+        with self.assertRaisesRegex(sapper.FGError, "network unavailable"):
+            self._answer()
+        fact = [f for f in self.store.list_facts() if f.get("kind") == "flag"][0]
+        self.assertEqual(fact["data"]["status"], "recorded")
+
+    def test_answer_dedupe_key_includes_question(self):
+        self._answer(submit=False)
+        with self.assertRaisesRegex(sapper.FGError, "already recorded"):
+            self._answer(submit=False)
+        self._answer(question="q2", submit=False)
+        answers = [f for f in self.store.list_facts() if f.get("kind") == "flag"]
+        self.assertEqual(len(answers), 2)
+        self.assertEqual({f["data"]["question_id"] for f in answers}, {"flag", "q2"})
+
+    def test_scoped_identity_comes_from_task_not_environment(self):
+        self.client.responses = [self._reply(True)]
+        self._answer()
+        self.assertEqual(self.client.calls, [("instance-1", "flag", "FLAG{x}")])
+
+    def test_newly_unlocked_question_is_valid_against_old_task_snapshot(self):
+        self.store.add_fact(
+            "Question q3 unlocked", "test", kind="note",
+            data={"platform": "ctfy", "record_type": "question", "question_id": "q3"},
+        )
+        self._answer(question="q3", submit=False)
+        answers = [f for f in self.store.list_facts() if f.get("kind") == "flag"]
+        self.assertEqual(answers[0]["data"]["question_id"], "q3")
+
+    def test_sync_ctfy_facts_is_idempotent_and_supports_tcp(self):
+        self.task = self._write_task(["flag"])
+        self.task.update({
+            "target_endpoints": [{"label": "pwn", "type": "tcp", "url": "target:1337"}],
+            "attachments": [{"name": "crackme", "size": 10, "path": "/ctfy/work/attachments/crackme"}],
+            "scope": ["target:1337"], "rules_of_engagement": ["no brute force"],
+        })
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.challenge["questions"] = [{"id": "q3", "prompt": "Second stage"}]
+        self.challenge["my_solved_question_ids"] = ["flag"]
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        first_count = len(self.store.list_facts())
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        facts = self.store.list_facts()
+        self.assertEqual(len(facts), first_count)
+        service = next(f for f in facts if (f.get("data") or {}).get("record_type") == "endpoint")
+        self.assertEqual(service["kind"], "service")
+        self.assertEqual(service["data"]["proto"], "tcp")
+        self.assertEqual(service["data"]["host"], "target")
+        self.assertEqual(service["data"]["port"], "1337")
+        record_types = {(f.get("data") or {}).get("record_type") for f in facts}
+        self.assertTrue({"challenge", "endpoint", "attachment", "question", "scope", "rule"} <= record_types)
+        self.assertTrue(any((f.get("data") or {}).get("question_id") == "q3" for f in facts))
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["solved_question_ids"], ["flag"])
+        self.assertFalse(metadata["fully_solved"])
+
+    def test_correct_answer_refreshes_gated_questions(self):
+        self.challenge["questions"] = self.task["questions"] + [{"id": "q3", "prompt": "Unlocked"}]
+        self.challenge["my_solved_question_ids"] = ["flag"]
+        reply = self._reply(True)
+        reply["challenge_fully_solved"] = False
+        self.client.responses = [reply]
+        self.assertEqual(self._answer(), 0)
+        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+        self.assertTrue(any(
+            (f.get("data") or {}).get("record_type") == "question"
+            and (f.get("data") or {}).get("question_id") == "q3"
+            for f in self.store.list_facts()
+        ))
+        self.assertEqual(self.store.load_project()["ctfy"]["solved_question_ids"], ["flag"])
+
+    def test_ctfy_handoff_status_is_supported(self):
+        fact = self.store.add_fact(
+            "candidate", "test", kind="flag",
+            data={"platform": "ctfy", "value": "FLAG{x}", "status": "recorded"},
+        )
+        updated = self.store.update_flag_fact(fact["id"], "handed_off", None)
+        self.assertEqual(updated["data"]["status"], "handed_off")
+
+    def test_answer_parser_has_no_cross_challenge_overrides(self):
+        args = sapper.build_parser().parse_args([
+            "--store", str(self.store.root), "answer", "FLAG{x}",
+            "--question", "q2", "--submit",
+        ])
+        self.assertIs(args.func, sapper.cmd_answer)
+        self.assertEqual(args.question, "q2")
+        self.assertTrue(args.submit)
+        self.assertFalse(hasattr(args, "challenge"))
+        self.assertFalse(hasattr(args, "instance"))
+        with self.assertRaises(SystemExit):
+            sapper.build_parser().parse_args([
+                "answer", "FLAG{x}", "--question", "q2", "--challenge", "other",
+            ])
 
 
 class DeadlineTests(unittest.TestCase):
