@@ -1,5 +1,6 @@
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -358,6 +359,29 @@ class CtfyClientTests(unittest.TestCase):
             self.client.get_challenge("challenge-1")
         self.assertEqual(caught.exception.status, 403)
         self.assertEqual(caught.exception.code, "token_challenge_forbidden")
+        self.assertNotIn("tok-x", str(caught.exception))
+
+    def test_get_retries_transient_network_error(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            challenge_payload()
+        ).encode()
+        failure = ctfy.urllib.error.URLError(
+            ssl.SSLError("_ssl.c:1109: The handshake operation timed out")
+        )
+        with mock.patch("ctfy.urllib.request.urlopen", side_effect=[failure, response]) as urlopen, \
+                mock.patch("ctfy.time.sleep") as sleep:
+            challenge = self.client.get_challenge("challenge-1")
+        self.assertEqual(challenge["id"], "challenge-1")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_submission_network_error_is_not_retried(self):
+        failure = ctfy.urllib.error.URLError(TimeoutError("connection timed out"))
+        with mock.patch("ctfy.urllib.request.urlopen", side_effect=failure) as urlopen:
+            with self.assertRaises(ctfy.CtfyError) as caught:
+                self.client.submit_answer("i-1", "q1", "FLAG{x}")
+        self.assertEqual(urlopen.call_count, 1)
         self.assertNotIn("tok-x", str(caught.exception))
 
     def test_submission_is_not_retried(self):

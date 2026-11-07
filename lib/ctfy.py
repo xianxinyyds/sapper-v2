@@ -85,6 +85,9 @@ class CtfyClient:
                     status=exc.code, code=code if isinstance(code, str) else None,
                 ) from None
             except urllib.error.URLError as exc:
+                if retry and attempt + 1 < attempts:
+                    time.sleep(float(2 ** attempt))
+                    continue
                 raise CtfyError(f"CTFY {method} {path} failed: {exc.reason}") from exc
             if not raw.strip():
                 return {}
