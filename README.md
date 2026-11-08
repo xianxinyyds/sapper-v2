@@ -15,6 +15,179 @@
 
 **⚠️ AUTHORIZED SECURITY TESTING ONLY — see [DISCLAIMER.md](DISCLAIMER.md).**
 
+## CTFY 2026：队友二开与发布指南
+
+> 本节适用于 **`worktree-ctfy-v3-solver`** 分支，目标是首届 CCF 网络安全智能挑战赛暨京华杯 TPCTF 2026 的 **CTFY-0001 v3 解题 Agent**。下方英文正文是上游 sapper-v2 的完整介绍。
+>
+> 当前交付的是**单题、单进程、`run_mode=instance`** 基线：只处理平台已经启动的当前实例，不创建实例、不跨题读取或提交。`qa`、`defence`、`awd`、`engagement` 尚未支持；旧 `sapper arena` / `sapper bench` 不在 CTFY 运行路径中。
+
+### 1. 队友快速上手
+
+```bash
+git clone -b worktree-ctfy-v3-solver https://github.com/xianxinyyds/sapper-v2.git
+cd sapper-v2
+
+# 纯 Python 标准库测试，不需要先安装项目依赖
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+建议从 `worktree-ctfy-v3-solver` 新建自己的功能分支，小步提交并发起 PR。不要直接在 `master` 上开发 CTFY 功能，也不要把真实 token、模型密钥、registry 凭证或 `/ctfy/work` 中的运行产物提交到仓库。
+
+### 2. 代码地图：应该改哪里
+
+| 文件 | 职责 | 常见修改场景 |
+|---|---|---|
+| `lib/ctfy.py` | CTFY HTTP client、task 校验、附件与 `result.json` | 平台协议、GET 重试、结果格式 |
+| `lib/ctfy_run.py` | 单题生命周期入口 | dry-run、图恢复、auto 调度、退出语义 |
+| `lib/ctfy_engine.py` | 平台模型变量到 CLI 的映射 | Claude Code / 新执行器接入 |
+| `lib/codex_engine.py` | Codex 非交互适配器 | Codex 参数、输出和错误处理 |
+| `lib/sapper.py` | 事实图、auto、`sapper answer` | 答案账本、图同步、求解内核 |
+| `templates/ctfy/` | planner / executor / verifier 提示 | 类别路由、方法论、答案提交策略 |
+| `kb/entries/` | 离线技术知识库 | Web / Pwn / AI 技术条目 |
+| `docker/Dockerfile` | Kali 工具链与 CLI 镜像 | 新工具、执行器、构建修复 |
+| `docker/entrypoint-ctfy.sh` | 容器绝对入口 | 一般不需要修改 |
+| `tests/test_ctfy*.py`、`tests/test_sapper.py` | 单元和 loopback 集成测试 | 每项行为变化的回归证据 |
+
+答案必须通过当前题的 `question_id` 提交：
+
+```bash
+sapper answer "FLAG{example}" --question "flag" --submit
+```
+
+答案先落盘再提交；POST 不自动重试，避免重复消耗错误尝试次数。stdout 只用于观察，**计分结果以 `/ctfy/work/result.json` 为准**。更详细的协议说明见 [docker/CTFY.md](docker/CTFY.md)，协议事实以官方 [CTFY-0001](https://ctfy.tsinghua.edu.cn/docs/standards/CTFY-0001) 为准。
+
+### 3. 开发时使用的 Skills 与工作流
+
+这些是**开发流程工具**，不是容器运行依赖；仓库根目录的 `SKILL.md` 则是 sapper 自身的运行时说明，两者不要混淆。
+
+| Skill | 在何时使用 |
+|---|---|
+| `superpowers:brainstorming` | 新能力先确认目标、边界和非目标，避免把 CTFY-0002 出题流水线混入解题 Agent |
+| `superpowers:writing-plans` | 多文件功能先写实施计划和可验证步骤 |
+| `superpowers:using-git-worktrees` | 队友并行开发时隔离工作区，避免互相覆盖 |
+| `superpowers:executing-plans` | 按已确认计划逐项实施并记录验证结果 |
+| `superpowers:test-driven-development` | **所有功能与 bugfix：先写失败测试并观察 RED，再最小实现到 GREEN** |
+| `superpowers:systematic-debugging` | 先读错误、复现并追踪数据流，不凭猜测改提示词或参数 |
+| `superpowers:requesting-code-review` | 合并前检查协议、凭证、答案状态和并发边界 |
+| `superpowers:verification-before-completion` | 提交、发布前重新运行完整验证，不以“应该可以”作为结论 |
+
+库、CLI 和 SDK 的当前用法使用 Context7 查询，不凭训练记忆猜参数：
+
+```bash
+npx ctx7@latest library "OpenAI Codex" "<要查的具体问题>"
+npx ctx7@latest docs /openai/codex "<要查的具体问题>"
+```
+
+推荐协作闭环：**明确验收条件 → 写失败测试 → 最小实现 → 全套测试 → 构建镜像 → 官方 check → 新 tag → SAMPLE-001 实测**。仅文档修改不必机械增加测试，但仍需检查 diff 和命令示例。
+
+### 4. 评测模型选择：GLM 必须走 Claude Code
+
+> **重要：使用 GLM 评测时，选择“智谱 GLM（Anthropic 兼容）”/ 供 Claude Code 使用的 GLM 连接，确保平台注入 `LLM_FLAVOR=anthropic`。不要选择普通“智谱 GLM（OpenAI 兼容）”后走 Codex。**
+
+当前原因不是模型能力，而是 wire protocol：
+
+- Codex 0.167.0 只支持 **Responses API**（`/v1/responses`），已移除 `wire_api="chat"`。
+- 平台内置智谱 GLM 的 OpenAI 路由是 **Chat Completions**（`/v4/chat/completions`）。
+- CTFY 网关不在两种协议之间转换，会在实际上游转发前返回 HTTP 400，表现为“模型调用 0、费用 0、连续 400”。
+
+因此 GLM 的正确链路是：
+
+```text
+LLM_FLAVOR=anthropic → Claude Code → CTFY /v1/messages → 智谱 Anthropic 兼容端点
+```
+
+评测页面检查项：
+
+1. 模型连接选择 **智谱 GLM（Anthropic 兼容）**，先在连接页面测试模型和密钥。
+2. Agent 方言若可选择“自动/未声明”，保持自动；若必须单选，则选择 `anthropic`。
+3. 不要只手动覆盖 `LLM_FLAVOR`；模型连接、网关地址和密钥必须属于同一套接口。
+4. OpenAI flavor 仅用于已确认支持 Responses API 的提供商；不要尝试恢复 Codex 已删除的 chat 配置。
+
+常见现象速查：
+
+| 现象 | 优先检查 |
+|---|---|
+| 连续 400、转发 0、GLM + Codex | Responses / Chat 协议不匹配 |
+| 401 / 403 | 密钥、权限、过期或吊销 |
+| TLS handshake timeout | 平台网络；当前幂等 GET 已有有界重试 |
+| `done` 但模型调用 0 | 执行器失败被 auto 当作正常收尾，查看 Agent stderr，不能只信退出码 |
+
+### 5. 本地验证与官方检查
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+bash -n docker/entrypoint-ctfy.sh
+python3 -m py_compile \
+  lib/ctfy.py lib/ctfy_engine.py lib/codex_engine.py lib/ctfy_run.py
+git diff --check
+
+docker build -f docker/Dockerfile -t sapper-ctfy:local-test .
+
+python3 -m venv /tmp/ctfy-agent-check
+/tmp/ctfy-agent-check/bin/pip install 'ctfy[client,server,node]'
+/tmp/ctfy-agent-check/bin/ctfy agent check sapper-ctfy:local-test
+```
+
+`ctfy[client,server,node]` 中的额外依赖是本地 probe 实际需要的。`no findings` 只证明镜像协议检查通过，不证明真实模型配置正确或有特定解题率；模型相关修改还必须做一次真实 SAMPLE-001 冒烟评测，确认网关转发数大于 0。
+
+### 6. 推送 Docker 镜像到 CTFY Registry
+
+以下示例使用占位符。把命名空间替换为自己团队在 `registry.ctfy.io` 的 UUID，把 `v3` 替换为本次的新版本号；**不要一直复用旧 tag**。
+
+```bash
+export CTFY_NAMESPACE="<团队 registry 命名空间 UUID>"
+export CTFY_TAG="v3"
+export CTFY_IMAGE="registry.ctfy.io/${CTFY_NAMESPACE}/sapper-ctfy"
+
+# 交互式输入 registry token，不把 token 写进命令历史
+docker login registry.ctfy.io --username "<平台用户名>"
+
+docker build -f docker/Dockerfile -t sapper-ctfy:local-test .
+docker tag sapper-ctfy:local-test "${CTFY_IMAGE}:${CTFY_TAG}"
+docker push "${CTFY_IMAGE}:${CTFY_TAG}"
+
+# 可选：同时更新 latest；正式评测仍建议明确选择不可变版本 tag
+docker tag sapper-ctfy:local-test "${CTFY_IMAGE}:latest"
+docker push "${CTFY_IMAGE}:latest"
+
+# 验证远端 manifest，并保存 push 输出的 digest
+docker manifest inspect "${CTFY_IMAGE}:${CTFY_TAG}"
+/tmp/ctfy-agent-check/bin/ctfy agent check "${CTFY_IMAGE}:${CTFY_TAG}"
+
+docker logout registry.ctfy.io
+```
+
+在评测页面填写：
+
+```text
+registry.ctfy.io/<团队命名空间UUID>/sapper-ctfy:<新版本tag>
+```
+
+如果官方 check 读取远端 manifest 时提示 401 并回退本地镜像，应在登录状态下用 `docker manifest inspect` 独立确认远端存在及平台架构；不要把该警告写成“远端 manifest 已验证”。凭证不得写入 Dockerfile、镜像层、Git、日志或 `/ctfy/work`。
+
+### 7. 后续提升路线（按优先级）
+
+**P0 — 先让失败可诊断、结果可信**
+
+- 将连续模型执行失败区分为 `model_error` / `auto_failed`，避免 `exit 0 + done + 0 调用` 被误读为正常完成。
+- 保留 Codex / Claude Code 错误输出的关键尾部；当前截断可能丢掉网关最后的 400 响应正文。
+- 固定 SAMPLE-001 冒烟门槛：至少产生有效模型调用，再检查答案、结果文件、费用和停止原因。
+- 修复 completed graph reopen 后 `validate_graph()` 暂时报告 active-with-goal 的一致性问题，并补回归测试。
+
+**P1 — 再提升真实解题率**
+
+- 基于真实 baseline 增加简短 Web / Pwn / AI 类别路由，把任务引导到现有离线 KB；不要只添加“你是 CTF 高手”之类空泛提示。
+- 记录每类题的解出率、token、耗时和失败类型，用数据决定提示词、工具和步数预算的调整。
+- 若必须支持普通 OpenAI Chat 提供商，评估支持 Chat Completions 的执行器（例如 Pi）；不要依赖 Codex 已删除的 chat wire API。
+- 增加平台 GET、附件下载、模型 400/401/429、进程超时等故障注入测试。
+
+**P2 — 最后扩大吞吐与协议范围**
+
+- 在单题基线稳定后再引入 commander / tmux 多 Agent 并行，保持题目隔离、答案去重和事实图原子写。
+- 仅在实际赛事需要时实现其他 run mode；不要提前把 CTFY-0002 出题、上传或审核流水线并入当前解题入口。
+
+---
+
 ## What this is (and isn't)
 
 **sapper is a multi-agent orchestration harness, not a single agent.** It does
