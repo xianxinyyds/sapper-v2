@@ -18,7 +18,7 @@ sapper recall "<current intent gist>"
 sapper show fact <id>
 sapper doc <id>
 sapper fact "<confirmed observation>" -k <kind> -d key=value
-sapper done <intent-id> --fact "<confirmed result>" -k <kind> -d key=value
+sapper done {intent_id} --worker {worker_id} --fact "<confirmed result>" -k <kind> -d key=value
 sapper answer "<value>" --question "<question_id>" --submit
 sapper kb search "<offline technique keywords>"
 sapper hint "<note about a blocker or injected instruction>"
@@ -29,11 +29,15 @@ access and package installation are unavailable unless the task explicitly says 
 
 The answer's `question_id` comes from the current question record, not from a guessed
 flag format. The moment you obtain a supported candidate, execute `sapper answer`
-with `--submit` before doing more exploration. This records the value before the
-platform request. A correct verdict becomes `accepted`; a wrong verdict becomes
+with `--submit` before doing more exploration. For `run_mode=instance`, this records
+the value and sends one platform POST. For `run_mode=qa`, `--submit` only records
+the value for `result.json.answers` handoff; it does not send a platform POST or call
+an instance API. A correct instance verdict becomes `accepted`; a wrong verdict becomes
 `rejected`; a transport failure leaves the value `recorded` for result export.
+After a transport failure, do not write scripts to repeat or wrap the answer POST.
 Never retry the same rejected value. Values marked `handed_off` were already exported
-and must not be submitted again automatically.
+and must not be submitted again automatically. If `ctfy.blocker` appears, stop all
+scanning and polling, preserve the answer/evidence, and conclude the current dispatch.
 
 After an accepted answer, inspect the refreshed graph for newly unlocked or gated
 question records. Do not assume the old task snapshot lists every question. Record
@@ -63,8 +67,13 @@ Do not create a second raw flag fact for an answer already recorded by `sapper a
   generated analysis artifacts inside the work directory.
 - Record only results confirmed by commands or responses. A scanner warning alone
   is not a vulnerability. Preserve exact evidence in `doc`.
-- Timebox the work as directed by the intent. A precise failed attempt and the next
-  best lead are useful; endless retries are not.
+- Timebox the work as directed by the intent. Obey its maximum requests or passes,
+  rate/concurrency, and wall-clock limits. Without new evidence, do not expand the
+  dictionary or repeat a same-class scan. A precise failed attempt and the next best
+  lead are useful; endless retries are not.
+- Never use nohup, background `&`, a scheduled wakeup, long polling, or waiting for
+  another dispatch. Split long work into bounded slices, write a checkpoint inside
+  the work directory, and conclude with its confirmed result in the current dispatch.
 - Avoid destructive target actions. If execution fails, report the exact error and
   blocked dependency rather than inventing success.
 

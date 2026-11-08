@@ -87,21 +87,38 @@ def prepare_graph(work_dir: Path, task: dict,
             raise sapper.FGError("fact graph belongs to a different CTFY challenge")
     else:
         store.init(origin, f"Solve CTFY challenge {challenge_id}")
+    with store.locked():
+        project = store.load_project()
+        metadata = project.get("ctfy") or {}
+        if metadata.pop("blocker", None) is not None:
+            store.save_project(project)
     sapper.sync_ctfy_facts(store, task, challenge)
     return store
 
 
+def _positive_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ctfy.CtfyError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ctfy.CtfyError(f"{name} must be a positive integer")
+    return value
+
+
 def _max_steps(task: dict) -> int:
     configured = task.get("max_turns")
-    if type(configured) is int and configured > 0:
-        return configured
-    try:
-        steps = int(os.environ.get("SAPPER_MAX_STEPS", "8"))
-    except ValueError as exc:
-        raise ctfy.CtfyError("SAPPER_MAX_STEPS must be a positive integer") from exc
-    if steps < 1:
-        raise ctfy.CtfyError("SAPPER_MAX_STEPS must be a positive integer")
-    return steps
+    if type(configured) is not int or configured < 1:
+        configured = _positive_env("CTFY_EVAL_MAX_TURNS")
+    if configured is None:
+        configured = 8
+    safety_cap = _positive_env("SAPPER_MAX_STEPS")
+    if safety_cap is not None:
+        configured = min(configured, safety_cap)
+    return configured
 
 
 def run(work_dir: Path) -> int:
@@ -113,18 +130,32 @@ def run(work_dir: Path) -> int:
         _write_empty_result(work_dir, "dry_run")
         return 0
     try:
-        ctfy.require_instance_task(task)
+        ctfy.require_task(task)
     except ctfy.CtfyError as exc:
-        reason = "unsupported_run_mode" if task.get("run_mode") != "instance" else "config_error"
+        reason = "unsupported_run_mode" if task.get("run_mode") not in {"instance", "qa"} else "config_error"
         return _fail(work_dir, reason, exc)
     try:
         client = ctfy.CtfyClient.from_env()
         challenge = client.get_challenge(task["challenge"]["id"])
     except ctfy.CtfyError as exc:
+        store = sapper.Store(work_dir / ".sapper")
+        try:
+            if store.exists() and store.load_project().get("origin") \
+                    == f"ctfy:{task['challenge']['id']}":
+                return _fail(work_dir, "config_error", exc, store)
+        except sapper.FGError:
+            pass
         return _fail(work_dir, "config_error", exc)
     try:
         store = prepare_graph(work_dir, task, challenge)
     except (ctfy.CtfyError, sapper.FGError) as exc:
+        candidate_store = sapper.Store(work_dir / ".sapper")
+        try:
+            if candidate_store.exists() and candidate_store.load_project().get("origin") \
+                    == f"ctfy:{task['challenge']['id']}":
+                return _fail(work_dir, "config_error", exc, candidate_store)
+        except sapper.FGError:
+            pass
         return _fail(work_dir, "config_error", exc)
     try:
         if store.load_project()["status"] == "completed" \
@@ -132,19 +163,43 @@ def run(work_dir: Path) -> int:
             store.reopen_project()
         model = configure_model()
         max_steps = _max_steps(task)
+        max_explore = _positive_env("SAPPER_MAX_EXPLORE") or max_steps
+        round_minutes = _positive_env("SAPPER_ROUND_MINUTES")
         ctfy.ensure_attachments(task, client, work_dir)
     except (ctfy.CtfyError, sapper.FGError) as exc:
         return _fail(work_dir, "config_error", exc, store)
 
-    return_code = sapper.main([
+    auto_args = [
         "--store", str(store.root), "auto",
         "--model", model,
         "--templates", str(Path(__file__).resolve().parent.parent / "templates" / "ctfy"),
         "--skip-permissions",
         "--max-steps", str(max_steps),
-        "--max-explore", str(min(6, max_steps)),
-    ])
-    stop_reason = "done" if return_code == 0 else "auto_failed"
+        "--max-explore", str(max_explore),
+    ]
+    if round_minutes is not None:
+        auto_args += ["--minutes", str(round_minutes)]
+    return_code = sapper.main(auto_args)
+    answers, _, _ = collect_ledger(store)
+    project = store.load_project()
+    outcome = project.get("last_auto")
+    outcome_reason = outcome.get("reason") if isinstance(outcome, dict) else None
+    if outcome_reason in {"model_error", "explore_failed"}:
+        stop_reason = outcome_reason
+    elif return_code != 0:
+        stop_reason = "auto_failed"
+    elif project.get("status") == "completed" \
+            or (project.get("ctfy") or {}).get("fully_solved") is True \
+            or outcome_reason == "completed":
+        stop_reason = "done"
+    elif outcome_reason == "blocker":
+        stop_reason = "blocked_by_infra"
+    elif task["run_mode"] == "qa" and answers:
+        stop_reason = "answers_handed_off"
+    elif isinstance(outcome_reason, str) and outcome_reason != "running":
+        stop_reason = outcome_reason
+    else:
+        stop_reason = "incomplete"
     try:
         finalize_result(work_dir, store, stop_reason)
     except (ctfy.CtfyError, sapper.FGError) as exc:

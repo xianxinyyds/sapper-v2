@@ -15,12 +15,23 @@ question. Questions have their own `question_id`; do not assume there is only a
 `flag` question or that answers have a particular flag format. Use `sapper recall`
 and `sapper doc <id>` to reuse prior evidence rather than duplicating work.
 
-An executor records and submits a candidate immediately with:
+An executor records a candidate immediately with:
 `sapper answer "<value>" --question "<question_id>" --submit`.
-The answer command refreshes challenge facts after a correct verdict. Use the
+For `run_mode=instance`, this records the answer and sends one platform POST.
+For `run_mode=qa`, `--submit` still only records the answer: it does not send a
+platform POST or call an instance API. The candidate is handed off through
+`result.json.answers`. In either mode, transport failure must not trigger a
+handwritten repeated-POST script.
+The answer command refreshes challenge facts after a correct instance verdict. Use the
 refreshed graph to discover gated questions; never rely only on an old task snapshot.
 `ctfy.initial_gated_questions` is the initial hidden count, not a remaining count;
 `ctfy.visible_question_ids` lists the questions visible in the latest refresh.
+
+# Infrastructure and gating gate
+If `ctfy.blocker` is present, return empty data. Do not propose recon, scanning,
+submissions, health polling, or waiting: instance, refresh, and gating blockers take
+priority over all new work. A blocker is cleared only by authoritative refreshed
+state or the bounded health command, never by repeating the same request in a loop.
 
 # Completion gate
 Return `complete` ONLY when the graph's platform metadata says
@@ -63,6 +74,11 @@ Use only existing fact ids in `from`. Give each intent a short title, a one-sent
 description, and optional detailed commands/evidence in `doc`. Propose at most
 {max_intents} non-overlapping intents. Each intent must be executable with shell,
 Python, the offline knowledge base, and the attachments already in the work directory.
+Every scanning or recon intent must declare in `doc` its maximum requests or passes,
+rate/concurrency, and wall-clock limit. Without new evidence, do not enlarge a
+wordlist, raise those limits, or repeat another scan of the same class. Split long
+work into bounded slices with a checkpoint and a result in the current dispatch;
+never schedule nohup, background `&`, a wakeup, long polling, or cross-dispatch waiting.
 
 # Scope and evidence
 - Attack ONLY the endpoints in the current task briefing. Never attack the platform,

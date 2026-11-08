@@ -19,7 +19,7 @@
 
 > 本节适用于 **`worktree-ctfy-v3-solver`** 分支，目标是首届 CCF 网络安全智能挑战赛暨京华杯 TPCTF 2026 的 **CTFY-0001 v3 解题 Agent**。下方英文正文是上游 sapper-v2 的完整介绍。
 >
-> 当前交付的是**单题、单进程、`run_mode=instance`** 基线：只处理平台已经启动的当前实例，不创建实例、不跨题读取或提交。`qa`、`defence`、`awd`、`engagement` 尚未支持；旧 `sapper arena` / `sapper bench` 不在 CTFY 运行路径中。
+> 当前交付的是**单题、单进程、`run_mode=instance` / `run_mode=qa`** 基线：instance 只处理平台已经启动的当前实例；QA 使用题目描述、问题和本地附件，候选答案通过 `result.json.answers` 移交，禁止 instance API 与 submission POST。两种模式都不创建实例、不跨题读取或提交；`defence`、`awd`、`engagement` 尚未支持，旧 `sapper arena` / `sapper bench` 不在 CTFY 运行路径中。
 
 ### 1. 队友快速上手
 
@@ -54,7 +54,9 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 sapper answer "FLAG{example}" --question "flag" --submit
 ```
 
-答案先落盘再提交；POST 不自动重试，避免重复消耗错误尝试次数。stdout 只用于观察，**计分结果以 `/ctfy/work/result.json` 为准**。更详细的协议说明见 [docker/CTFY.md](docker/CTFY.md)，协议事实以官方 [CTFY-0001](https://ctfy.tsinghua.edu.cn/docs/standards/CTFY-0001) 为准。
+答案先落盘；instance 的 `--submit` 只发送一次 POST，不自动重试，避免重复消耗错误尝试次数。QA 的同一命令只记录候选供 result handoff，不发送平台 POST。`task.max_turns` / `CTFY_EVAL_MAX_TURNS` 控制 turn 预算，`SAPPER_MAX_STEPS` 是更低安全上限，`SAPPER_ROUND_MINUTES` 才表示 wall-clock 时间。`done` 只用于实际完成；未解出、模型失败、QA handoff 和 `blocked_by_infra` 都有不同停止原因。
+
+引擎按角色限制重试，并通过独立 process group 回收子进程；主动 daemonize 的进程不保证回收，执行器不得依赖 nohup、后台任务或长轮询。stdout 只用于观察，**计分结果以 `/ctfy/work/result.json` 为准**。详细协议、预算和停止语义见 [docker/CTFY.md](docker/CTFY.md) 与 [docker/ENV.md](docker/ENV.md)，协议事实以官方 [CTFY-0001](https://ctfy.tsinghua.edu.cn/docs/standards/CTFY-0001) 为准。
 
 ### 3. 开发时使用的 Skills 与工作流
 
@@ -110,7 +112,7 @@ LLM_FLAVOR=anthropic → Claude Code → CTFY /v1/messages → 智谱 Anthropic 
 | 连续 400、转发 0、GLM + Codex | Responses / Chat 协议不匹配 |
 | 401 / 403 | 密钥、权限、过期或吊销 |
 | TLS handshake timeout | 平台网络；当前幂等 GET 已有有界重试 |
-| `done` 但模型调用 0 | 执行器失败被 auto 当作正常收尾，查看 Agent stderr，不能只信退出码 |
+| `done` 但模型调用 0 | 检查图或平台是否确实完成；普通空跑应为 `incomplete`，模型/执行器故障应为 `model_error` / `explore_failed` / `auto_failed`，不能只信退出码 |
 
 ### 5. 本地验证与官方检查
 
@@ -169,7 +171,7 @@ registry.ctfy.io/<团队命名空间UUID>/sapper-ctfy:<新版本tag>
 
 **P0 — 先让失败可诊断、结果可信**
 
-- 将连续模型执行失败区分为 `model_error` / `auto_failed`，避免 `exit 0 + done + 0 调用` 被误读为正常完成。
+- 持续审计 `model_error` / `explore_failed` / `auto_failed` 与 `blocked_by_infra` 的真实评测分布，避免把 `exit 0` 或普通 `incomplete` 误读为完成。
 - 保留 Codex / Claude Code 错误输出的关键尾部；当前截断可能丢掉网关最后的 400 响应正文。
 - 固定 SAMPLE-001 冒烟门槛：至少产生有效模型调用，再检查答案、结果文件、费用和停止原因。
 - 修复 completed graph reopen 后 `validate_graph()` 暂时报告 active-with-goal 的一致性问题，并补回归测试。

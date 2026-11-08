@@ -2,9 +2,9 @@
 """CTFY-0001 v3 protocol helpers for the hosted single-challenge runner."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
-import shutil
 import tempfile
 import time
 import urllib.error
@@ -84,11 +84,12 @@ class CtfyClient:
                     f"CTFY {method} {path} -> HTTP {exc.code}: {message}",
                     status=exc.code, code=code if isinstance(code, str) else None,
                 ) from None
-            except urllib.error.URLError as exc:
+            except (OSError, http.client.HTTPException) as exc:
                 if retry and attempt + 1 < attempts:
                     time.sleep(float(2 ** attempt))
                     continue
-                raise CtfyError(f"CTFY {method} {path} failed: {exc.reason}") from exc
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                raise CtfyError(f"CTFY {method} {path} failed: {reason}") from exc
             if not raw.strip():
                 return {}
             try:
@@ -104,6 +105,13 @@ class CtfyClient:
             raise CtfyError("CTFY challenge response must be an object")
         if not isinstance(result.get("questions"), list):
             raise CtfyError("CTFY challenge response questions must be a list")
+        return result
+
+    def get_instance(self, instance_id: str) -> dict:
+        segment = self._segment(instance_id, "instance_id")
+        result = self._request("GET", f"/api/v1/instances/{segment}")
+        if not isinstance(result, dict):
+            raise CtfyError("CTFY instance response must be an object")
         return result
 
     @staticmethod
@@ -122,10 +130,36 @@ class CtfyClient:
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/octet-stream"},
             method="GET",
         )
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise CtfyError(f"cannot write CTFY attachment {destination}: {exc}") from exc
         for attempt in range(3):
+            temporary = None
             try:
-                response = urllib.request.urlopen(req, timeout=self.timeout)
-                break
+                try:
+                    response = urllib.request.urlopen(req, timeout=self.timeout)
+                except urllib.error.HTTPError:
+                    raise
+                except (OSError, http.client.HTTPException) as exc:
+                    raise urllib.error.URLError(exc) from exc
+                with response, tempfile.NamedTemporaryFile(
+                        mode="wb", dir=destination.parent,
+                        prefix=".attachment-", suffix=".tmp", delete=False,
+                        ) as fh:
+                    temporary = Path(fh.name)
+                    while True:
+                        try:
+                            chunk = response.read(1024 * 1024)
+                        except (OSError, http.client.HTTPException) as exc:
+                            raise urllib.error.URLError(exc) from exc
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temporary, destination)
+                return
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")[:2000]
                 if exc.code in {429, 502, 503, 504} and attempt < 2:
@@ -149,24 +183,18 @@ class CtfyClient:
                     f"CTFY GET {path} -> HTTP {exc.code}: {message}",
                     status=exc.code, code=code if isinstance(code, str) else None,
                 ) from None
-            except urllib.error.URLError as exc:
-                raise CtfyError(f"CTFY GET {path} failed: {exc.reason}") from exc
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with response, tempfile.NamedTemporaryFile(
-                mode="wb", dir=destination.parent,
-                prefix=".attachment-", suffix=".tmp", delete=False,
-            ) as fh:
-                temporary = Path(fh.name)
-                shutil.copyfileobj(response, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(temporary, destination)
-        except OSError as exc:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-            raise CtfyError(f"cannot write CTFY attachment {destination}: {exc}") from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                if attempt < 2:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                raise CtfyError(f"CTFY GET {path} failed: {reason}") from exc
+            except OSError as exc:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                raise CtfyError(f"cannot write CTFY attachment {destination}: {exc}") from exc
 
     def submit_answer(self, instance_id: str, question_id: str, answer: str) -> dict:
         self._segment(instance_id, "instance_id")
@@ -191,6 +219,8 @@ def ensure_attachments(task: dict, client: CtfyClient, work_dir: Path) -> None:
         if not isinstance(attachment, dict):
             raise CtfyError("CTFY attachment entry must be an object")
         if attachment.get("path") is not None:
+            if task.get("run_mode") == "qa" and not Path(attachment["path"]).is_file():
+                raise CtfyError(f"CTFY QA attachment is not a local file: {attachment['path']}")
             continue
         name = client._attachment_name(attachment.get("name"))
         pending.append(name)
@@ -213,20 +243,41 @@ def load_task(work_dir: Path) -> dict:
     return task
 
 
-def require_instance_task(task: dict) -> None:
-    if task.get("run_mode") != "instance":
-        raise CtfyError(f"unsupported CTFY run_mode {task.get('run_mode')!r}; expected 'instance'")
+def require_task(task: dict) -> None:
+    mode = task.get("run_mode")
+    if mode not in {"instance", "qa"}:
+        raise CtfyError(
+            f"unsupported CTFY run_mode {mode!r}; expected 'instance' or 'qa'"
+        )
+    label = f"CTFY {mode} task"
     challenge = task.get("challenge")
     if not isinstance(challenge, dict) or not isinstance(challenge.get("id"), str) \
             or not challenge["id"].strip():
-        raise CtfyError("CTFY instance task requires challenge.id")
-    if not isinstance(task.get("target_instance"), str) or not task["target_instance"].strip():
+        raise CtfyError(f"{label} requires challenge.id")
+    if mode == "instance" and (
+            not isinstance(task.get("target_instance"), str)
+            or not task["target_instance"].strip()):
         raise CtfyError("CTFY instance task requires target_instance")
+    if mode == "qa" and task.get("target_instance") is not None:
+        raise CtfyError("CTFY QA task requires target_instance=null")
     if not isinstance(task.get("questions"), list):
-        raise CtfyError("CTFY instance task requires a questions list")
+        raise CtfyError(f"{label} requires a questions list")
     for field in ("target_endpoints", "attachments", "scope", "rules_of_engagement"):
         if not isinstance(task.get(field, []), list):
-            raise CtfyError(f"CTFY instance task {field} must be a list")
+            raise CtfyError(f"{label} {field} must be a list")
+    if mode == "qa":
+        for attachment in task.get("attachments", []):
+            if not isinstance(attachment, dict):
+                raise CtfyError("CTFY attachment entry must be an object")
+            path = attachment.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise CtfyError("CTFY QA attachments require local path values")
+
+
+def require_instance_task(task: dict) -> None:
+    if task.get("run_mode") != "instance":
+        raise CtfyError(f"unsupported CTFY run_mode {task.get('run_mode')!r}; expected 'instance'")
+    require_task(task)
 
 
 def write_result(work_dir: Path, *, answers: dict[str, str], solved: list[str],

@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import ssl
@@ -78,6 +79,14 @@ class LocalPlatform:
                     "authorization": self.headers.get("Authorization"), "body": body,
                 })
                 status, payload, headers = owner.responses.pop(0)
+                if status == "truncated":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(payload) + 100))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 data = json.dumps(payload).encode() if isinstance(payload, (dict, list)) else payload
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(data)))
@@ -130,6 +139,31 @@ class CtfyTaskTests(unittest.TestCase):
                     (work / "task.json").write_text(json.dumps(task), encoding="utf-8")
                     with self.assertRaises(ctfy.CtfyError):
                         ctfy.require_instance_task(ctfy.load_task(work))
+
+    def test_require_task_accepts_qa_with_local_attachments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            local = work / "attachments" / "notes.txt"
+            local.parent.mkdir()
+            local.write_text("clue", encoding="utf-8")
+            valid = instance_task(
+                run_mode="qa", target_instance=None, target_endpoints=[],
+                attachments=[{"name": "notes.txt", "size": 4, "path": str(local)}],
+            )
+            ctfy.require_task(valid)
+
+            invalid = [
+                instance_task(run_mode="qa", target_instance="instance-1"),
+                instance_task(
+                    run_mode="qa", target_instance=None,
+                    attachments=[{"name": "remote.bin", "size": 4, "path": None}],
+                ),
+                instance_task(run_mode="unknown", target_instance=None),
+            ]
+            for task in invalid:
+                with self.subTest(run_mode=task["run_mode"], target=task["target_instance"]), \
+                        self.assertRaises(ctfy.CtfyError):
+                    ctfy.require_task(task)
 
     def test_write_result_is_atomic_and_versioned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,6 +364,15 @@ class CtfyClientTests(unittest.TestCase):
         self.env.stop()
         self.platform.close()
 
+    def test_get_instance_uses_documented_single_get(self):
+        self.platform.queue(200, {"id": "instance-1", "status": "running"})
+        instance = self.client.get_instance("instance-1")
+        self.assertEqual(instance["status"], "running")
+        self.assertEqual(self.platform.seen, [{
+            "method": "GET", "path": "/api/v1/instances/instance-1",
+            "authorization": "Bearer tok-x", "body": None,
+        }])
+
     def test_submission_contract_and_verdict(self):
         self.platform.queue(200, submission_payload(True))
         self.platform.queue(200, submission_payload(False))
@@ -376,6 +419,73 @@ class CtfyClientTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1.0)
 
+    def test_get_retries_direct_response_read_timeout(self):
+        failed = mock.MagicMock()
+        failed.__enter__.return_value.read.side_effect = TimeoutError("read timed out")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            challenge_payload()
+        ).encode()
+        with mock.patch("ctfy.urllib.request.urlopen", side_effect=[failed, response]) as urlopen, \
+                mock.patch("ctfy.time.sleep") as sleep:
+            challenge = self.client.get_challenge("challenge-1")
+        self.assertEqual(challenge["id"], "challenge-1")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_get_retries_response_read_network_errors(self):
+        for error in (
+            ConnectionResetError("connection reset"),
+            http.client.IncompleteRead(b'{"id":', 100),
+        ):
+            with self.subTest(error=type(error).__name__):
+                failed = mock.MagicMock()
+                failed.__enter__.return_value.read.side_effect = error
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = json.dumps(
+                    challenge_payload()
+                ).encode()
+                with mock.patch(
+                    "ctfy.urllib.request.urlopen", side_effect=[failed, response]
+                ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+                    challenge = self.client.get_challenge("challenge-1")
+                self.assertEqual(challenge["id"], "challenge-1")
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_called_once_with(1.0)
+
+    def test_get_direct_timeout_exhaustion_is_sanitized(self):
+        with mock.patch(
+            "ctfy.urllib.request.urlopen", side_effect=TimeoutError("read timed out")
+        ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+            with self.assertRaises(ctfy.CtfyError) as caught:
+                self.client.get_challenge("challenge-1")
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+        self.assertNotIn("tok-x", str(caught.exception))
+
+    def test_submission_direct_timeout_is_single_attempt(self):
+        with mock.patch(
+            "ctfy.urllib.request.urlopen", side_effect=TimeoutError("read timed out")
+        ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+            with self.assertRaises(ctfy.CtfyError) as caught:
+                self.client.submit_answer("i-1", "q1", "FLAG{x}")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+        self.assertNotIn("tok-x", str(caught.exception))
+
+    def test_submission_response_read_network_errors_are_single_attempt(self):
+        for error in (
+            ConnectionResetError("connection reset"),
+            http.client.IncompleteRead(b"partial", 100),
+        ):
+            with self.subTest(error=type(error).__name__), mock.patch(
+                "ctfy.urllib.request.urlopen", side_effect=error
+            ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+                with self.assertRaises(ctfy.CtfyError):
+                    self.client.submit_answer("i-1", "q1", "FLAG{x}")
+                self.assertEqual(urlopen.call_count, 1)
+                sleep.assert_not_called()
+
     def test_submission_network_error_is_not_retried(self):
         failure = ctfy.urllib.error.URLError(TimeoutError("connection timed out"))
         with mock.patch("ctfy.urllib.request.urlopen", side_effect=failure) as urlopen:
@@ -411,6 +521,95 @@ class CtfyClientTests(unittest.TestCase):
             )
             self.assertEqual(self.platform.seen[0]["authorization"], "Bearer tok-x")
             self.assertEqual(list(work.glob("attachments/.attachment-*.tmp")), [])
+
+    def test_qa_attachment_must_exist_locally_without_instance_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            task = instance_task(
+                run_mode="qa", target_instance=None, target_endpoints=[],
+                attachments=[{
+                    "name": "missing.txt", "size": 4,
+                    "path": str(work / "attachments" / "missing.txt"),
+                }],
+            )
+            with mock.patch.object(self.client, "download_attachment") as download, \
+                    self.assertRaises(ctfy.CtfyError):
+                ctfy.ensure_attachments(task, self.client, work)
+            download.assert_not_called()
+            self.assertEqual(self.platform.seen, [])
+
+    def test_attachment_open_direct_timeout_is_retried(self):
+        response = mock.MagicMock()
+        response.read.side_effect = [b"data", b""]
+        response.__enter__.return_value = response
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "ctfy.urllib.request.urlopen",
+            side_effect=[TimeoutError("open timed out"), response],
+        ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+            destination = Path(tmp) / "attachments" / "dump.bin"
+            self.client.download_attachment("instance-1", "dump.bin", destination)
+            self.assertEqual(destination.read_bytes(), b"data")
+            self.assertEqual(list(destination.parent.glob(".attachment-*.tmp")), [])
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_attachment_read_direct_timeout_retries_atomically(self):
+        failed = mock.MagicMock()
+        failed.read.side_effect = TimeoutError("read timed out")
+        failed.__enter__.return_value = failed
+        response = mock.MagicMock()
+        response.read.side_effect = [b"new", b""]
+        response.__enter__.return_value = response
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "ctfy.urllib.request.urlopen", side_effect=[failed, response]
+        ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+            destination = Path(tmp) / "attachments" / "dump.bin"
+            destination.parent.mkdir()
+            destination.write_bytes(b"old")
+            self.client.download_attachment("instance-1", "dump.bin", destination)
+            self.assertEqual(destination.read_bytes(), b"new")
+            self.assertEqual(list(destination.parent.glob(".attachment-*.tmp")), [])
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_attachment_read_network_errors_retry_atomically(self):
+        for error in (
+            ConnectionResetError("connection reset"),
+            http.client.IncompleteRead(b"old", 100),
+        ):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                failed = mock.MagicMock()
+                failed.read.side_effect = error
+                failed.__enter__.return_value = failed
+                response = mock.MagicMock()
+                response.read.side_effect = [b"new", b""]
+                response.__enter__.return_value = response
+                destination = Path(tmp) / "attachments" / "dump.bin"
+                destination.parent.mkdir()
+                destination.write_bytes(b"old")
+                with mock.patch(
+                    "ctfy.urllib.request.urlopen", side_effect=[failed, response]
+                ) as urlopen, mock.patch("ctfy.time.sleep") as sleep:
+                    self.client.download_attachment("instance-1", "dump.bin", destination)
+                self.assertEqual(destination.read_bytes(), b"new")
+                self.assertEqual(list(destination.parent.glob(".attachment-*.tmp")), [])
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_called_once_with(1.0)
+
+    def test_attachment_filesystem_error_is_not_retried(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "ctfy.urllib.request.urlopen", return_value=response
+        ) as urlopen, mock.patch(
+            "ctfy.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")
+        ), mock.patch("ctfy.time.sleep") as sleep:
+            destination = Path(tmp) / "attachments" / "dump.bin"
+            destination.parent.mkdir()
+            with self.assertRaisesRegex(ctfy.CtfyError, "cannot write"):
+                self.client.download_attachment("instance-1", "dump.bin", destination)
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_attachment_name_cannot_escape_work_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

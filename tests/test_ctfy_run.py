@@ -62,7 +62,7 @@ class CtfyDryRunTests(unittest.TestCase):
     def test_invalid_task_and_unsupported_mode_fail_cleanly(self):
         cases = [
             ({"schema_version": 2, "run_mode": "instance"}, "config_error"),
-            ({"schema_version": 3, "run_mode": "qa", "questions": []}, "unsupported_run_mode"),
+            ({"schema_version": 3, "run_mode": "unknown", "questions": []}, "unsupported_run_mode"),
         ]
         for task, reason in cases:
             with self.subTest(reason=reason):
@@ -177,7 +177,7 @@ class CtfyRunTests(unittest.TestCase):
         self.assertEqual(store.load_project()["origin"], "ctfy:challenge-1")
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["answers"], {})
-        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(result["stop_reason"], "incomplete")
 
     def test_default_steps_and_auto_failure_still_write_result(self):
         self.task["max_turns"] = None
@@ -188,10 +188,84 @@ class CtfyRunTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         argv = auto.call_args.args[0]
         self.assertEqual(argv[argv.index("--max-steps") + 1], "8")
-        self.assertEqual(argv[argv.index("--max-explore") + 1], "6")
+        self.assertEqual(argv[argv.index("--max-explore") + 1], "8")
         self.assertNotIn("--verify", argv)
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["stop_reason"], "auto_failed")
+
+    def test_platform_budget_safety_cap_and_round_minutes(self):
+        cases = [
+            (9, {"CTFY_EVAL_MAX_TURNS": "12", "SAPPER_MAX_STEPS": "5"}, 5),
+            (None, {"CTFY_EVAL_MAX_TURNS": "12"}, 12),
+            (None, {"CTFY_EVAL_MAX_TURNS": "12", "SAPPER_MAX_STEPS": "5"}, 5),
+            (None, {}, 8),
+        ]
+        for configured, environ, expected in cases:
+            with self.subTest(configured=configured, environ=environ), \
+                    mock.patch.dict("os.environ", environ, clear=True):
+                self.assertEqual(
+                    ctfy_run._max_steps(instance_task(max_turns=configured)), expected,
+                )
+
+        self.task["max_turns"] = None
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        rc, _, _, auto = self.run_with_mocks(environ={
+            "CTFY_EVAL_MAX_TURNS": "12", "SAPPER_MAX_EXPLORE": "3",
+            "SAPPER_ROUND_MINUTES": "7",
+        })
+        self.assertEqual(rc, 0)
+        argv = auto.call_args.args[0]
+        self.assertEqual(argv[argv.index("--max-steps") + 1], "12")
+        self.assertEqual(argv[argv.index("--max-explore") + 1], "3")
+        self.assertEqual(argv[argv.index("--minutes") + 1], "7")
+
+    def test_invalid_budget_environment_fails_with_config_error(self):
+        self.task["max_turns"] = None
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        for variable in (
+            "CTFY_EVAL_MAX_TURNS", "SAPPER_MAX_STEPS",
+            "SAPPER_MAX_EXPLORE", "SAPPER_ROUND_MINUTES",
+        ):
+            with self.subTest(variable=variable), contextlib.redirect_stderr(io.StringIO()):
+                rc, _, _, auto = self.run_with_mocks(environ={variable: "0"})
+                self.assertNotEqual(rc, 0)
+                auto.assert_not_called()
+                result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(result["stop_reason"], "config_error")
+
+    def test_structured_auto_outcome_controls_stop_reason(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        project = store.load_project()
+        project["last_auto"] = {
+            "reason": "no_progress", "explore_attempts": 0, "detail": "noop",
+        }
+        store.save_project(project)
+        rc, _, _, _ = self.run_with_mocks()
+        self.assertEqual(rc, 0)
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["stop_reason"], "no_progress")
+
+        project = store.load_project()
+        project["last_auto"] = {
+            "reason": "explore_failed", "explore_attempts": 1, "detail": "timeout",
+        }
+        store.save_project(project)
+        rc, _, _, _ = self.run_with_mocks(auto_return=1)
+        self.assertEqual(rc, 1)
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["stop_reason"], "explore_failed")
+
+    def test_new_round_clears_stale_blocker_before_sync(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        project = store.load_project()
+        project["ctfy"]["blocker"] = {
+            "kind": "instance_unavailable", "created_at": "old", "detail": "stale",
+        }
+        store.save_project(project)
+
+        ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+
+        self.assertIsNone(store.load_project()["ctfy"].get("blocker"))
 
     def test_graph_from_other_challenge_is_rejected(self):
         store = ctfy_run.sapper.Store(self.work / ".sapper")
@@ -354,6 +428,237 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertTrue(result["fully_solved"])
         self.assertEqual(result["stop_reason"], "done")
 
+    def test_missing_instance_stops_auto_and_hands_off_recorded_answer(self):
+        self.platform.queue(200, challenge_payload())
+        self.platform.queue(404, {"code": "instance_not_found", "message": "missing"})
+        self.platform.queue(404, {"code": "instance_not_found", "message": "still missing"})
+
+        def solve(argv):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store),
+            ), 0)
+            answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+            self.assertEqual(answer["data"]["status"], "recorded")
+            args = ctfy_run.sapper.build_parser().parse_args(argv)
+            return ctfy_run.sapper.cmd_auto(args)
+
+        with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason, \
+                mock.patch.object(ctfy_run.sapper, "_run_explore_raw") as explore:
+            rc, _, _ = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        explore.assert_not_called()
+        self.assertEqual(
+            [(call["method"], call["path"]) for call in self.platform.seen],
+            [
+                ("GET", "/api/v1/challenges/challenge-1"),
+                ("POST", "/api/v1/submissions"),
+                ("GET", "/api/v1/instances/instance-1"),
+            ],
+        )
+        answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(answer["data"]["status"], "handed_off")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "FLAG{local}"})
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
+
+    def test_accepted_answer_is_exported_when_refresh_fails(self):
+        verdict = submission_payload(True)
+        verdict["question_id"] = "flag"
+        verdict["challenge_fully_solved"] = False
+        self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, verdict)
+        self.platform.queue(403, {"code": "forbidden", "message": "refresh failed"})
+
+        def solve(argv):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store),
+            ), 0)
+            args = ctfy_run.sapper.build_parser().parse_args(argv)
+            return ctfy_run.sapper.cmd_auto(args)
+
+        with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
+            rc, _, _ = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(answer["data"]["status"], "accepted")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertFalse(result["fully_solved"])
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
+
+    def test_gating_blocker_stops_without_more_model_calls(self):
+        verdict = submission_payload(True)
+        verdict["question_id"] = "flag"
+        verdict["challenge_fully_solved"] = False
+        self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, verdict)
+        self.platform.queue(200, challenge_payload(
+            my_solved_question_ids=["flag"], my_fully_solved=False,
+        ))
+
+        def solve(argv):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store),
+            ), 0)
+            args = ctfy_run.sapper.build_parser().parse_args(argv)
+            return ctfy_run.sapper.cmd_auto(args)
+
+        with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
+            rc, _, _ = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"], "gating_pending"
+        )
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
+
+    def test_initial_challenge_failure_reuses_matching_answer_ledger(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        candidate = store.add_fact(
+            "candidate", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "instance_id": "instance-1", "question_id": "flag",
+                "value": "preserved", "status": "recorded",
+            },
+        )
+        self.platform.queue(403, {"code": "forbidden", "message": "offline"})
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc, _, auto = self.run_with_auto(lambda argv: 0)
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        self.assertEqual(store.get_fact(candidate["id"])["data"]["status"], "handed_off")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "preserved"})
+        self.assertEqual(result["stop_reason"], "config_error")
+
+    def test_truncated_initial_challenge_preserves_matching_answer_ledger(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        candidate = store.add_fact(
+            "candidate", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "instance_id": "instance-1", "question_id": "flag",
+                "value": "preserved-after-reset", "status": "recorded",
+            },
+        )
+        for _ in range(3):
+            self.platform.queue("truncated", b'{"id":')
+
+        with mock.patch.object(ctfy_run.ctfy.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc, _, auto = self.run_with_auto(lambda argv: 0)
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        self.assertEqual(len(self.platform.seen), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+        self.assertEqual(store.get_fact(candidate["id"])["data"]["status"], "handed_off")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "preserved-after-reset"})
+
+    def test_malformed_refreshed_challenge_preserves_matching_answer_ledger(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        candidate = store.add_fact(
+            "candidate", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "instance_id": "instance-1", "question_id": "flag",
+                "value": "preserved-after-malformed", "status": "recorded",
+            },
+        )
+        self.platform.queue(200, challenge_payload(my_solved_question_ids="flag"))
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc, _, auto = self.run_with_auto(lambda argv: 0)
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        self.assertEqual(store.get_fact(candidate["id"])["data"]["status"], "handed_off")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "preserved-after-malformed"})
+        self.assertEqual(result["stop_reason"], "config_error")
+
+    def test_qa_run_hands_off_answer_without_instance_api(self):
+        local = self.work / "attachments" / "clue.txt"
+        local.parent.mkdir()
+        local.write_text("local clue", encoding="utf-8")
+        self.task = instance_task(
+            run_mode="qa", target_instance=None, target_endpoints=[],
+            attachments=[{"name": "clue.txt", "size": 10, "path": str(local)}],
+        )
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.platform.queue(200, challenge_payload(is_qa_only=True))
+
+        def solve(argv):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store, value="QA answer"),
+            ), 0)
+            return 0
+
+        rc, _, auto = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
+        self.assertEqual(self.platform.seen, [{
+            "method": "GET", "path": "/api/v1/challenges/challenge-1",
+            "authorization": "Bearer tok-super-secret", "body": None,
+        }])
+        answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(answer["data"]["status"], "handed_off")
+        self.assertIsNone(answer["data"].get("instance_id"))
+        self.assertEqual(self.store.load_project()["ctfy"]["run_mode"], "qa")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "QA answer"})
+        self.assertEqual(result["solved"], [])
+        self.assertFalse(result["fully_solved"])
+        self.assertEqual(result["stop_reason"], "answers_handed_off")
+
+    def test_qa_second_round_reuses_ledger_and_exports_solved_state(self):
+        self.task = instance_task(run_mode="qa", target_instance=None, target_endpoints=[])
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.platform.queue(200, challenge_payload(is_qa_only=True))
+
+        def solve(argv):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store, value="QA answer"),
+            ), 0)
+            return 0
+
+        first_rc, _, _ = self.run_with_auto(solve)
+        self.assertEqual(first_rc, 0)
+        original_fact_ids = {fact["id"] for fact in self.store.list_facts()}
+        answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.platform.queue(200, challenge_payload(
+            is_qa_only=True, my_solved_question_ids=["flag"], my_fully_solved=True,
+        ))
+
+        second_rc, _, second_auto = self.run_with_auto(lambda argv: 0)
+
+        self.assertEqual(second_rc, 0)
+        second_auto.assert_called_once()
+        self.assertEqual({fact["id"] for fact in self.store.list_facts()}, original_fact_ids)
+        self.assertEqual(self.store.get_fact(answer["id"])["data"]["status"], "handed_off")
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertTrue(result["fully_solved"])
+        self.assertEqual(
+            [call["method"] for call in self.platform.seen], ["GET", "GET"],
+        )
+        self.assertTrue(all(
+            call["path"] == "/api/v1/challenges/challenge-1"
+            for call in self.platform.seen
+        ))
+
     def test_tcp_task_seeds_socket_service_without_target_url(self):
         self.task["target_endpoints"] = [
             {"label": "pwn", "type": "tcp", "url": "target:1337"},
@@ -505,6 +810,51 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         self.assertIn("\n  initial_gated_questions: 7\n", prompt)
         self.assertIn('\n  visible_question_ids: ["visible-q"]\n', prompt)
 
+    def test_prompt_distinguishes_qa_handoff_from_instance_post(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        combined = reason + "\n" + explore
+        self.assertIn("run_mode=qa", combined)
+        self.assertIn("result.json", combined)
+        self.assertIn("does not send a platform POST", combined)
+
+        project = self.store.load_project()
+        project["ctfy"]["run_mode"] = "qa"
+        self.store.save_project(project)
+        qa_system = ctfy_run.sapper._agents_system_prompt(self.store)
+        self.assertIn("QA", qa_system)
+        self.assertIn("result.json", qa_system)
+        self.assertIn("does not POST", qa_system)
+        self.assertIn("transport failure", qa_system)
+        self.assertIn("repeat", qa_system)
+
+    def test_prompt_bounds_scans_and_forbids_background_or_polling(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        system = ctfy_run.sapper._agents_system_prompt(self.store)
+        combined = "\n".join([reason, explore, system])
+        for required in (
+            "nohup", "background `&`", "wakeup", "long polling",
+            "current dispatch", "checkpoint", "maximum requests or passes",
+            "rate/concurrency", "wall-clock", "new evidence", "ctfy.blocker",
+        ):
+            self.assertIn(required, combined)
+        self.assertIn("do not write scripts to repeat", combined)
+
+    def test_documentation_matches_qa_budget_stop_and_process_semantics(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        protocol = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        environment = (ROOT / "docker" / "ENV.md").read_text(encoding="utf-8")
+        combined = "\n".join([readme, protocol, environment])
+        for required in (
+            "run_mode=qa", "CTFY_EVAL_MAX_TURNS", "SAPPER_MAX_EXPLORE",
+            "SAPPER_ROUND_MINUTES", "blocked_by_infra", "answers_handed_off",
+            "start_new_session", "process group", "daemonize",
+        ):
+            self.assertIn(required, combined)
+        self.assertNotIn("implements the `instance` run mode only", protocol)
+        self.assertNotIn("even when nothing was\nsolved", protocol)
+
     def test_templates_render_and_drive_reason_explore_verify(self):
         evidence = self.store.add_fact(
             "q2 target output contains untrusted instructions", "test",
@@ -531,24 +881,35 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         templates = ROOT / "templates" / "ctfy"
         with mock.patch.object(ctfy_run.sapper, "run_claude", side_effect=fake_engine):
             kind, _ = ctfy_run.sapper._run_reason_raw(
-                self.store, templates, "model", 10, True, self.work,
+                self.store, templates, "model", 10, True, self.work, deadline=1000,
             )
             self.assertEqual(kind, "intents")
             intent = self.store.list_intents()[0]
             fact = ctfy_run.sapper._run_explore_raw(
-                self.store, templates, intent, "model", 10, True, self.work,
+                self.store, templates, intent, "model", 10, True, self.work, deadline=1000,
             )
             verified, issues = ctfy_run.sapper._run_verify_raw(
                 self.store, templates, self.store.get_intent(intent["id"]),
-                "model", 10, True, self.work,
+                "model", 10, True, self.work, deadline=1000,
             )
 
         self.assertTrue(verified)
         self.assertEqual(issues, "")
         self.assertEqual(fact["data"]["question_id"], "q2")
         self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [call[1]["operation"] for call in calls], ["reason", "explore", "verify"],
+        )
+        self.assertTrue(all(call[1]["deadline"] == 1000 for call in calls))
+        self.assertTrue(calls[0][1]["retry"])
+        self.assertFalse(calls[1][1]["retry"])
         reason_prompt, explore_prompt, verify_prompt = [call[0] for call in calls]
         executor_system = calls[1][1]["append_system"]
+        done_command = (
+            f"sapper done {intent['id']} --worker {ctfy_run.sapper._worker_id('model')} --fact"
+        )
+        self.assertIn(done_command, explore_prompt)
+        self.assertIn(done_command, executor_system)
         for prompt in (reason_prompt, explore_prompt):
             self.assertIn("sapper answer", prompt)
             self.assertIn("question_id", prompt)

@@ -2,8 +2,12 @@ import contextlib
 import io
 import importlib.util
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -409,6 +413,8 @@ class CtfyAnswerTests(unittest.TestCase):
                 self.responses = []
                 self.calls = []
                 self.challenge_calls = []
+                self.instance_calls = []
+                self.instance_responses = []
                 self.observed_statuses = []
 
             def submit_answer(self, instance_id, question_id, answer):
@@ -424,6 +430,13 @@ class CtfyAnswerTests(unittest.TestCase):
             def get_challenge(self, challenge_id):
                 self.challenge_calls.append(challenge_id)
                 return test.challenge
+
+            def get_instance(self, instance_id):
+                self.instance_calls.append(instance_id)
+                response = self.instance_responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
 
         self.client = FakeClient()
 
@@ -450,12 +463,15 @@ class CtfyAnswerTests(unittest.TestCase):
             "attempts_remaining": None, "ranked": True, "unranked_reason": "",
         }
 
-    def _answer(self, value="FLAG{x}", question="flag", submit=True):
+    def _answer(self, value="FLAG{x}", question="flag", submit=True, client_factory=None):
         module = types.SimpleNamespace(
             load_task=ctfy.load_task,
+            require_task=ctfy.require_task,
             require_instance_task=ctfy.require_instance_task,
             CtfyError=ctfy.CtfyError,
-            CtfyClient=types.SimpleNamespace(from_env=lambda: self.client),
+            CtfyClient=types.SimpleNamespace(
+                from_env=client_factory or (lambda: self.client)
+            ),
         )
         args = types.SimpleNamespace(
             store=str(self.store.root), value=value, question=question,
@@ -468,6 +484,18 @@ class CtfyAnswerTests(unittest.TestCase):
                     "CTFY_EVAL_TARGET_INSTANCE": "different-instance",
                 }, clear=True):
             return sapper.cmd_answer(args)
+
+    def _health(self):
+        module = types.SimpleNamespace(
+            load_task=ctfy.load_task,
+            require_task=ctfy.require_task,
+            CtfyError=ctfy.CtfyError,
+            CtfyClient=types.SimpleNamespace(from_env=lambda: self.client),
+        )
+        args = types.SimpleNamespace(store=str(self.store.root))
+        with mock.patch.object(sapper, "_load_ctfy_module", return_value=module, create=True), \
+                mock.patch.dict("os.environ", {"CTFY_WORK_DIR": str(self.work)}, clear=True):
+            return sapper.cmd_ctfy_health(args)
 
     def test_answer_records_before_submit_and_applies_verdict(self):
         self.client.responses = [self._reply(True)]
@@ -492,6 +520,58 @@ class CtfyAnswerTests(unittest.TestCase):
             self._answer()
         fact = [f for f in self.store.list_facts() if f.get("kind") == "flag"][0]
         self.assertEqual(fact["data"]["status"], "recorded")
+
+    def test_missing_instance_is_confirmed_once_and_answer_is_kept(self):
+        missing = ctfy.CtfyError("instance missing", status=404, code="instance_not_found")
+        self.client.responses = [missing]
+        self.client.instance_responses = [missing]
+        self.assertEqual(self._answer(), 0)
+        self.assertEqual(self.client.calls, [("instance-1", "flag", "FLAG{x}")])
+        self.assertEqual(self.client.instance_calls, ["instance-1"])
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "recorded")
+        blocker = self.store.load_project()["ctfy"]["blocker"]
+        self.assertEqual(blocker["kind"], "instance_unavailable")
+
+    def test_ctfy_health_uses_one_get_without_exposing_credentials(self):
+        self.client.instance_responses = [{
+            "id": "instance-1", "status": "running",
+            "credentials": {"password": "credential-secret"},
+        }]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(self._health(), 0)
+        self.assertEqual(self.client.instance_calls, ["instance-1"])
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("instance available", stdout.getvalue())
+        self.assertNotIn("credential-secret", stdout.getvalue())
+
+    def test_accepted_answer_survives_challenge_refresh_failure(self):
+        self.client.responses = [self._reply(True)]
+        self.client.get_challenge = mock.Mock(
+            side_effect=ctfy.CtfyError("refresh offline")
+        )
+        self.assertEqual(self._answer(), 0)
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "accepted")
+        blocker = self.store.load_project()["ctfy"]["blocker"]
+        self.assertEqual(blocker["kind"], "challenge_refresh_failed")
+
+    def test_qa_submit_records_for_result_handoff_without_client(self):
+        self.task.update({
+            "run_mode": "qa", "target_instance": None, "target_endpoints": [],
+        })
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        factory = mock.Mock(return_value=self.client)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(self._answer(client_factory=factory), 0)
+        factory.assert_not_called()
+        self.assertEqual(self.client.calls, [])
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertIsNone(fact["data"].get("instance_id"))
+        self.assertEqual(fact["data"]["status"], "recorded")
+        self.assertIn("result handoff", stdout.getvalue())
 
     def test_answer_dedupe_key_includes_question(self):
         self._answer(submit=False)
@@ -540,6 +620,7 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertTrue({"challenge", "endpoint", "attachment", "question", "scope", "rule"} <= record_types)
         self.assertTrue(any((f.get("data") or {}).get("question_id") == "q3" for f in facts))
         metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["run_mode"], "instance")
         self.assertEqual(metadata["solved_question_ids"], ["flag"])
         self.assertFalse(metadata["fully_solved"])
 
@@ -557,6 +638,27 @@ class CtfyAnswerTests(unittest.TestCase):
             for f in self.store.list_facts()
         ))
         self.assertEqual(self.store.load_project()["ctfy"]["solved_question_ids"], ["flag"])
+        self.assertIsNone(self.store.load_project()["ctfy"].get("blocker"))
+
+    def test_gating_blocker_survives_sync_and_clears_when_question_unlocks(self):
+        self.task = self._write_task(["flag"])
+        self.challenge["questions"] = self.task["questions"]
+        self.challenge["my_solved_question_ids"] = ["flag"]
+        reply = self._reply(True)
+        reply["challenge_fully_solved"] = False
+        self.client.responses = [reply]
+        self.assertEqual(self._answer(), 0)
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["blocker"]["kind"], "gating_pending")
+
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"], "gating_pending"
+        )
+
+        self.challenge["questions"].append({"id": "q2", "prompt": "Unlocked"})
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        self.assertIsNone(self.store.load_project()["ctfy"].get("blocker"))
 
     def test_ctfy_handoff_status_is_supported(self):
         fact = self.store.add_fact(
@@ -565,6 +667,12 @@ class CtfyAnswerTests(unittest.TestCase):
         )
         updated = self.store.update_flag_fact(fact["id"], "handed_off", None)
         self.assertEqual(updated["data"]["status"], "handed_off")
+
+    def test_health_parser_uses_current_scoped_task(self):
+        args = sapper.build_parser().parse_args([
+            "--store", str(self.store.root), "ctfy-health",
+        ])
+        self.assertIs(args.func, sapper.cmd_ctfy_health)
 
     def test_answer_parser_has_no_cross_challenge_overrides(self):
         args = sapper.build_parser().parse_args([
@@ -927,6 +1035,403 @@ class KeyRotationTests(unittest.TestCase):
             "ANTHROPIC_AUTH_TOKEN": "t1"}):
             self.assertTrue(sapper._rotate_key())
             self.assertEqual(os.environ["ANTHROPIC_AUTH_TOKEN"], "t1")
+
+
+class AutoLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.store = sapper.Store(self.work / ".sapper")
+        self.store.init("ctfy:challenge-1", "solve")
+        self.seed = self.store.add_fact("seed", "test")
+        self.templates = ROOT / "templates" / "ctfy"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add_intent(self, description="work"):
+        return self.store.add_intent([self.seed["id"]], description, "test")
+
+    def args(self, **overrides):
+        values = {
+            "store": str(self.store.root), "templates": str(self.templates),
+            "model": "model", "timeout": 10, "skip_permissions": True,
+            "max_steps": 2, "max_explore": 4, "verify": False,
+            "dry_run": False, "deadline": None, "minutes": None,
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def run_auto(self, args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = sapper.cmd_auto(args)
+        outcome = self.store.load_project().get("last_auto")
+        return rc, outcome
+
+    def conclude(self, store, templates, intent, *args, **kwargs):
+        fact, _ = self.store.conclude_with_new_fact(
+            intent["id"], f"completed {intent['id']}", sapper._worker_id("model"),
+        )
+        return fact
+
+    def test_noop_still_drains_owned_ready_frontier(self):
+        intent = self.add_intent()
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("noop", "no new work")), \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=self.conclude) as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=1))
+        self.assertEqual(rc, 0)
+        explore.assert_called_once()
+        self.assertEqual(explore.call_args.args[2]["id"], intent["id"])
+        self.assertEqual(outcome["reason"], "max_steps")
+
+    def test_rejected_does_not_execute_pending_work(self):
+        self.add_intent()
+        with mock.patch.object(
+            sapper, "_run_reason_raw", return_value=("rejected", "not now")
+        ) as reason, mock.patch.object(sapper, "_run_explore_raw") as explore:
+            rc, outcome = self.run_auto(self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(reason.call_count, 2)
+        explore.assert_not_called()
+        self.assertEqual(outcome["reason"], "no_progress")
+
+    def test_noop_without_ready_work_stops_as_no_progress(self):
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("noop", "none")) as reason, \
+                mock.patch.object(sapper, "_run_explore_raw") as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(reason.call_count, 2)
+        explore.assert_not_called()
+        self.assertEqual(outcome["reason"], "no_progress")
+
+    def test_failed_intent_is_suppressed_while_independent_work_continues(self):
+        first = self.add_intent("times out")
+        second = self.add_intent("independent")
+        seen = []
+
+        def explore_effect(store, templates, intent, *args, **kwargs):
+            seen.append(intent["id"])
+            if intent["id"] == first["id"]:
+                raise sapper.EngineTimeout("timed out")
+            return self.conclude(self.store, self.templates, intent)
+
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")) as reason, \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=explore_effect):
+            rc, outcome = self.run_auto(self.args(max_steps=4, max_explore=3))
+        self.assertEqual(rc, 1)
+        self.assertEqual(seen, [first["id"], second["id"]])
+        self.assertEqual(reason.call_count, 2)
+        self.assertEqual(outcome["reason"], "explore_failed")
+        self.assertEqual(outcome["explore_attempts"], 2)
+
+    def test_explore_cap_exits_without_another_reason(self):
+        first = self.add_intent("first")
+        self.add_intent("second")
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")) as reason, \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=self.conclude) as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=4, max_explore=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(reason.call_count, 1)
+        self.assertEqual(explore.call_count, 1)
+        self.assertEqual(explore.call_args.args[2]["id"], first["id"])
+        self.assertEqual(outcome["reason"], "explore_cap")
+        self.assertEqual(outcome["explore_attempts"], 1)
+
+    def test_blocker_after_explore_skips_remaining_frontier(self):
+        first = self.add_intent("submits and discovers blocker")
+        self.add_intent("must not run")
+
+        def explore_effect(store, templates, intent, *args, **kwargs):
+            fact = self.conclude(store, templates, intent)
+            project = store.load_project()
+            project["ctfy"] = {"blocker": {"kind": "instance_unavailable"}}
+            store.save_project(project)
+            return fact
+
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=explore_effect) as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=3, max_explore=4))
+        self.assertEqual(rc, 0)
+        self.assertEqual(explore.call_count, 1)
+        self.assertEqual(explore.call_args.args[2]["id"], first["id"])
+        self.assertEqual(outcome["reason"], "blocker")
+
+    def test_model_error_is_a_structured_failure(self):
+        with mock.patch.object(sapper, "_run_reason_raw", side_effect=sapper.FGError("model down")) as reason, \
+                mock.patch.object(sapper.time, "sleep"):
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 1)
+        self.assertEqual(reason.call_count, 2)
+        self.assertEqual(outcome["reason"], "model_error")
+
+    def test_completed_graph_has_completed_outcome(self):
+        def complete(*args, **kwargs):
+            self.store.complete_project([self.seed["id"]], "solved", "test")
+            return "complete", "solved"
+
+        with mock.patch.object(sapper, "_run_reason_raw", side_effect=complete):
+            rc, outcome = self.run_auto(self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "completed")
+
+    def test_deadline_and_blocker_do_not_call_reason(self):
+        project = self.store.load_project()
+        project["ctfy"] = {"blocker": {"kind": "instance_unavailable"}}
+        self.store.save_project(project)
+        with mock.patch.object(sapper, "_run_reason_raw") as reason:
+            rc, outcome = self.run_auto(self.args())
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        self.assertEqual(outcome["reason"], "blocker")
+
+        project = self.store.load_project()
+        project["ctfy"].pop("blocker")
+        self.store.save_project(project)
+        with mock.patch.object(sapper, "deadline_from_args", return_value=0), \
+                mock.patch.object(sapper, "_run_reason_raw") as reason:
+            rc, outcome = self.run_auto(self.args())
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        self.assertEqual(outcome["reason"], "deadline")
+
+    def test_step_budget_and_planner_countdown_are_real(self):
+        def add_evidence(*args, **kwargs):
+            self.store.add_fact("new evidence", "test")
+            return "intents", "evidence only"
+
+        with mock.patch.object(sapper, "_run_reason_raw", side_effect=add_evidence):
+            rc, outcome = self.run_auto(self.args(max_steps=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "max_steps")
+
+        def complete_with_countdown(*args, **kwargs):
+            self.assertIn("remaining", kwargs["time_budget"])
+            self.store.complete_project([self.seed["id"]], "solved", "test")
+            return "complete", "solved"
+
+        with mock.patch.object(sapper, "_run_reason_raw", side_effect=complete_with_countdown):
+            rc, outcome = self.run_auto(self.args(minutes=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "completed")
+
+
+class ExploreLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.store = sapper.Store(self.work / ".sapper")
+        self.store.init("ctfy:challenge-1", "solve")
+        seed = self.store.add_fact("seed", "test")
+        self.intent = self.store.add_intent([seed["id"]], "inspect target", "test")
+        self.templates = ROOT / "templates" / "ctfy"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_explore_timeout_releases_claim_and_bounds_failure_history(self):
+        before = sapper._graph_signature(self.store)
+        with mock.patch.object(
+            sapper, "run_claude", side_effect=sapper.EngineTimeout("x" * 1500)
+        ):
+            for _ in range(5):
+                with self.assertRaises(sapper.EngineTimeout):
+                    sapper._run_explore_raw(
+                        self.store, self.templates, self.store.get_intent(self.intent["id"]),
+                        "model", 10, True, self.work, claim=True,
+                    )
+        refreshed = self.store.get_intent(self.intent["id"])
+        self.assertEqual(refreshed["status"], "open")
+        self.assertIsNone(refreshed["worker"])
+        self.assertEqual(len(refreshed["failures"]), 3)
+        failure = refreshed["failures"][-1]
+        self.assertEqual(failure["category"], "timeout")
+        self.assertEqual(failure["worker"], sapper._worker_id("model"))
+        self.assertLessEqual(len(failure["message"]), 1000)
+        self.assertTrue(failure["created_at"])
+        self.assertEqual(sapper._graph_signature(self.store), before)
+
+    def test_dispatch_explore_failure_also_releases_claim(self):
+        args = types.SimpleNamespace(dry_run=False, claim=True)
+        with mock.patch.object(sapper, "run_claude", side_effect=sapper.FGError("boom")):
+            with self.assertRaisesRegex(sapper.FGError, "boom"):
+                sapper._dispatch_explore(
+                    self.store, self.templates, self.intent,
+                    "model", 10, True, self.work, args,
+                )
+        refreshed = self.store.get_intent(self.intent["id"])
+        self.assertEqual(refreshed["status"], "open")
+        self.assertIsNone(refreshed["worker"])
+        self.assertEqual(refreshed["failures"][-1]["category"], "dispatch")
+
+    def test_failure_history_is_visible_to_planner_and_legacy_intents_are_safe(self):
+        self.intent["failures"] = [{
+            "created_at": "2026-11-08T00:00:00", "category": "timeout",
+            "message": "read timed out", "worker": "model-1",
+        }]
+        self.store.save_intent(self.intent)
+        prompt = sapper.render_prompt(self.store, "{graph_yaml}\n{open_intents}")
+        self.assertIn("read timed out", prompt)
+        self.assertIn("timeout", prompt)
+        brief = json.loads(sapper.render_prompt(self.store, "{open_intents}"))[0]
+        self.assertEqual(brief["status"], "open")
+        self.assertIsNone(brief["worker"])
+        self.assertEqual(brief["failures"][0]["message"], "read timed out")
+        legacy = dict(self.intent)
+        legacy.pop("failures")
+        self.assertEqual(sapper._intent_brief(legacy)["failures"], [])
+        yaml = sapper._to_yaml_like(sapper.build_graph_view(self.store))
+        self.assertIn("status=open", yaml)
+        self.assertIn("worker=null", yaml)
+
+    def test_malformed_response_recovers_executor_completed_fact(self):
+        worker = sapper._worker_id("model")
+        completed = []
+
+        def done_then_malformed(*args, **kwargs):
+            fact, _ = self.store.conclude_with_new_fact(
+                self.intent["id"], "executor completed", worker,
+            )
+            completed.append(fact)
+            return {"result": "not-json"}
+
+        with mock.patch.object(sapper, "run_claude", side_effect=done_then_malformed):
+            fact = sapper._run_explore_raw(
+                self.store, self.templates, self.intent,
+                "model", 10, True, self.work, claim=True,
+            )
+        self.assertEqual(fact["id"], completed[0]["id"])
+        refreshed = self.store.get_intent(self.intent["id"])
+        self.assertEqual(refreshed["status"], "done")
+        self.assertEqual(refreshed["worker"], worker)
+        self.assertNotIn("failures", refreshed)
+
+    def test_failure_recording_does_not_relax_worker_ownership(self):
+        self.store.claim_intent(self.intent["id"], "owner")
+        with self.assertRaisesRegex(sapper.FGError, "claimed by owner"):
+            self.store.record_intent_failure(
+                self.intent["id"], "other", "dispatch", "boom",
+            )
+        self.assertEqual(self.store.get_intent(self.intent["id"])["worker"], "owner")
+
+
+class EngineExecutionTests(unittest.TestCase):
+    def call_engine(self, *, operation="reason", retry=True, deadline=None):
+        return sapper.run_claude(
+            "prompt", model="model", timeout=30, skip_permissions=True,
+            append_system=None, cwd=Path.cwd(), operation=operation,
+            retry=retry, deadline=deadline,
+        )
+
+    def test_reason_transient_error_has_bounded_retry(self):
+        with mock.patch.dict("os.environ", {"SAPPER_RETRY_MODEL": "3"}), \
+                mock.patch.object(
+                    sapper, "_run_engine_once",
+                    side_effect=[sapper.FGError("temporary"), {"result": "ok"}],
+                ) as once, mock.patch.object(sapper.time, "sleep") as sleep:
+            result = self.call_engine(operation="reason")
+        self.assertEqual(result, {"result": "ok"})
+        self.assertEqual(once.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_explore_transient_error_is_not_retried(self):
+        with mock.patch.dict("os.environ", {"SAPPER_RETRY_MODEL": "3"}), \
+                mock.patch.object(
+                    sapper, "_run_engine_once", side_effect=sapper.FGError("temporary"),
+                ) as once, mock.patch.object(sapper.time, "sleep") as sleep:
+            with self.assertRaisesRegex(sapper.FGError, "temporary"):
+                self.call_engine(operation="explore", retry=False)
+        self.assertEqual(once.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_engine_timeout_is_never_retried_for_any_operation(self):
+        for operation in ("reason", "explore", "verify"):
+            with self.subTest(operation=operation), \
+                    mock.patch.dict("os.environ", {"SAPPER_RETRY_MODEL": "3"}), \
+                    mock.patch.object(
+                        sapper, "_run_engine_once",
+                        side_effect=sapper.EngineTimeout("timed out"),
+                    ) as once, mock.patch.object(sapper.time, "sleep") as sleep:
+                with self.assertRaises(sapper.EngineTimeout):
+                    self.call_engine(operation=operation)
+                self.assertEqual(once.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_engine_timeout_kills_process_group_and_drains(self):
+        proc = mock.Mock()
+        proc.pid = 4242
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(["engine"], 1), ("", ""),
+        ]
+        with mock.patch.object(sapper.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(sapper.os, "killpg") as killpg:
+            with self.assertRaisesRegex(sapper.EngineTimeout, "explore"):
+                sapper._run_engine_once(
+                    ["engine"], "prompt", 1, Path.cwd(), "engine", operation="explore",
+                )
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(4242, signal.SIGKILL)
+        self.assertEqual(proc.communicate.call_count, 2)
+
+    @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
+    def test_engine_timeout_kills_grandchild_in_process_group(self):
+        if not Path("/proc").exists():
+            self.skipTest("grandchild liveness assertion requires procfs")
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = Path(tmp) / "grandchild.pid"
+            script = (
+                "import pathlib, subprocess, sys, time; "
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)']); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                "time.sleep(60)"
+            )
+            child_pid = None
+            try:
+                with self.assertRaises(sapper.EngineTimeout):
+                    sapper._run_engine_once(
+                        [sys.executable, "-c", script, str(pid_path)],
+                        "prompt", 2, Path.cwd(), "python", operation="explore",
+                    )
+                self.assertTrue(pid_path.exists(), "engine did not start its grandchild")
+                child_pid = int(pid_path.read_text(encoding="utf-8"))
+
+                def alive(pid):
+                    try:
+                        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        return False
+                    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+                for _ in range(40):
+                    if not alive(child_pid):
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(alive(child_pid), "grandchild survived engine timeout")
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_deadline_clamps_engine_timeout(self):
+        with mock.patch.object(sapper.time, "time", return_value=100.0), \
+                mock.patch.object(
+                    sapper, "_run_engine_once", return_value={"result": "ok"},
+                ) as once:
+            self.call_engine(deadline=105.0)
+        self.assertEqual(once.call_args.args[2], 5.0)
+
+    def test_retry_does_not_sleep_or_start_past_deadline(self):
+        with mock.patch.dict("os.environ", {"SAPPER_RETRY_MODEL": "3"}), \
+                mock.patch.object(sapper.time, "time", return_value=100.0), \
+                mock.patch.object(
+                    sapper, "_run_engine_once", side_effect=sapper.FGError("temporary"),
+                ) as once, mock.patch.object(sapper.time, "sleep") as sleep:
+            with self.assertRaises(sapper.EngineTimeout):
+                self.call_engine(deadline=105.0)
+        self.assertEqual(once.call_count, 1)
+        sleep.assert_not_called()
 
 
 class HookExecutionTests(unittest.TestCase):

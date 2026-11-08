@@ -1,62 +1,71 @@
-# TSecBench 托管模式配置清单（王座协议线上赛）
+# CTFY-0001 v3 运行环境清单
 
-正式赛规则要点（2026-10-17 00:00 — 10-18 23:59）：
+本文只描述当前单题解题镜像的 `run_mode=instance` 与 `run_mode=qa` 入口。旧
+`sapper bench` / `sapper arena` 的 `BENCHMARK_*`、个人 key pool 和多题计时变量
+不属于此运行路径。
 
-- **只有 1 次评测机会**，仅队长账号可提交；Agent 异常没有重试
-- 50 题 / 100 flag，任务限时 **8 小时**（镜像内默认按 470 分钟跑，留安全边际）
-- 无 hint（接口返回 null，也无惩罚）
-- 排名顺序：**得分 → 有效耗时 → token 量**（所以默认不开 verify 双检，省 token）
-- 模型限流/超时/中断不算平台异常——镜像内已带**模型调用重试**（SAPPER_RETRY_MODEL=3，指数退避），单题异常自动跳过下一轮再试，绝不中断整个任务
-- 严禁引导 Agent 攻击平台——提示词中已有 scope 纪律，请勿在模板里加任何"打平台"的引导
+## 1. 平台与任务提供
 
-## 一、平台自动注入（控制台不要手填）
+| 变量或字段 | 说明 |
+|---|---|
+| `CTFY_WORK_DIR` | 工作目录，默认 `/ctfy/work` |
+| `CTFY_PLATFORM_URL` | 当前 CTFY 平台基址 |
+| `CTFY_TOKEN` | 当前 run 的 scoped Bearer token |
+| `task.max_turns` | 正整数时作为本轮 turn 预算，优先于环境变量 |
+| `CTFY_EVAL_MAX_TURNS` | `task.max_turns` 缺失或无效时的 turn 预算 |
+| `CTFY_EVAL_DRY_RUN=1` | 无凭证 dry-run；不写死到正式评测配置中 |
+
+Instance 模式的 `target_instance` 是平台已经启动的实例 ID。Agent 不创建实例，
+只访问当前题的 challenge、instance、附件和 submission API。QA 模式的
+`target_instance=null` 是正常输入；附件必须已有本地 `path`，答案通过
+`result.json.answers` 移交，不调用 instance API 或 submission POST。
+
+## 2. 平台模型连接
 
 | 变量 | 说明 |
 |---|---|
-| `BENCHMARK_BASE_URL` | 答题 API 基址，任务创建后自动注入 |
-| `BENCHMARK_TOKEN` | 答题 API 凭证，自动注入 |
+| `LLM_FLAVOR` | `anthropic` 使用 Claude Code；`openai` 使用 Codex |
+| `LLM_API_KEY` | 平台提供的模型凭证 |
+| `LLM_MODEL` | 请求平台网关的准确模型 ID |
+| `LLM_BASE_URL` | 可选提供商端点覆盖 |
 
-## 二、运行时环境变量（控制台手填）
+GLM 评测应选择供 Claude Code 使用的 Anthropic 兼容连接，使
+`LLM_FLAVOR=anthropic`。普通 Chat Completions 连接不能直接交给只支持
+Responses API 的 Codex。模型连接、网关和密钥必须来自同一套平台配置。
 
-| KEY | VALUE | 说明 |
-|---|---|---|
-| `ANTHROPIC_BASE_URL` | `https://open.bigmodel.cn/api/anthropic` | 直连厂商公开端点 |
-| `ANTHROPIC_AUTH_TOKEN` | 你的智谱 API Key | 换供应商只改这项和 BASE_URL |
-| `SAPPER_MODEL` | `glm-5.3-flash[1m]` | 已实测走通。`[1m]` 后缀由 claude CLI 解析为 1M 上下文（剥后缀 + beta 头），API 侧模型名仍是 glm-5.3-flash，直接填 `glm-5.3-flash-1m` 会报模型不存在 |
+入口会清理 `SAPPER_KEY_POOL`，不会回退到个人密钥。不要把 token、模型 key、
+registry 凭证或 key pool 写入 Dockerfile、镜像层、Git、日志或 `/ctfy/work`。
 
-### Key 池自动轮换（强烈建议配置）
+## 3. 可选预算与可靠性参数
 
-当某个 Key 额度耗尽/401/欠费，系统自动切换到池中下一组凭据，`-p` 版**无需重启**（下一次模型调用即用新 Key），tmux 版自动轮换并重启对应 TUI（`claude --continue` 恢复原会话上下文）。检测特征：insufficient/balance/quota/exceeded/billing/401/unauthorized/欠费/余额。
-
-| KEY | VALUE 格式 |
+| 变量 | 语义 |
 |---|---|
-| `SAPPER_KEY_POOL` | `[{"base_url":"https://open.bigmodel.cn/api/anthropic","token":"智谱key1","model":"glm-5.3-flash[1m]"},{"base_url":"https://api.moonshot.cn/v1","token":"moonshot-key","model":"kimi-k2.5"}]` |
+| `SAPPER_MAX_STEPS` | 对任务/平台 turn 预算再施加更低安全上限，不是独立默认值 |
+| `SAPPER_MAX_EXPLORE` | explore dispatch 上限；失败 dispatch 也计数，默认等于 turn 预算 |
+| `SAPPER_ROUND_MINUTES` | 本轮 auto 的真实 wall-clock 分钟预算 |
+| `SAPPER_RETRY_MODEL` | reason 的非 timeout 瞬态错误有界重试；explore 与 timeout 不整体重试 |
 
-注意：池里各组 URL 直连各厂商公开端点。单 Key 时轮换自动退化为普通重试。
+没有任何平台 turn 预算时默认 `8`。预算环境变量必须是正整数，否则写
+`config_error`。turn 数不能当作秒数；需要真实倒计时才设置
+`SAPPER_ROUND_MINUTES`。
 
-可选调参（不填用镜像默认值）：
+Challenge GET 和附件下载使用有界网络重试，答案 POST 始终单次。Instance
+health GET 也始终单次；持续 `instance_not_found` 只形成 blocker，不做长轮询。
+引擎以 `start_new_session=True` 启动并回收 process group；主动 daemonize、
+脱离进程组的程序不保证可回收，因此不要在执行命令中使用 nohup 或后台 `&`。
 
-| KEY | 默认 | 说明 |
-|---|---|---|
-| `SAPPER_TOTAL_MINUTES` | `470` | 总预算（8h 限时留边际） |
-| `SAPPER_MINUTES_PER_CHALLENGE` | `9` | 每题每轮 auto 分钟数；bench 多轮循环，没解完的题下轮续（进度在图里保留）。50 题×9 分≈450 分 |
-| `SAPPER_MAX_STEPS` | `10` | 每题每轮最多 reason 轮数 |
-| `SAPPER_RETRY_MODEL` | `3` | 模型调用失败重试次数（10s/20s/40s 退避） |
-| `SAPPER_VERIFY` | 不设 | 设为 `1` 才开启核验者（费 token，正式赛默认不开） |
+## 4. 结果检查
 
-## 三、容器启动流程
+stdout 不是计分通道。检查 `/ctfy/work/result.json`：
 
-1. 校验 `BENCHMARK_*` 与模型网关环境变量，缺失立刻 FATAL（日志可见）
-2. 平台 API 连通性探测 + 模型 CLI 冒烟测试
-3. `sapper bench --minutes 470`：对每个未完成题目循环
-   `start → 建图（题目描述/靶标地址按不可信数据录入）→ auto 自主解题
-   → 提交已记录未提交的 flag（正确/错误都回写）→ close`
-   一轮做不完全部题就再来一轮，直到全部完成或 470 分钟用尽
-4. 非特权用户运行（Claude Code 拒绝 root 下跳权限确认）；密钥全走环境变量，镜像不含任何密钥/题目记忆
+- `done` 只表示图已完成或平台确认 `fully_solved=true`。
+- 普通未解出可以是 `incomplete`、`no_progress`、`max_steps`、`explore_cap`
+  或 `deadline`，不应误报为完成。
+- QA 有候选移交时使用 `answers_handed_off`。
+- Instance、refresh 或 gating blocker 使用 `blocked_by_infra`，答案仍保留。
+- 模型/执行器失败使用 `model_error`、`explore_failed` 或 `auto_failed`，
+  与配置错误 `config_error` 区分。
 
-## 四、一次机会的检查单（提交前自查）
-
-- [ ] 用**其他题集**（如 Tsecbench v1 公开集）跑过完整托管评测，`correct_flag_count` 有增长
-- [ ] 镜像内 `sapper --version`、`sapper bench --help` 正常
-- [ ] `ANTHROPIC_*` 三个变量填的是厂商公开端点地址 + 正确 key
-- [ ] 队长账号提交；活动期间只此一次
+发布前运行完整测试、本地镜像构建和无凭证 dry-run；只有本机已经安装官方
+`ctfy` CLI 时才运行 `ctfy agent check`。本地 loopback 通过不等于真实评测
+解题率或官方平台验证通过。

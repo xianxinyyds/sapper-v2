@@ -1,8 +1,10 @@
 # CTFY-0001 v3 solver image
 
-This image runs **one already-started challenge instance** per evaluation. It
-implements the `instance` run mode only. `qa`, `defence`, `awd`, and `engagement`
-are rejected with a non-zero exit and `stop_reason=unsupported_run_mode` when a
+This image runs **one challenge per evaluation** in `run_mode=instance` or
+`run_mode=qa`. Instance mode uses only the already-started target instance; it
+never creates one. QA mode uses the description, questions, and local
+attachments, with `target_instance=null` as the normal state. `defence`, `awd`,
+`engagement`, and unknown modes are rejected with `unsupported_run_mode` when a
 result file can be written.
 
 The container does not list challenges, start instances, or sweep multiple
@@ -26,21 +28,31 @@ The container starts as an unprivileged user with cwd `/ctfy/work`.
 | `CTFY_PLATFORM_URL` | Base URL of the current CTFY platform |
 | `CTFY_TOKEN` | Bearer token scoped to the current run |
 | `CTFY_EVAL_DRY_RUN` | `1` requests the no-credential conformance fast path |
+| `CTFY_EVAL_MAX_TURNS` | Turn budget when `task.max_turns` is absent or invalid |
 | `LLM_FLAVOR` | `anthropic` (Claude Code) or `openai` (Codex) |
 | `LLM_API_KEY` | Platform-provided model credential; no personal fallback is used |
 | `LLM_MODEL` | Exact model id requested from the platform gateway |
 | `LLM_BASE_URL` | Optional provider endpoint override |
-| `SAPPER_MAX_STEPS` | Optional step budget when `task.max_turns` is null; default `8` |
+| `SAPPER_MAX_STEPS` | Optional lower safety cap on the selected turn budget |
+| `SAPPER_MAX_EXPLORE` | Optional explore-dispatch cap; defaults to the selected turn budget |
+| `SAPPER_ROUND_MINUTES` | Optional wall-clock deadline for this auto round |
+| `SAPPER_RETRY_MODEL` | Bounded retries for non-timeout transient reason calls |
+
+A positive `task.max_turns` wins over `CTFY_EVAL_MAX_TURNS`; if neither is
+available, the default is `8`. `SAPPER_MAX_STEPS` can only reduce that value.
+Turn counts are not seconds. Invalid or non-positive budget environment values
+produce `config_error`.
 
 The runner clears `SAPPER_KEY_POOL` and maps only the platform model variables to
 the selected CLI. Credentials are kept in process memory and are not written to
-`/ctfy/work` or baked into the image.
+`/ctfy/work` or baked into the image. See [ENV.md](ENV.md) for the configuration
+checklist.
 
 ## Dry run
 
 A task with `"dry_run": true`, or an environment with `CTFY_EVAL_DRY_RUN=1`,
-writes the result before validating the instance, platform, or model
-configuration and exits `0`:
+writes the result before validating the target, platform, or model configuration
+and exits `0`:
 
 ```json
 {
@@ -58,18 +70,45 @@ official dry run has no `CTFY_TOKEN` or `LLM_API_KEY`.
 ## Normal lifecycle
 
 For each round the runner refreshes only the current challenge, resumes the
-existing graph, configures the selected model CLI, ensures attachments whose
-`path` is null, and runs the single-challenge `auto` loop with the CTFY prompts.
-An executor submits an answer immediately:
+existing graph, configures the selected model CLI, prepares attachments, and
+runs the single-challenge `auto` loop with the CTFY prompts. Instance attachments
+with a null path are downloaded from the current instance. QA attachments must
+already exist at their local paths; QA never constructs an instance download.
+If the initial challenge GET fails, a matching existing graph is still used for
+the result rollup so recorded answers are not overwritten by an empty result.
+
+An executor records a candidate immediately:
 
 ```bash
 sapper answer "FLAG{example}" --question "flag" --submit
 ```
 
-The answer is recorded before submission. Submission POSTs are never retried
-automatically. A correct response refreshes the challenge so gated questions can
-enter the graph. Only idempotent GETs and attachment downloads receive bounded
-retries.
+In instance mode, the answer is recorded before one submission POST. Submission
+POSTs are never retried automatically, and executors must not write their own
+repeated-POST scripts. A correct response refreshes the challenge so gated
+questions can enter the graph. An accepted fact is persisted before that refresh;
+a later refresh failure cannot roll back `accepted` or remove it from `solved`.
+
+In QA mode, the same command only records the candidate for
+`result.json.answers` handoff. It does not call an instance API or send a QA or
+instance submission POST from this runner. The platform can then process the
+handed-off answers and expose solved state in a later challenge refresh.
+
+Challenge GETs and attachment downloads have bounded retries, including direct
+`TimeoutError` response reads. The instance health GET is deliberately
+single-attempt. A manual bounded check is available as:
+
+```bash
+sapper ctfy-health
+```
+
+It reads only the current task's instance, sends no POST, and prints availability
+rather than instance credentials. A confirmed missing instance records an
+`instance_unavailable` blocker; there is no sleep/poll loop and no instance
+creation. A refresh failure records `challenge_refresh_failed`. All visible
+questions being solved while `fully_solved=false` and no new question is visible
+records `gating_pending`. Blockers stop further reason/explore work and preserve
+recorded or accepted answers.
 
 ## Result and exit semantics
 
@@ -87,17 +126,33 @@ After a successful result write, the exported candidates become `handed_off`.
 `solved` combines locally accepted question ids with the platform's solved list;
 `fully_solved` comes only from the platform challenge response.
 
-A completed auto run exits `0` with `stop_reason=done`, even when nothing was
-solved. An auto failure still writes the rollup, uses `stop_reason=auto_failed`,
-and exits non-zero. Configuration/protocol failures write `config_error` when
-possible and exit non-zero.
+`done` is used only for a completed graph or authoritative `fully_solved=true`.
+An ordinary unfinished run may exit `0` with `incomplete`, `no_progress`,
+`max_steps`, `explore_cap`, or `deadline`. QA candidates normally produce
+`answers_handed_off`. A structured instance/refresh/gating blocker produces
+`blocked_by_infra` and exits `0` after writing the result.
+
+Model/executor failures are distinct: `model_error` and `explore_failed` come
+from the structured auto outcome and exit non-zero; an unexplained non-zero auto
+return uses `auto_failed`. Configuration/protocol failures use `config_error`
+or `unsupported_run_mode` and exit non-zero. Exit code `0` alone never means
+`done`.
+
+Reason calls retain bounded retries for non-timeout transient errors. Explore
+calls and all engine timeouts are not retried wholesale. Each engine subprocess
+uses `start_new_session=True`; timeout, exception, and normal return clean up its
+**process group** with `SIGKILL` and bounded drain/reaping. A process that
+actively daemonizes or otherwise leaves that group is outside this guarantee.
+Prompts therefore forbid nohup, background `&`, wakeups, long polling, and work
+that waits for a later dispatch. Long analysis must be split into bounded slices
+with checkpoints and concluded in the current dispatch.
 
 ## Build and local verification
 
 Build from the repository root:
 
 ```bash
-docker build -f docker/Dockerfile -t sapper-ctfy:latest .
+docker build -f docker/Dockerfile -t sapper-ctfy:local .
 ```
 
 Run the standard-library unit tests and local HTTP-platform integration tests:
@@ -105,25 +160,22 @@ Run the standard-library unit tests and local HTTP-platform integration tests:
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 bash -n docker/entrypoint-ctfy.sh
-python3 -m py_compile \
-  lib/ctfy.py lib/ctfy_engine.py lib/codex_engine.py lib/ctfy_run.py
+python3 -m compileall -q lib tests
 git diff --check
 ```
 
-The integration tests submit only to a loopback mock platform. They cover an
-accepted answer, a TCP endpoint, graph reuse across rounds, gated question sync,
-handed-off answers, and scanning the work directory for test credentials. They
-do **not** prove real model solve quality or official platform conformance.
+The integration tests submit only to a loopback mock platform. They cover
+instance and QA handoff, direct timeouts, accepted-answer refresh failure,
+instance and gating blockers, graph reuse across rounds, TCP endpoints, process
+cleanup, and work-directory credential scans. They do **not** prove real model
+solve quality or official platform conformance.
 
-Install the official CLI in an isolated environment and run its manifest and
-local dry-run checks against the built image:
+If the official CLI is already installed, run its manifest and local dry-run
+checks against the built image:
 
 ```bash
-python3 -m venv /tmp/ctfy-agent-check
-/tmp/ctfy-agent-check/bin/pip install 'ctfy[client,server,node]'
-/tmp/ctfy-agent-check/bin/ctfy agent check sapper-ctfy:latest
+ctfy agent check sapper-ctfy:local
 ```
 
-The `server` and `node` extras provide the local probe imports and Docker SDK
-needed by `ctfy 0.8.0`. A local mock pass must not be reported as an official
-conformance pass; use the result from `ctfy agent check` itself.
+A local mock pass must not be reported as an official conformance pass; use the
+result from `ctfy agent check` itself.
