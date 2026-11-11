@@ -19,7 +19,7 @@
 
 > 本节适用于 **`worktree-ctfy-v3-solver`** 分支，目标是首届 CCF 网络安全智能挑战赛暨京华杯 TPCTF 2026 的 **CTFY-0001 v3 解题 Agent**。下方英文正文是上游 sapper-v2 的完整介绍。
 >
-> 当前交付的是**单题、单进程、`run_mode=instance` / `run_mode=qa`** 基线：instance 只处理平台已经启动的当前实例；QA 使用题目描述、问题和本地附件，候选答案通过 `result.json.answers` 移交，禁止 instance API 与 submission POST。两种模式都不创建实例、不跨题读取或提交；`defence`、`awd`、`engagement` 尚未支持，旧 `sapper arena` / `sapper bench` 不在 CTFY 运行路径中。
+> 当前交付的是**单题、单进程、`run_mode=instance` / `run_mode=qa`** 基线，命题范围覆盖 **Crypto、Reverse、Misc、Web、Pwn 与 AI 安全**。instance 只处理平台已经启动的当前实例；QA 使用题目描述、问题和本地附件，答案通过单次 `/api/v1/qa/submissions` 判分，transport 失败才降级为 `result.json.answers` 移交，禁止 instance API。两种模式都不创建实例、不跨题读取或提交；`defence`、`awd`、`engagement` 尚未支持，旧 `sapper arena` / `sapper bench` 不在 CTFY 运行路径中。
 
 ### 1. 队友快速上手
 
@@ -43,7 +43,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 | `lib/codex_engine.py` | Codex 非交互适配器 | Codex 参数、输出和错误处理 |
 | `lib/sapper.py` | 事实图、auto、`sapper answer` | 答案账本、图同步、求解内核 |
 | `templates/ctfy/` | planner / executor / verifier 提示 | 类别路由、方法论、答案提交策略 |
-| `kb/entries/` | 离线技术知识库 | Web / Pwn / AI 技术条目 |
+| `kb/entries/` | 离线技术知识库 | Crypto / Reverse / Misc / Web / Pwn / AI 安全条目 |
 | `docker/Dockerfile` | Kali 工具链与 CLI 镜像 | 新工具、执行器、构建修复 |
 | `docker/entrypoint-ctfy.sh` | 容器绝对入口 | 一般不需要修改 |
 | `tests/test_ctfy*.py`、`tests/test_sapper.py` | 单元和 loopback 集成测试 | 每项行为变化的回归证据 |
@@ -54,9 +54,9 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 sapper answer "FLAG{example}" --question "flag" --submit
 ```
 
-答案先落盘；instance 的 `--submit` 只发送一次 POST，不自动重试，避免重复消耗错误尝试次数。QA 的同一命令只记录候选供 result handoff，不发送平台 POST。`task.max_turns` / `CTFY_EVAL_MAX_TURNS` 控制 turn 预算，`SAPPER_MAX_STEPS` 是更低安全上限，`SAPPER_ROUND_MINUTES` 才表示 wall-clock 时间。`done` 只用于实际完成；未解出、模型失败、QA handoff 和 `blocked_by_infra` 都有不同停止原因。
+答案先落盘；instance 与 QA 的 `--submit` 分别只发送一次 `/api/v1/submissions` 或 `/api/v1/qa/submissions`，不自动重试，避免重复消耗错误尝试次数。仅 transport 失败才保留 recorded 供 result handoff，HTTP/协议失败使用 `submission_failed`，不静默移交。`task.max_turns` / `CTFY_EVAL_MAX_TURNS` 控制 turn 预算，`SAPPER_MAX_STEPS` 是更低安全上限；`SAPPER_ROUND_MINUTES` 默认 165 分钟，`CTFY_DISPATCH_TIMEOUT` 默认 300 秒，auto 另留 300 秒 finalization reserve。每次 reason/explore 后进行原子 checkpoint，最终 finalize 才改变 handed_off。
 
-引擎按角色限制重试，并通过独立 process group 回收子进程；主动 daemonize 的进程不保证回收，执行器不得依赖 nohup、后台任务或长轮询。stdout 只用于观察，**计分结果以 `/ctfy/work/result.json` 为准**。详细协议、预算和停止语义见 [docker/CTFY.md](docker/CTFY.md) 与 [docker/ENV.md](docker/ENV.md)，协议事实以官方 [CTFY-0001](https://ctfy.tsinghua.edu.cn/docs/standards/CTFY-0001) 为准。
+引擎按角色限制重试，并通过独立 process group 回收子进程；主动 daemonize 的进程不保证回收，执行器不得依赖 nohup、后台任务或长轮询。stdout 只用于观察，**计分结果以 `/ctfy/work/result.json` 为准**。`done` 只用于实际完成；未解出、模型失败、QA handoff 和 `blocked_by_infra` 都有不同停止原因。详细协议、预算和停止语义见 [docker/CTFY.md](docker/CTFY.md) 与 [docker/ENV.md](docker/ENV.md)，协议事实以官方 [CTFY-0001](https://ctfy.tsinghua.edu.cn/docs/standards/CTFY-0001) 为准。
 
 ### 3. 开发时使用的 Skills 与工作流
 

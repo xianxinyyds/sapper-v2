@@ -1,0 +1,17 @@
+{
+  "id": "kb057",
+  "title": "Reverse 二进制静态优先工作流",
+  "description": "用现有 binutils、gdb、checksec 和 Python 做可复核的逆向分析",
+  "detail": "1. 先确认输入：file、sha256sum、大小和权限；需要工具先 command -v，不在线安装。\n2. 字符串与偏移：strings -a -t x，区分普通输出、 flag 形状、路径和隐藏标记；用 xxd 复核原始字节。\n3. ELF 静态画像：readelf -h/-S/-s/-r，nm 查符号，objdump -d 查函数、调用和常量引用；先定位校验逻辑再下断点。\n4. 保护与利用衔接：checksec 判断 NX/PIE/RELRO/Canary；需要动态行为时用 gdb batch、strace/ltrace（若存在），限制运行时间和输入。\n5. 加壳/混淆：先记录节区、熵和导入异常，UPX 等工具仅在 command -v 成功时使用；Ghidra、radare2、angr 不是镜像默认依赖。\n6. 每个结论保存精确文件偏移、符号、反汇编或寄存器证据，不能只凭 strings 的猜测提交复杂答案。",
+  "commands": [
+    "file binary && sha256sum binary && strings -a -t x binary",
+    "readelf -h -S -s binary && nm -an binary",
+    "objdump -d binary",
+    "checksec --file=binary"
+  ],
+  "tags": [
+    "reverse"
+  ],
+  "source": "本地 binutils/gdb 工作流",
+  "created_at": "2026-11-11T00:00:00Z"
+}

@@ -630,7 +630,9 @@ class Store:
             fact = self.get_fact(fid)
             if fact.get("kind") != "flag":
                 raise FGError(f"fact {fid} is not a flag fact")
-            if status not in ("recorded", "submitted", "accepted", "rejected", "handed_off", "duplicate"):
+            if status not in (
+                    "recorded", "submitted", "accepted", "rejected", "handed_off",
+                    "duplicate", "submission_failed"):
                 raise FGError(f"invalid flag status {status!r}")
             data = dict(fact.get("data") or {})
             data["status"] = status
@@ -1419,6 +1421,21 @@ def extract_json_object(text: str) -> dict:
     raise FGError(f"no JSON object in model output: {text[:200]!r}")
 
 
+def _extract_reason_json_object(text: str) -> dict:
+    try:
+        return extract_json_object(text)
+    except FGError as original:
+        start = text.find("{") if text else -1
+        if start >= 0:
+            try:
+                repaired = json.loads(text[start:].strip() + "}")
+                if isinstance(repaired, dict):
+                    return repaired
+            except json.JSONDecodeError:
+                pass
+        raise original
+
+
 # --------------------------------------------------------------------------- #
 # claude dispatch
 # --------------------------------------------------------------------------- #
@@ -1879,6 +1896,17 @@ def _clear_ctfy_blocker(store: Store, kinds: set[str]) -> None:
             store.save_project(project)
 
 
+def _normalize_ctfy_category(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("_", " ").replace("-", " ")
+    return {
+        "crypto": "Crypto", "rev": "Reverse", "reverse": "Reverse",
+        "misc": "Misc", "web": "Web", "pwn": "Pwn",
+        "ai": "AI security", "ai security": "AI security", "ai安全": "AI security",
+    }.get(normalized)
+
+
 def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> None:
     """Idempotently project the current CTFY briefing into the fact graph."""
     def add_once(record_type: str, sync_key: str, description: str, *,
@@ -1972,6 +2000,18 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             "initial_gated_questions": task.get("gated_questions", 0),
             "visible_question_ids": visible_question_ids,
         }
+        category = _normalize_ctfy_category(
+            source.get("category") or challenge_data.get("category")
+        )
+        if category is not None:
+            metadata["category"] = category
+        raw_tags = source["tags"] if "tags" in source else challenge_data.get("tags")
+        if isinstance(raw_tags, list):
+            tags = list(dict.fromkeys(
+                tag.strip() for tag in raw_tags if isinstance(tag, str) and tag.strip()
+            ))
+            if tags:
+                metadata["tags"] = tags
         waiting_for_gate = bool(visible_question_ids) and not fully_solved \
             and set(visible_question_ids).issubset(solved_ids)
         if waiting_for_gate:
@@ -2043,6 +2083,18 @@ def cmd_answer(args) -> int:
         raise FGError(f"question {question_id!r} is not visible in the current CTFY task")
     challenge_id = task["challenge"]["id"]
     instance_id = task["target_instance"] if task["run_mode"] == "instance" else None
+    competition_id = task.get("competition_id")
+    if args.submit and task["run_mode"] == "qa" \
+            and (not isinstance(competition_id, str) or not competition_id.strip()):
+        raise FGError("QA submission requires a non-empty competition_id")
+    metadata = store.load_project().get("ctfy") or {}
+    if question_id in (metadata.get("solved_question_ids") or []):
+        raise FGError(f"question {question_id!r} is already solved by the platform")
+    for candidate in store.list_facts():
+        data = candidate.get("data") or {}
+        if candidate.get("kind") == "flag" and data.get("platform") == "ctfy" \
+                and data.get("question_id") == question_id and data.get("status") == "accepted":
+            raise FGError(f"question {question_id!r} is already solved")
     existing = _find_answer_fact(store, instance_id, question_id, value)
     if existing is not None:
         raise FGError(
@@ -2064,14 +2116,25 @@ def cmd_answer(args) -> int:
     print(f"{fact['id']} recorded for question {question_id}")
     if not args.submit:
         return 0
-    if task["run_mode"] == "qa":
-        print(f"{fact['id']} waiting for result handoff")
-        return 0
-    client = module.CtfyClient.from_env()
     try:
-        reply = client.submit_answer(instance_id, question_id, value)
+        client = module.CtfyClient.from_env()
+        if task["run_mode"] == "qa":
+            reply = client.submit_qa_answer(
+                challenge_id, competition_id, question_id, value,
+            )
+        else:
+            reply = client.submit_answer(instance_id, question_id, value)
     except Exception as exc:
-        if isinstance(exc, module.CtfyError) and exc.code == "instance_not_found":
+        if isinstance(exc, module.CtfyError) and exc.transport:
+            _set_ctfy_blocker(store, "platform_unreachable", exc)
+            print(
+                f"{fact['id']} kept as recorded: platform unreachable; "
+                "answer preserved for result handoff"
+            )
+            return 0
+        if task["run_mode"] == "qa":
+            store.update_flag_fact(fact["id"], "submission_failed", str(exc)[:2000])
+        elif isinstance(exc, module.CtfyError) and exc.code == "instance_not_found":
             try:
                 client.get_instance(instance_id)
             except module.CtfyError as health_error:
@@ -2082,8 +2145,9 @@ def cmd_answer(args) -> int:
                         "answer preserved for result handoff"
                     )
                     return 0
+        failure_status = "recorded" if task["run_mode"] == "instance" else "submission_failed"
         raise FGError(
-            f"submit failed, answer kept as {fact['id']} (recorded): {exc}"
+            f"submit failed, answer kept as {fact['id']} ({failure_status}): {exc}"
         ) from exc
     raw = json.dumps(reply, ensure_ascii=False)
     accepted = reply["correct"]
@@ -2091,7 +2155,9 @@ def cmd_answer(args) -> int:
     store.update_flag_fact(fact["id"], status, raw[:2000])
     print(f"{fact['id']} {status}: {raw[:300]}")
     if accepted:
-        _clear_ctfy_blocker(store, {"instance_unavailable"})
+        _clear_ctfy_blocker(
+            store, {"instance_unavailable", "instance_health_unreachable", "platform_unreachable"}
+        )
         try:
             challenge = client.get_challenge(challenge_id)
         except module.CtfyError as exc:
@@ -2120,8 +2186,14 @@ def cmd_ctfy_health(args) -> int:
             _set_ctfy_blocker(store, "instance_unavailable", exc)
             print("instance unavailable; recorded answers preserved")
             return 0
+        if exc.transport:
+            _set_ctfy_blocker(store, "instance_health_unreachable", exc)
+            print("instance health unreachable; recorded answers preserved")
+            return 0
         raise FGError(f"instance health check failed: {exc}") from exc
-    _clear_ctfy_blocker(store, {"instance_unavailable"})
+    _clear_ctfy_blocker(
+        store, {"instance_unavailable", "instance_health_unreachable", "platform_unreachable"}
+    )
     print("instance available")
     return 0
 
@@ -3289,8 +3361,9 @@ def _agents_system_prompt(store: Store, intent_id: str | None = None,
         if (project.get("ctfy") or {}).get("run_mode") == "qa":
             answer_rule = (
                 "In QA, `sapper answer \"<value>\" --question \"<question_id>\" --submit` "
-                "only records the candidate for result.json handoff and does not POST "
-                "or call an instance API. "
+                "records the candidate and sends one QA verdict POST to "
+                "/api/v1/qa/submissions; it never calls an instance API. "
+                "Only a transport failure leaves it recorded for result.json handoff. "
             )
         else:
             answer_rule = (
@@ -3304,6 +3377,11 @@ def _agents_system_prompt(store: Store, intent_id: str | None = None,
             "`sapper doc <id>` to inspect evidence; use `sapper fact` for confirmed "
             f"observations; use `{done_command}` to conclude work.\n"
             f"{answer_rule}"
+            "A supported candidate needs reproducible evidence and an exact current "
+            "question_id. Use the platform category first — Crypto, Reverse, Misc, "
+            "Web, Pwn, or AI security — and its evidence-producing first steps. "
+            "Check tool/input preconditions before probing and record "
+            "closed-vector results instead of repeating falsified work. "
             "Use the exact current question_id and never assume a flag format. "
             "After a transport failure, do not write scripts to repeat an answer POST; "
             "preserve the recorded answer for result export.\n"
@@ -3358,7 +3436,7 @@ def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> i
         append_system=None, cwd=cwd, operation="reason", retry=True,
     )
     text = envelope.get("result", "")
-    payload = extract_json_object(text)
+    payload = _extract_reason_json_object(text)
     kind, data = _classify_reason_payload(payload)
     summary = _apply_reason(store, kind, data)
     print(f"[reason] {summary}")
@@ -3697,6 +3775,14 @@ def _apply_reason(store: Store, kind: str, data) -> str:
         # Validate each candidate before writing it. Invalid model entries are
         # ignored without allowing a malformed id to reach the filesystem.
         existing = {f["id"] for f in store.list_facts()}
+        def intent_key(description, from_ids):
+            normalized = " ".join(str(description).lower().split())
+            return normalized, tuple(sorted(str(x) for x in from_ids))
+        seen = {
+            intent_key(i.get("description", ""), i.get("from", []))
+            for i in store.list_intents()
+        }
+        suppressed = 0
         made = []
         for it in data[:3]:
             if not isinstance(it, dict):
@@ -3717,6 +3803,11 @@ def _apply_reason(store: Store, kind: str, data) -> str:
             desc = raw_desc.strip() if isinstance(raw_desc, str) else ""
             if not desc:
                 continue
+            signature = intent_key(desc, from_ids)
+            if signature in seen:
+                suppressed += 1
+                continue
+            seen.add(signature)
             req = bool(it.get("requires_confirmation", False))
             t = it.get("title")
             t = t.strip() if isinstance(t, str) and t.strip() else None
@@ -3727,7 +3818,10 @@ def _apply_reason(store: Store, kind: str, data) -> str:
                 requires_confirmation=req, title=t, doc=d,
             )
             made.append(intent["id"])
-        return f"proposed intents: {', '.join(made) if made else '(none valid)'}"
+        return (
+            f"proposed intents: {', '.join(made) if made else '(none valid)'}; "
+            f"suppressed={suppressed}"
+        )
     return "unknown"
 
 
@@ -4156,6 +4250,9 @@ def format_time_budget(deadline: float | None) -> str:
     return f"{text} remaining until the {local_end} deadline (local time)"
 
 
+_AUTO_FINALIZE_RESERVE_S = 300
+
+
 def _auto_project_reason(project: dict) -> str | None:
     if project.get("status") == "completed" \
             or (project.get("ctfy") or {}).get("fully_solved") is True:
@@ -4175,6 +4272,30 @@ def _save_auto_outcome(store: Store, reason: str, explore_attempts: int,
             "detail": detail[:500],
         }
         store.save_project(project)
+
+
+def _auto_checkpoint(args) -> None:
+    callback = getattr(args, "checkpoint", None)
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception as exc:
+        sys.stderr.write(f"[auto] checkpoint failed: {exc}\n")
+
+
+def _apply_executor_blocker(store: Store, fact: dict) -> None:
+    data = fact.get("data") or {}
+    kind = data.get("ctfy_blocker")
+    allowed = {
+        "instance_unavailable", "instance_health_unreachable",
+        "platform_unreachable", "target_dns_unavailable",
+    }
+    if kind in allowed:
+        _set_ctfy_blocker(
+            store, kind,
+            data.get("ctfy_blocker_detail") or fact.get("description", "executor confirmed blocker"),
+        )
 
 
 def cmd_auto(args) -> int:
@@ -4197,6 +4318,7 @@ def cmd_auto(args) -> int:
     verify = args.verify
     dry = args.dry_run
     deadline = deadline_from_args(args)
+    soft_deadline = deadline - _AUTO_FINALIZE_RESERVE_S if deadline is not None else None
     if deadline is not None:
         print(f"[auto] deadline {datetime.fromtimestamp(deadline).strftime('%Y-%m-%d %H:%M')} "
               f"({format_time_budget(deadline)})")
@@ -4214,12 +4336,12 @@ def cmd_auto(args) -> int:
     auto_worker = _worker_id(model)
 
     for step in range(1, max_steps + 1):
-        if deadline is not None and time.time() >= deadline:
+        if soft_deadline is not None and time.time() >= soft_deadline:
             stop_reason = "deadline"
-            stop_detail = "wall-clock deadline reached"
+            stop_detail = "finalization reserve reached"
             print("[auto] deadline reached — stopping (record what you have)")
             break
-        args.time_budget = format_time_budget(deadline)
+        args.time_budget = format_time_budget(soft_deadline)
         project = store.load_project()
         project_reason = _auto_project_reason(project)
         if project_reason is not None:
@@ -4242,6 +4364,11 @@ def cmd_auto(args) -> int:
             )
             reason_failures = 0
         except FGError as exc:
+            if isinstance(exc, EngineTimeout) and soft_deadline is not None \
+                    and time.time() >= soft_deadline:
+                stop_reason = "deadline"
+                stop_detail = "engine stopped at the finalization reserve"
+                break
             reason_failures += 1
             failure_detail = str(exc)
             print(f"[auto] step {step}: reason failed ({reason_failures}): {exc}")
@@ -4249,12 +4376,14 @@ def cmd_auto(args) -> int:
                 stop_reason = "model_error"
                 stop_detail = failure_detail
                 break
-            if deadline is not None and time.time() + 15 >= deadline:
-                stop_reason = "model_error"
+            if soft_deadline is not None and time.time() + 15 >= soft_deadline:
+                stop_reason = "deadline"
                 stop_detail = "no time remains for another reason attempt"
                 break
             time.sleep(15)
             continue
+        finally:
+            _auto_checkpoint(args)
         print(f"[auto]        reason -> {summary}")
 
         project = store.load_project()
@@ -4264,11 +4393,16 @@ def cmd_auto(args) -> int:
             stop_detail = summary
             print(f"[auto] step {step}: stopping with {project_reason}")
             break
+        if soft_deadline is not None and time.time() >= soft_deadline:
+            stop_reason = "deadline"
+            stop_detail = "finalization reserve reached after reason"
+            break
 
         ready = [
             i for i in frontier(store)
             if (not i.get("worker") or i.get("worker") == auto_worker)
             and i["id"] not in failed_intents
+            and len(i.get("failures") or []) < 2
         ]
         if kind == "rejected" or (kind == "noop" and not ready):
             noop_streak += 1
@@ -4296,11 +4430,17 @@ def cmd_auto(args) -> int:
             print(f"[auto] step {step}.2 explore {intent['id']}")
             explore_count += 1
             try:
-                _run_explore_raw(
+                fact = _run_explore_raw(
                     store, templates_dir, intent, model, timeout, skip, cwd,
                     claim=True, deadline=deadline,
                 )
+                _apply_executor_blocker(store, fact)
             except FGError as exc:
+                if isinstance(exc, EngineTimeout) and soft_deadline is not None \
+                        and time.time() >= soft_deadline:
+                    stop_reason = "deadline"
+                    stop_detail = "engine stopped at the finalization reserve"
+                    break
                 failed_intents.add(intent["id"])
                 explore_failed = True
                 failure_detail = str(exc)
@@ -4309,10 +4449,16 @@ def cmd_auto(args) -> int:
                     cap_reached = True
                     break
                 continue
+            finally:
+                _auto_checkpoint(args)
             project_reason = _auto_project_reason(store.load_project())
             if project_reason is not None:
                 stop_reason = project_reason
                 stop_detail = f"explore {intent['id']} changed project state"
+                break
+            if soft_deadline is not None and time.time() >= soft_deadline:
+                stop_reason = "deadline"
+                stop_detail = "finalization reserve reached after explore"
                 break
             if verify:
                 iid = intent["id"]
@@ -4340,6 +4486,10 @@ def cmd_auto(args) -> int:
                             content=f"verification could not complete for {iid}: {exc}",
                             creator="verify",
                         )
+            if soft_deadline is not None and time.time() >= soft_deadline:
+                stop_reason = "deadline"
+                stop_detail = "finalization reserve reached after verify"
+                break
             if explore_count >= max_explore:
                 cap_reached = True
                 break
@@ -4382,7 +4532,7 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd, time_budget
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd, operation="reason", retry=True, deadline=deadline,
     )
-    payload = extract_json_object(envelope.get("result", ""))
+    payload = _extract_reason_json_object(envelope.get("result", ""))
     kind, data = _classify_reason_payload(payload)
     summary = _apply_reason(store, kind, data)
     return kind, summary
@@ -5238,8 +5388,10 @@ def _resolve_templates_dir(args) -> Path:
     return Path(__file__).resolve().parent.parent / "templates"
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, checkpoint=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.func is cmd_auto:
+        args.checkpoint = checkpoint
     # patch templates default post-hoc (depends on store)
     if getattr(args, "templates", None) is None and getattr(args, "func", None) in (cmd_dispatch, cmd_auto):
         args.templates = str(_resolve_templates_dir(args))

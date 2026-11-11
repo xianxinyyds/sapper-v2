@@ -415,6 +415,8 @@ class CtfyAnswerTests(unittest.TestCase):
                 self.challenge_calls = []
                 self.instance_calls = []
                 self.instance_responses = []
+                self.qa_calls = []
+                self.qa_responses = []
                 self.observed_statuses = []
 
             def submit_answer(self, instance_id, question_id, answer):
@@ -438,6 +440,16 @@ class CtfyAnswerTests(unittest.TestCase):
                     raise response
                 return response
 
+            def submit_qa_answer(self, challenge_id, competition_id, question_id, answer):
+                self.qa_calls.append((challenge_id, competition_id, question_id, answer))
+                answers = [f for f in test.store.list_facts()
+                           if f.get("kind") == "flag" and (f.get("data") or {}).get("platform") == "ctfy"]
+                self.observed_statuses.append(answers[-1]["data"]["status"] if answers else None)
+                response = self.qa_responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
         self.client = FakeClient()
 
     def tearDown(self):
@@ -445,7 +457,7 @@ class CtfyAnswerTests(unittest.TestCase):
 
     def _write_task(self, question_ids):
         task = {
-            "schema_version": 3, "run_mode": "instance",
+            "schema_version": 3, "run_mode": "instance", "competition_id": "competition-1",
             "challenge": {"id": "challenge-1", "name": "Web", "description": "Solve it"},
             "questions": [{"id": qid, "prompt": f"Prompt {qid}"} for qid in question_ids],
             "gated_questions": 0, "target_instance": "instance-1",
@@ -454,6 +466,12 @@ class CtfyAnswerTests(unittest.TestCase):
         }
         (self.work / "task.json").write_text(json.dumps(task), encoding="utf-8")
         return task
+
+    def _use_qa(self):
+        self.task.update({
+            "run_mode": "qa", "target_instance": None, "target_endpoints": [],
+        })
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
 
     @staticmethod
     def _reply(correct):
@@ -521,6 +539,18 @@ class CtfyAnswerTests(unittest.TestCase):
         fact = [f for f in self.store.list_facts() if f.get("kind") == "flag"][0]
         self.assertEqual(fact["data"]["status"], "recorded")
 
+    def test_instance_transport_failure_sets_blocker_and_preserves_answer(self):
+        self.client.responses = [
+            ctfy.CtfyError("network unavailable", transport=True)
+        ]
+        self.assertEqual(self._answer(), 0)
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "recorded")
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"],
+            "platform_unreachable",
+        )
+
     def test_missing_instance_is_confirmed_once_and_answer_is_kept(self):
         missing = ctfy.CtfyError("instance missing", status=404, code="instance_not_found")
         self.client.responses = [missing]
@@ -546,6 +576,17 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertIn("instance available", stdout.getvalue())
         self.assertNotIn("credential-secret", stdout.getvalue())
 
+    def test_ctfy_health_transport_failure_sets_structured_blocker(self):
+        self.client.instance_responses = [
+            ctfy.CtfyError("health network unavailable", transport=True)
+        ]
+        self.assertEqual(self._health(), 0)
+        self.assertEqual(self.client.instance_calls, ["instance-1"])
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"],
+            "instance_health_unreachable",
+        )
+
     def test_accepted_answer_survives_challenge_refresh_failure(self):
         self.client.responses = [self._reply(True)]
         self.client.get_challenge = mock.Mock(
@@ -557,21 +598,58 @@ class CtfyAnswerTests(unittest.TestCase):
         blocker = self.store.load_project()["ctfy"]["blocker"]
         self.assertEqual(blocker["kind"], "challenge_refresh_failed")
 
-    def test_qa_submit_records_for_result_handoff_without_client(self):
-        self.task.update({
-            "run_mode": "qa", "target_instance": None, "target_endpoints": [],
-        })
-        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
-        factory = mock.Mock(return_value=self.client)
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            self.assertEqual(self._answer(client_factory=factory), 0)
-        factory.assert_not_called()
+    def test_qa_submit_applies_accepted_verdict_and_refreshes(self):
+        self._use_qa()
+        self.challenge["my_solved_question_ids"] = ["flag"]
+        self.challenge["my_fully_solved"] = True
+        self.client.qa_responses = [self._reply(True)]
+        self.assertEqual(self._answer(), 0)
+        self.assertEqual(self.client.observed_statuses, ["recorded"])
+        self.assertEqual(self.client.qa_calls, [
+            ("challenge-1", "competition-1", "flag", "FLAG{x}")
+        ])
         self.assertEqual(self.client.calls, [])
         fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
-        self.assertIsNone(fact["data"].get("instance_id"))
+        self.assertEqual(fact["data"]["status"], "accepted")
+        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+
+    def test_qa_submit_applies_rejected_verdict(self):
+        self._use_qa()
+        self.client.qa_responses = [self._reply(False)]
+        self.assertEqual(self._answer(), 1)
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "rejected")
+        self.assertEqual(self.client.challenge_calls, [])
+
+    def test_qa_transport_failure_sets_blocker_and_preserves_answer(self):
+        self._use_qa()
+        self.client.qa_responses = [
+            ctfy.CtfyError("network unavailable", transport=True)
+        ]
+        self.assertEqual(self._answer(), 0)
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
         self.assertEqual(fact["data"]["status"], "recorded")
-        self.assertIn("result handoff", stdout.getvalue())
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"],
+            "platform_unreachable",
+        )
+
+    def test_qa_http_failure_is_not_handed_off(self):
+        self._use_qa()
+        self.client.qa_responses = [ctfy.CtfyError("forbidden", status=403)]
+        with self.assertRaisesRegex(sapper.FGError, "forbidden"):
+            self._answer()
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "submission_failed")
+
+    def test_qa_submit_requires_competition_id(self):
+        self._use_qa()
+        self.task.pop("competition_id")
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        factory = mock.Mock(return_value=self.client)
+        with self.assertRaisesRegex(sapper.FGError, "competition_id"):
+            self._answer(client_factory=factory)
+        factory.assert_not_called()
 
     def test_answer_dedupe_key_includes_question(self):
         self._answer(submit=False)
@@ -581,6 +659,28 @@ class CtfyAnswerTests(unittest.TestCase):
         answers = [f for f in self.store.list_facts() if f.get("kind") == "flag"]
         self.assertEqual(len(answers), 2)
         self.assertEqual({f["data"]["question_id"] for f in answers}, {"flag", "q2"})
+
+    def test_answer_is_rejected_when_question_already_accepted(self):
+        self.store.add_fact(
+            "accepted answer", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "instance_id": "instance-1", "question_id": "flag",
+                "value": "old", "status": "accepted",
+            },
+        )
+        with self.assertRaisesRegex(sapper.FGError, "already solved"):
+            self._answer(value="new-value")
+        self.assertEqual(self.client.calls, [])
+
+    def test_answer_is_rejected_when_platform_solved_but_other_question_allowed(self):
+        project = self.store.load_project()
+        project["ctfy"] = {"solved_question_ids": ["flag"]}
+        self.store.save_project(project)
+        with self.assertRaisesRegex(sapper.FGError, "already solved"):
+            self._answer(value="new-value")
+        self.assertEqual(self._answer(value="other", question="q2", submit=False), 0)
+        self.assertEqual(self.client.calls, [])
 
     def test_scoped_identity_comes_from_task_not_environment(self):
         self.client.responses = [self._reply(True)]
@@ -623,6 +723,44 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertEqual(metadata["run_mode"], "instance")
         self.assertEqual(metadata["solved_question_ids"], ["flag"])
         self.assertFalse(metadata["fully_solved"])
+
+    def test_category_aliases_are_normalized(self):
+        cases = {
+            "crypto": "Crypto", "rev": "Reverse", "reverse": "Reverse",
+            "misc": "Misc", "web": "Web", "pwn": "Pwn",
+            "ai": "AI security", "ai_security": "AI security", "AI security": "AI security",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(sapper._normalize_ctfy_category(raw), expected)
+        self.assertIsNone(sapper._normalize_ctfy_category("unknown"))
+
+    def test_sync_ctfy_facts_normalizes_category_and_ignores_unknown(self):
+        self.task["challenge"]["category"] = "web"
+        self.task["challenge"]["tags"] = ["task-tag"]
+        self.challenge["category"] = "rev"
+        self.challenge["tags"] = ["reverse", "elf"]
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["category"], "Reverse")
+        self.assertEqual(metadata["tags"], ["reverse", "elf"])
+
+        self.challenge["category"] = "not-a-category"
+        self.challenge["tags"] = "not-a-list"
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        metadata = self.store.load_project()["ctfy"]
+        self.assertNotIn("category", metadata)
+        self.assertNotIn("tags", metadata)
+
+    def test_sync_ctfy_facts_uses_task_category_when_refresh_omits_it(self):
+        self.task["challenge"]["category"] = "crypto"
+        self.task["challenge"]["tags"] = ["rsa"]
+        self.challenge.pop("category", None)
+        self.challenge.pop("tags", None)
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["category"], "Crypto")
+        self.assertEqual(metadata["tags"], ["rsa"])
 
     def test_correct_answer_refreshes_gated_questions(self):
         self.challenge["questions"] = self.task["questions"] + [{"id": "q3", "prompt": "Unlocked"}]
@@ -1037,6 +1175,36 @@ class KeyRotationTests(unittest.TestCase):
             self.assertEqual(os.environ["ANTHROPIC_AUTH_TOKEN"], "t1")
 
 
+class ReasonJsonRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = sapper.Store(Path(self.tmp.name) / ".sapper")
+        self.store.init("ctfy:challenge-1", "solve")
+        self.templates = ROOT / "templates" / "ctfy"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def reason(self, text):
+        with mock.patch.object(sapper, "run_claude", return_value={"result": text}):
+            return sapper._run_reason_raw(
+                self.store, self.templates, "model", 10, True, Path(self.tmp.name),
+            )
+
+    def test_reason_repairs_exactly_one_missing_terminal_brace(self):
+        kind, _ = self.reason('{"accepted": true, "data": {}')
+        self.assertEqual(kind, "noop")
+
+    def test_reason_rejects_multiple_missing_braces_and_truncated_strings(self):
+        for text in ('{"accepted": true, "data": {', '{"accepted": true, "data": "x'):
+            with self.subTest(text=text), self.assertRaises(sapper.FGError):
+                self.reason(text)
+
+    def test_reason_repair_still_enforces_schema(self):
+        with self.assertRaises(sapper.FGError):
+            self.reason('{"accepted": true, "data": {"intents": "bad"}')
+
+
 class AutoLoopTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1156,6 +1324,177 @@ class AutoLoopTests(unittest.TestCase):
         self.assertEqual(explore.call_args.args[2]["id"], first["id"])
         self.assertEqual(outcome["reason"], "blocker")
 
+    def test_typed_blocker_stops_remaining_frontier(self):
+        first = self.add_intent("first")
+        self.add_intent("second")
+
+        def conclude_blocker(store, templates, intent, *args, **kwargs):
+            fact, _ = store.conclude_with_new_fact(
+                intent["id"], "confirmed DNS outage", sapper._worker_id("model"),
+                kind="note", data={"ctfy_blocker": "target_dns_unavailable"},
+            )
+            return fact
+
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=conclude_blocker) as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "blocker")
+        self.assertEqual(explore.call_count, 1)
+        self.assertEqual(explore.call_args.args[2]["id"], first["id"])
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"],
+            "target_dns_unavailable",
+        )
+
+    def test_prose_and_unknown_blockers_do_not_stop_auto(self):
+        for marker in (None, "not-a-blocker"):
+            with self.subTest(marker=marker):
+                data = {"ctfy_blocker": marker} if marker else None
+                intent = self.add_intent()
+                with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                        mock.patch.object(sapper, "_run_explore_raw") as explore:
+                    explore.side_effect = lambda *args, **kwargs: args[0].conclude_with_new_fact(
+                        intent["id"], "prose instance_unavailable only",
+                        sapper._worker_id("model"), kind="note", data=data,
+                    )[0]
+                    rc, outcome = self.run_auto(self.args(max_steps=1))
+                self.assertEqual(rc, 0)
+                self.assertEqual(outcome["reason"], "max_steps")
+                self.assertNotIn("blocker", self.store.load_project().get("ctfy", {}))
+
+    def test_blocker_from_executor_completed_malformed_response(self):
+        self.add_intent()
+
+        def done_then_malformed(*args, **kwargs):
+            fact, _ = self.store.conclude_with_new_fact(
+                "i001", "completed with blocker", sapper._worker_id("model"),
+                kind="note", data={"ctfy_blocker": "platform_unreachable"},
+            )
+            return {"result": "not-json"}
+
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "run_claude", side_effect=done_then_malformed):
+            rc, outcome = self.run_auto(self.args(max_steps=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "blocker")
+        self.assertEqual(
+            self.store.load_project()["ctfy"]["blocker"]["kind"],
+            "platform_unreachable",
+        )
+
+    def test_main_injects_checkpoint_into_auto(self):
+        callback = mock.Mock()
+        with mock.patch.object(sapper, "cmd_auto", return_value=0) as auto:
+            rc = sapper.main([
+                "--store", str(self.store.root), "auto", "--model", "model",
+                "--templates", str(self.templates),
+            ], checkpoint=callback)
+        self.assertEqual(rc, 0)
+        self.assertIs(auto.call_args.args[0].checkpoint, callback)
+
+    def test_checkpoint_runs_after_reason_and_explore_and_errors_are_nonfatal(self):
+        self.add_intent()
+        callback = mock.Mock(side_effect=RuntimeError("checkpoint failed"))
+        args = self.args(max_steps=1)
+        args.checkpoint = callback
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("noop", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=self.conclude):
+            rc, outcome = self.run_auto(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "max_steps")
+        self.assertEqual(callback.call_count, 2)
+
+    def test_deadline_after_reason_skips_explore_and_claim(self):
+        intent = self.add_intent()
+        with mock.patch.object(sapper, "deadline_from_args", return_value=1305), \
+                mock.patch.object(sapper.time, "time", return_value=1000) as clock, \
+                mock.patch.object(sapper, "_run_reason_raw") as reason, \
+                mock.patch.object(sapper, "_run_explore_raw") as explore:
+            reason.side_effect = lambda *args, **kwargs: (
+                clock.configure_mock(return_value=1005) or ("intents", "ready")
+            )
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "deadline")
+        explore.assert_not_called()
+        self.assertEqual(self.store.get_intent(intent["id"])["status"], "open")
+
+    def test_deadline_between_explores_stops_remaining_frontier(self):
+        first = self.add_intent("first")
+        self.add_intent("second")
+        with mock.patch.object(sapper, "deadline_from_args", return_value=1305), \
+                mock.patch.object(sapper.time, "time", return_value=1000) as clock, \
+                mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw") as explore:
+            explore.side_effect = lambda *args, **kwargs: (
+                clock.configure_mock(return_value=1005)
+                or self.conclude(*args, **kwargs)
+            )
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "deadline")
+        self.assertEqual(explore.call_count, 1)
+        self.assertEqual(explore.call_args.args[2]["id"], first["id"])
+
+    def test_deadline_after_explore_skips_verify(self):
+        self.add_intent()
+        with mock.patch.object(sapper, "deadline_from_args", return_value=1305), \
+                mock.patch.object(sapper.time, "time", return_value=1000) as clock, \
+                mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw") as explore, \
+                mock.patch.object(sapper, "_run_verify_raw") as verify:
+            explore.side_effect = lambda *args, **kwargs: (
+                clock.configure_mock(return_value=1005)
+                or self.conclude(*args, **kwargs)
+            )
+            rc, outcome = self.run_auto(self.args(max_steps=3, verify=True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "deadline")
+        verify.assert_not_called()
+
+    def test_engine_timeout_after_soft_deadline_is_not_model_error(self):
+        with mock.patch.object(sapper, "deadline_from_args", return_value=1305), \
+                mock.patch.object(sapper.time, "time", return_value=1000) as clock, \
+                mock.patch.object(sapper, "_run_reason_raw") as reason, \
+                mock.patch.object(sapper.time, "sleep"):
+            reason.side_effect = lambda *args, **kwargs: (
+                clock.configure_mock(return_value=1006)
+                or (_ for _ in ()).throw(sapper.EngineTimeout("deadline"))
+            )
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "deadline")
+        self.assertEqual(reason.call_count, 1)
+
+    def test_apply_reason_dedupes_only_exact_normalized_intent(self):
+        self.add_intent("Inspect target")
+        other = self.store.add_fact("new evidence", "test")
+        data = [
+            {"from": [self.seed["id"]], "description": "  inspect   TARGET "},
+            {"from": [other["id"]], "description": "Inspect target"},
+            {"from": [self.seed["id"]], "description": "Different work"},
+        ]
+        summary = sapper._apply_reason(self.store, "intents", data)
+        intents = self.store.list_intents()
+        self.assertEqual(len(intents), 3)
+        self.assertIn("suppressed=1", summary)
+        self.assertEqual(intents[-1]["description"], "Different work")
+
+    def test_intent_with_two_persistent_failures_is_not_retried(self):
+        intent = self.add_intent()
+        intent["failures"] = [
+            {"created_at": "old-1", "category": "timeout", "message": "one", "worker": "w1"},
+            {"created_at": "old-2", "category": "timeout", "message": "two", "worker": "w2"},
+        ]
+        self.store.save_intent(intent)
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw") as explore:
+            rc, outcome = self.run_auto(self.args(max_steps=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "no_progress")
+        explore.assert_not_called()
+
     def test_model_error_is_a_structured_failure(self):
         with mock.patch.object(sapper, "_run_reason_raw", side_effect=sapper.FGError("model down")) as reason, \
                 mock.patch.object(sapper.time, "sleep"):
@@ -1210,7 +1549,7 @@ class AutoLoopTests(unittest.TestCase):
             return "complete", "solved"
 
         with mock.patch.object(sapper, "_run_reason_raw", side_effect=complete_with_countdown):
-            rc, outcome = self.run_auto(self.args(minutes=1))
+            rc, outcome = self.run_auto(self.args(minutes=6))
         self.assertEqual(rc, 0)
         self.assertEqual(outcome["reason"], "completed")
 

@@ -1,14 +1,16 @@
 {
   "id": "kb042",
-  "title": "Pwn 二进制方向速查",
-  "description": "栈溢出到 libc 三步与常见保护绕过",
-  "detail": "1. checksec 看保护：NX/PIE/RELRO/Canary\n2. 栈溢出：找偏移（cyclic）→ ret2win → ret2libc（泄露 put/got → 计算 base → system(/bin/sh)）\n3. 格式化字符串：%p 泄露 → %n 写（改 got/返回地址/fini_array）\n4. 堆：fastbin attack/tcache poisoning/UAF/unsorted bin leak（glibc 版本对号）\n5. Canary：泄露（格式化/输出残留）；PIE：partial overwrite\n6. one_gadget / ROPgadget / pwntools 模板（本地同版本 libc 调试）\n7. 无输出环境：ret2dlresolve / SROP / ORW 链\n8. 环境坑：靶机 libc 与本地不一致 → patchelf + ld 指定（往届队伍翻车点）\n渗透赛占比小，出现多为简单 ret2win/后门函数。",
+  "title": "Pwn 二进制与协议验证工作流",
+  "description": "先核对真实附件和协议，再做有界偏移、泄露与 ROP 验证",
+  "detail": "1. 前置检查：题目宣传的 ELF/source/libc 是否真实存在且可读；只有占位 README 时先做本地审计，不连续数小时猜远程布局。\n2. 有附件时：file/readelf/nm/objdump + checksec 看架构、NX/PIE/RELRO/Canary；没有附件时先确认服务协议、banner、命令、分帧和错误行为。\n3. 栈溢出：用唯一模式或已知本地程序确定偏移，再选择 ret2win 或 ret2libc；远程黑盒 variants 建 coverage matrix，同一假设族被否定后停止。\n4. 格式化字符串：先证明 %p 泄露或 %n 写确实生效；不得把字面回显当格式化漏洞。\n5. 堆与保护：按真实 libc 版本判断 tcache/UAF/unsorted bin；Canary/PIE 需要泄露证据，patchelf、one_gadget 不是默认依赖。\n6. ROP：优先 pwntools.ROP、ROPgadget 和 objdump；ropper 不可用时回退而不是安装。\n7. 先在本地已知程序/输入上验证 exploit，再做有界远程请求；每次崩溃、泄露和连接行为立即 checkpoint，禁止无 candidate 的 submission intent。",
   "commands": [
-    "checksec --file=pwn1 && ROPgadget --binary pwn1 | grep syscall"
+    "file pwn1 && checksec --file=pwn1 && readelf -h -S -s pwn1",
+    "python3 -I -c \"from pwn import *; print(ROP('pwn1').find_gadget(['ret']))\"",
+    "objdump -d pwn1"
   ],
   "tags": [
     "pwn"
   ],
-  "source": "CTF wiki 思路",
+  "source": "本地二进制与授权协议验证工作流",
   "created_at": "2026-10-15T14:14:39Z"
 }

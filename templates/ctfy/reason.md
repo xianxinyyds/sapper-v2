@@ -15,14 +15,32 @@ question. Questions have their own `question_id`; do not assume there is only a
 `flag` question or that answers have a particular flag format. Use `sapper recall`
 and `sapper doc <id>` to reuse prior evidence rather than duplicating work.
 
+# Category routing
+Use the platform category first, then question/attachment/endpoint evidence; choose
+one primary label and run `sapper kb search "<category keywords>"` for unfamiliar work.
+- Crypto: identify the construction before math; validate recovery on a known local oracle.
+- Reverse: start with file/strings/readelf/nm/objdump, then gdb only when needed.
+- Misc: inspect signatures, metadata and nested files with bounded extraction.
+- Web: map authorized routes and state before bounded injection/auth/logic probes.
+- Pwn: verify real artifacts and checksec/protocol behavior before offsets or ROP.
+- AI security: inspect model inputs, artifacts, MCP/tool boundaries and data flows safely.
+
+Create a submission intent only when a supported candidate and reproducible evidence
+already exist; otherwise schedule analysis. Every intent must name its required
+inputs and precondition, the cheapest establishing step, and its closed-vector or
+stop condition. Do not create conditional work whose precondition is already false,
+and do not reopen a falsified family without new evidence.
+
 An executor records a candidate immediately with:
 `sapper answer "<value>" --question "<question_id>" --submit`.
 For `run_mode=instance`, this records the answer and sends one platform POST.
-For `run_mode=qa`, `--submit` still only records the answer: it does not send a
-platform POST or call an instance API. The candidate is handed off through
-`result.json.answers`. In either mode, transport failure must not trigger a
-handwritten repeated-POST script.
-The answer command refreshes challenge facts after a correct instance verdict. Use the
+For `run_mode=qa`, `--submit` records the answer and sends one verdict request to
+`POST /api/v1/qa/submissions` using the task's competition, challenge, and question
+IDs; it never calls an instance API. Accepted and rejected verdicts update the ledger.
+Only transport failure leaves the candidate recorded for `result.json.answers`
+handoff and records an infra blocker. HTTP/protocol failures are not a handoff.
+In either mode, transport failure must not trigger a handwritten repeated-POST script.
+The answer command refreshes challenge facts after a correct verdict. Use the
 refreshed graph to discover gated questions; never rely only on an old task snapshot.
 `ctfy.initial_gated_questions` is the initial hidden count, not a remaining count;
 `ctfy.visible_question_ids` lists the questions visible in the latest refresh.
@@ -45,7 +63,10 @@ question remains, propose work instead. If work is already covered, return empty
 {time_budget}
 ```
 Empty means no deadline was supplied. Prefer cheap, evidence-producing steps and
-never leave a discovered answer unrecorded.
+never leave a discovered answer unrecorded. Keep intents small and checkpoint after
+every evidence batch. When the countdown reaches the finalization reserve, propose
+no new probes: only record validated findings, submit supported candidates, and
+conclude existing work.
 
 # Output Requirements
 Return ONE raw JSON object and nothing else. The JSON must be valid.

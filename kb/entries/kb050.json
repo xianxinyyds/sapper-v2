@@ -2,10 +2,10 @@
   "id": "kb050",
   "title": "中间件 RCE 速查（版本→CVE→nuclei）",
   "description": "指纹命中即打的最高频中间件漏洞表",
-  "detail": "指纹→打法映射（nuclei 模板内置，用 -tags 指定）：Log4j2 ≤2.14（log4shell）；Spring Boot ≤2.3（actuator 泄露+VM）；Shiro ≤1.5.1（rememberMe 反序列化）；Fastjson ≤1.2.47（autoType RCE）；WebLogic（CVE-2019-2725/2888）；Confluence（CVE-2022-26134 OGNL）；GitLab（CVE-2021-22205 exiftool）；ThinkPHP 5.x（invokefunction 路由 RCE，payload 形如 s=index/think 加 app/invokefunction）。流程：钉死版本 → 本表对照 → nuclei -u T -tags X 验证 → 拿 RCE 读 flag。",
+  "detail": "指纹→打法映射（模板存在时才用 nuclei -tags）：Log4j2 ≤2.14（log4shell）；Spring Boot ≤2.3（actuator 泄露+VM）；Shiro ≤1.5.1（rememberMe 反序列化）；Fastjson ≤1.2.47（autoType RCE）；WebLogic（CVE-2019-2725/2888）；Confluence（CVE-2022-26134 OGNL）；GitLab（CVE-2021-22205 exiftool）；ThinkPHP 5.x（invokefunction 路由 RCE，payload 形如 s=index/think 加 app/invokefunction）。流程：钉死版本 → 本表对照 → 检查 nuclei 模板目录 → 有模板则定向验证，无模板则 curl/Python 手工验证 → 拿 RCE 读 flag。镜像只保证 nuclei 二进制，不保证内置模板或允许联网下载。",
   "commands": [
-    "nuclei -u http://T -tags log4j,spring,shiro,fastjson -severity critical,high",
-    "nuclei -u http://T -tags weblogic,confluence,gitlab"
+    "nuclei -version",
+    "find \"$HOME\" -maxdepth 2 -type d -name nuclei-templates"
   ],
   "tags": [
     "cve",

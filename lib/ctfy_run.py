@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import ctfy
@@ -18,7 +20,7 @@ def _write_empty_result(work_dir: Path, stop_reason: str) -> None:
 
 
 def _fail(work_dir: Path, stop_reason: str, error: Exception,
-          store: sapper.Store | None = None) -> int:
+          store: sapper.Store | None = None, *, exit_code: int = 2) -> int:
     try:
         if store is None:
             _write_empty_result(work_dir, stop_reason)
@@ -27,7 +29,7 @@ def _fail(work_dir: Path, stop_reason: str, error: Exception,
     except (ctfy.CtfyError, sapper.FGError) as result_error:
         sys.stderr.write(f"ctfy: {result_error}\n")
     sys.stderr.write(f"ctfy: {error}\n")
-    return 2
+    return exit_code
 
 
 def _scan_ledger(store: sapper.Store) -> tuple[dict[str, dict], set[str], bool]:
@@ -64,6 +66,14 @@ def collect_ledger(store: sapper.Store) -> tuple[dict[str, str], list[str], bool
     latest, solved, fully_solved = _scan_ledger(store)
     answers = {question: fact["data"]["value"] for question, fact in latest.items()}
     return answers, sorted(solved), fully_solved
+
+
+def _checkpoint_result(work_dir: Path, store: sapper.Store) -> None:
+    answers, solved, fully_solved = collect_ledger(store)
+    ctfy.write_result(
+        work_dir, answers=answers, solved=solved,
+        fully_solved=fully_solved, stop_reason="incomplete",
+    )
 
 
 def finalize_result(work_dir: Path, store: sapper.Store, stop_reason: str) -> None:
@@ -121,6 +131,24 @@ def _max_steps(task: dict) -> int:
     return configured
 
 
+def _round_deadline(challenge: dict) -> float:
+    minutes = _positive_env("SAPPER_ROUND_MINUTES") or 165
+    candidates = [time.time() + minutes * 60]
+    close_at = challenge.get("close_at")
+    if isinstance(close_at, str) and close_at.strip():
+        text = close_at.strip()
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.astimezone()
+            candidates.append(parsed.timestamp())
+        except ValueError:
+            pass
+    return min(candidates)
+
+
 def run(work_dir: Path) -> int:
     try:
         task = ctfy.load_task(work_dir)
@@ -138,14 +166,16 @@ def run(work_dir: Path) -> int:
         client = ctfy.CtfyClient.from_env()
         challenge = client.get_challenge(task["challenge"]["id"])
     except ctfy.CtfyError as exc:
+        reason = "blocked_by_infra" if exc.transport else "config_error"
+        exit_code = 0 if exc.transport else 2
         store = sapper.Store(work_dir / ".sapper")
         try:
             if store.exists() and store.load_project().get("origin") \
                     == f"ctfy:{task['challenge']['id']}":
-                return _fail(work_dir, "config_error", exc, store)
+                return _fail(work_dir, reason, exc, store, exit_code=exit_code)
         except sapper.FGError:
             pass
-        return _fail(work_dir, "config_error", exc)
+        return _fail(work_dir, reason, exc, exit_code=exit_code)
     try:
         store = prepare_graph(work_dir, task, challenge)
     except (ctfy.CtfyError, sapper.FGError) as exc:
@@ -161,13 +191,20 @@ def run(work_dir: Path) -> int:
         if store.load_project()["status"] == "completed" \
                 and challenge.get("my_fully_solved") is not True:
             store.reopen_project()
+        _checkpoint_result(work_dir, store)
         model = configure_model()
         max_steps = _max_steps(task)
         max_explore = _positive_env("SAPPER_MAX_EXPLORE") or max_steps
-        round_minutes = _positive_env("SAPPER_ROUND_MINUTES")
+        dispatch_timeout = _positive_env("CTFY_DISPATCH_TIMEOUT") \
+            or _positive_env("SAPPER_TIMEOUT") or 300
+        deadline = _round_deadline(challenge)
         ctfy.ensure_attachments(task, client, work_dir)
     except (ctfy.CtfyError, sapper.FGError) as exc:
-        return _fail(work_dir, "config_error", exc, store)
+        transport = getattr(exc, "transport", False)
+        return _fail(
+            work_dir, "blocked_by_infra" if transport else "config_error", exc, store,
+            exit_code=0 if transport else 2,
+        )
 
     auto_args = [
         "--store", str(store.root), "auto",
@@ -177,9 +214,13 @@ def run(work_dir: Path) -> int:
         "--max-steps", str(max_steps),
         "--max-explore", str(max_explore),
     ]
-    if round_minutes is not None:
-        auto_args += ["--minutes", str(round_minutes)]
-    return_code = sapper.main(auto_args)
+    auto_args += [
+        "--timeout", str(dispatch_timeout),
+        "--deadline", datetime.fromtimestamp(deadline).isoformat(),
+    ]
+    return_code = sapper.main(
+        auto_args, checkpoint=lambda: _checkpoint_result(work_dir, store)
+    )
     answers, _, _ = collect_ledger(store)
     project = store.load_project()
     outcome = project.get("last_auto")

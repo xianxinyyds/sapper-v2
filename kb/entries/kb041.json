@@ -1,14 +1,15 @@
 {
   "id": "kb041",
-  "title": "Crypto 常见套路（比赛速查）",
-  "description": "古典/编码/常见数学陷阱",
-  "detail": "1. 编码链：base16/32/58/62/64/85、hex、url、uu；中文->utf8/gbk hex\n2. 古典：凯撒/维吉尼亚（quipqiup）、栅栏、培根、猪圈、键盘坐标、音符/电码\n3. RSA 套路：e=1/小 e（立方攻击）、共模、小 n（yafu 分解）、n 相同公约数、维纳/邦格罗德（e 大）、p 高位（coppersmith）、泄露 dp/dq\n4. 古典工具：RsaCtfTool 起手，-n -e --decrypt\n5. 哈希：长度扩展（hashpumpy）；md5 碰撞（fastcoll）\n6. 异或：已知明文开头（flag{）逐位还原循环 key\n7. 椭圆：smart's attack（ anomalous curve ）\n8. lfsr/格：lattice 用 sage；比赛 CVM 上没 sage 就 python 的 olll 实现\n渗透赛里 crypto 多为\"解开拿凭据/flag\"的小题，重识别轻推导。",
+  "title": "Crypto 常见套路与可验证恢复",
+  "description": "先识别密码结构，再用本地已知答案 oracle 验证恢复代码",
+  "detail": "1. 编码与古典：base 家族、hex、凯撒/维吉尼亚、栅栏、异或已知前缀，全部用 Python 小步验证。\n2. RSA：e=1/小 e、共模、共享因子、小 n、泄露 dp/dq、Wiener 等；优先 pycryptodome/sympy/gmpy2/z3，RsaCtfTool、Sage、yafu 不是镜像默认依赖。\n3. 哈希：长度扩展和碰撞需先确认构造与工具；没有相应工具就记录限制，不假装可运行。\n4. CBC：先验证是否存在 decrypt/unpad 接口和可区分的 padding 错误，再考虑 padding oracle；不要只因标题含 CBC 就套用。\n5. ECB secret-suffix：用同一连接确认确定性、块大小和前缀/后缀长度，再逐字节比较。必须保持 hex 字符串与原始字节长度一致，并验证每轮恰好一个候选命中。\n6. 恢复脚本先在本地已知密钥、已知明文的 oracle 上通过，再对授权服务做有界请求；出现所有候选都命中、连续空格或异常重复字节时立即判为实现错误并停止。\n7. 每恢复一个字节立即 checkpoint，后续脚本不得覆盖已验证前缀；异常输出必须保留为新证据而不是新答案。",
   "commands": [
-    "RsaCtfTool -n ... -e 65537 --decrypt --uncipher file"
+    "python3 -I -c \"from Crypto.Cipher import AES; print(AES.block_size)\"",
+    "python3 -I -c \"import sympy; print(sympy.factorint(10403))\""
   ],
   "tags": [
     "crypto"
   ],
-  "source": "CTF wiki 思路",
+  "source": "CTF crypto 可验证恢复工作流",
   "created_at": "2026-10-15T14:14:39Z"
 }

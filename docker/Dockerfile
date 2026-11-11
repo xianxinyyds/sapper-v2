@@ -58,7 +58,7 @@ RUN unzip -o /tmp/nuclei.zip -d /usr/local/bin nuclei \
 # --allow-scripts: kali's npm blocks postinstall by default, but claude-code
 # ships a native binary that its postinstall (node install.cjs) must fetch.
 RUN npm install -g --allow-scripts=@anthropic-ai/claude-code \
-        @anthropic-ai/claude-code @openai/codex \
+        @anthropic-ai/claude-code @openai/codex@0.167.0 \
     && claude --version \
     && codex --version \
     && npm cache clean --force

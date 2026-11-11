@@ -35,13 +35,24 @@ The container starts as an unprivileged user with cwd `/ctfy/work`.
 | `LLM_BASE_URL` | Optional provider endpoint override |
 | `SAPPER_MAX_STEPS` | Optional lower safety cap on the selected turn budget |
 | `SAPPER_MAX_EXPLORE` | Optional explore-dispatch cap; defaults to the selected turn budget |
-| `SAPPER_ROUND_MINUTES` | Optional wall-clock deadline for this auto round |
+| `SAPPER_ROUND_MINUTES` | Optional wall-clock round budget; defaults to `165` minutes |
+| `CTFY_DISPATCH_TIMEOUT` | Optional per-reason/explore dispatch cap; defaults to `300` seconds |
+| `SAPPER_TIMEOUT` | Fallback dispatch cap when `CTFY_DISPATCH_TIMEOUT` is unset |
 | `SAPPER_RETRY_MODEL` | Bounded retries for non-timeout transient reason calls |
 
 A positive `task.max_turns` wins over `CTFY_EVAL_MAX_TURNS`; if neither is
 available, the default is `8`. `SAPPER_MAX_STEPS` can only reduce that value.
 Turn counts are not seconds. Invalid or non-positive budget environment values
 produce `config_error`.
+
+The effective absolute deadline is the earliest of the round budget and a parseable
+`challenge.close_at`. Auto reserves the last 300 seconds as the **finalization
+reserve**: no new reason/explore dispatch starts then, while an in-flight engine is
+still bounded by the true deadline. The runner writes a ledger-aware result after
+`prepare_graph()` and atomically checkpoints after every reason/explore attempt.
+Intermediate checkpoints use `stop_reason=incomplete` and never mark answers
+`handed_off`; finalization remains the only handoff transition. A hard SIGKILL is
+still outside the cleanup guarantee, but it no longer erases earlier checkpoints.
 
 The runner clears `SAPPER_KEY_POOL` and maps only the platform model variables to
 the selected CLI. Credentials are kept in process memory and are not written to
@@ -76,6 +87,8 @@ with a null path are downloaded from the current instance. QA attachments must
 already exist at their local paths; QA never constructs an instance download.
 If the initial challenge GET fails, a matching existing graph is still used for
 the result rollup so recorded answers are not overwritten by an empty result.
+Exhausted transport retries produce `blocked_by_infra` and exit `0`; HTTP/protocol
+errors remain `config_error` with a non-zero exit.
 
 An executor records a candidate immediately:
 
@@ -89,10 +102,13 @@ repeated-POST scripts. A correct response refreshes the challenge so gated
 questions can enter the graph. An accepted fact is persisted before that refresh;
 a later refresh failure cannot roll back `accepted` or remove it from `solved`.
 
-In QA mode, the same command only records the candidate for
-`result.json.answers` handoff. It does not call an instance API or send a QA or
-instance submission POST from this runner. The platform can then process the
-handed-off answers and expose solved state in a later challenge refresh.
+In QA mode, the same command records the answer before one verdict request to
+`POST /api/v1/qa/submissions`, using the task's `competition_id`, `challenge_id`,
+`question_id`, and answer. It never calls an instance API. Accepted and rejected
+verdicts update the ledger, and accepted answers refresh the challenge. Only a
+transport failure leaves the candidate `recorded` for `result.json.answers` handoff
+and records `platform_unreachable`; HTTP/protocol failures use `submission_failed`
+and are not silently handed off.
 
 Challenge GETs and attachment downloads have bounded retries, including direct
 `TimeoutError` response reads. The instance health GET is deliberately
@@ -107,8 +123,13 @@ rather than instance credentials. A confirmed missing instance records an
 `instance_unavailable` blocker; there is no sleep/poll loop and no instance
 creation. A refresh failure records `challenge_refresh_failed`. All visible
 questions being solved while `fully_solved=false` and no new question is visible
-records `gating_pending`. Blockers stop further reason/explore work and preserve
+records `gating_pending`. Other transport kinds are `platform_unreachable` and
+`instance_health_unreachable`; executor-confirmed DNS failures use the typed
+`target_dns_unavailable` marker. Blockers stop further reason/explore work and preserve
 recorded or accepted answers.
+
+The CTFY planner supports concise routing for Crypto, Reverse, Misc, Web, Pwn and
+AI security, with platform category preferred over task/attachment inference.
 
 ## Result and exit semantics
 
@@ -117,20 +138,22 @@ Answer facts have these states:
 - `recorded`: saved locally, but no platform verdict was received.
 - `accepted`: the platform returned `correct: true`.
 - `rejected`: the platform returned `correct: false`.
+- `submission_failed`: an HTTP/protocol failure made the submission ineligible for
+  silent result handoff; it is excluded from `answers`.
 - `handed_off`: a recorded candidate was written to `result.json`; later rounds
   do not automatically submit it again.
 
 `answers` contains only the latest unverified `recorded` candidate for each
-question. Accepted, rejected, handed-off, and legacy Arena flags are excluded.
+question. Accepted, rejected, submission-failed, handed-off, and legacy Arena flags are excluded.
 After a successful result write, the exported candidates become `handed_off`.
 `solved` combines locally accepted question ids with the platform's solved list;
 `fully_solved` comes only from the platform challenge response.
 
 `done` is used only for a completed graph or authoritative `fully_solved=true`.
 An ordinary unfinished run may exit `0` with `incomplete`, `no_progress`,
-`max_steps`, `explore_cap`, or `deadline`. QA candidates normally produce
-`answers_handed_off`. A structured instance/refresh/gating blocker produces
-`blocked_by_infra` and exits `0` after writing the result.
+`max_steps`, `explore_cap`, or `deadline`. Transport-fallback QA candidates produce
+`answers_handed_off`; accepted QA verdicts can instead reach `done`. A structured
+instance/refresh/gating blocker produces `blocked_by_infra` and exits `0` after writing the result.
 
 Model/executor failures are distinct: `model_error` and `explore_failed` come
 from the structured auto outcome and exit non-zero; an unexplained non-zero auto

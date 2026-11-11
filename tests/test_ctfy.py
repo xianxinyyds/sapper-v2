@@ -22,6 +22,7 @@ def instance_task(**overrides):
         "schema_version": 3,
         "run_mode": "instance",
         "challenge": {"id": "challenge-1", "name": "Web", "description": "Solve it"},
+        "competition_id": "competition-1",
         "questions": [{"id": "flag", "prompt": "Flag"}],
         "gated_questions": 0,
         "target_instance": "instance-1",
@@ -388,6 +389,40 @@ class CtfyClientTests(unittest.TestCase):
                 "instance_id": "i-1", "question_id": "q1", "answer": answer,
             })
 
+    def test_qa_submission_contract_and_verdict(self):
+        self.platform.queue(200, submission_payload(True))
+        self.platform.queue(200, submission_payload(False))
+        accepted = self.client.submit_qa_answer(
+            "challenge-1", "competition-1", "flag", "FLAG{x}"
+        )
+        rejected = self.client.submit_qa_answer(
+            "challenge-1", "competition-1", "flag", "FLAG{y}"
+        )
+        self.assertTrue(accepted["correct"])
+        self.assertFalse(rejected["correct"])
+        self.assertEqual([call["method"] for call in self.platform.seen], ["POST", "POST"])
+        for call, answer in zip(self.platform.seen, ["FLAG{x}", "FLAG{y}"]):
+            self.assertEqual(call["path"], "/api/v1/qa/submissions")
+            self.assertEqual(call["authorization"], "Bearer tok-x")
+            self.assertEqual(call["body"], {
+                "challenge_id": "challenge-1", "competition_id": "competition-1",
+                "question_id": "flag", "answer": answer,
+            })
+            self.assertNotIn("instance_id", call["body"])
+
+    def test_qa_submission_protocol_and_transport_errors(self):
+        self.platform.queue(200, {"correct": "yes"})
+        with self.assertRaises(ctfy.CtfyError) as protocol:
+            self.client.submit_qa_answer("challenge-1", "competition-1", "flag", "x")
+        self.assertFalse(protocol.exception.transport)
+        with mock.patch(
+            "ctfy.urllib.request.urlopen", side_effect=TimeoutError("read timed out")
+        ) as urlopen:
+            with self.assertRaises(ctfy.CtfyError) as transport:
+                self.client.submit_qa_answer("challenge-1", "competition-1", "flag", "x")
+        self.assertTrue(transport.exception.transport)
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_retry_after_and_error_envelope(self):
         self.platform.queue(429, {"code": "rate_limited", "message": "slow", "detail": {}},
                             {"Retry-After": "2"})
@@ -402,6 +437,7 @@ class CtfyClientTests(unittest.TestCase):
             self.client.get_challenge("challenge-1")
         self.assertEqual(caught.exception.status, 403)
         self.assertEqual(caught.exception.code, "token_challenge_forbidden")
+        self.assertFalse(caught.exception.transport)
         self.assertNotIn("tok-x", str(caught.exception))
 
     def test_get_retries_transient_network_error(self):
@@ -461,7 +497,16 @@ class CtfyClientTests(unittest.TestCase):
                 self.client.get_challenge("challenge-1")
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+        self.assertTrue(caught.exception.transport)
         self.assertNotIn("tok-x", str(caught.exception))
+
+    def test_protocol_errors_are_not_transport(self):
+        for payload in (b"not-json", []):
+            with self.subTest(payload=payload):
+                self.platform.queue(200, payload)
+                with self.assertRaises(ctfy.CtfyError) as caught:
+                    self.client.get_challenge("challenge-1")
+                self.assertFalse(caught.exception.transport)
 
     def test_submission_direct_timeout_is_single_attempt(self):
         with mock.patch(

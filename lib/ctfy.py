@@ -17,9 +17,10 @@ class CtfyError(Exception):
     """A task, platform, or result-file error safe to show to the operator."""
 
     def __init__(self, message: str, *, status: int | None = None,
-                 code: str | None = None):
+                 code: str | None = None, transport: bool = False):
         self.status = status
         self.code = code
+        self.transport = transport
         super().__init__(message)
 
 
@@ -89,7 +90,9 @@ class CtfyClient:
                     time.sleep(float(2 ** attempt))
                     continue
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-                raise CtfyError(f"CTFY {method} {path} failed: {reason}") from exc
+                raise CtfyError(
+                    f"CTFY {method} {path} failed: {reason}", transport=True
+                ) from exc
             if not raw.strip():
                 return {}
             try:
@@ -190,7 +193,7 @@ class CtfyClient:
                     time.sleep(float(2 ** attempt))
                     continue
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-                raise CtfyError(f"CTFY GET {path} failed: {reason}") from exc
+                raise CtfyError(f"CTFY GET {path} failed: {reason}", transport=True) from exc
             except OSError as exc:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
@@ -207,6 +210,21 @@ class CtfyClient:
         })
         if not isinstance(result, dict) or type(result.get("correct")) is not bool:
             raise CtfyError("CTFY submission response requires a boolean correct field")
+        return result
+    def submit_qa_answer(self, challenge_id: str, competition_id: str,
+                         question_id: str, answer: str) -> dict:
+        self._segment(challenge_id, "challenge_id")
+        self._segment(competition_id, "competition_id")
+        if not isinstance(question_id, str) or not question_id.strip():
+            raise CtfyError("question_id cannot be empty")
+        if not isinstance(answer, str) or not answer.strip():
+            raise CtfyError("answer cannot be empty")
+        result = self._request("POST", "/api/v1/qa/submissions", body={
+            "challenge_id": challenge_id, "competition_id": competition_id,
+            "question_id": question_id, "answer": answer,
+        })
+        if not isinstance(result, dict) or type(result.get("correct")) is not bool:
+            raise CtfyError("CTFY QA submission response requires a boolean correct field")
         return result
 
 

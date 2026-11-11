@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -123,6 +124,15 @@ class CtfyLedgerTests(unittest.TestCase):
         self.assertTrue(fully_solved)
         self.assertEqual(self.store.get_fact(latest["id"])["data"]["status"], "recorded")
 
+    def test_checkpoint_is_repeatable_and_does_not_hand_off(self):
+        candidate = self.add_answer("flag", "candidate")
+        ctfy_run._checkpoint_result(self.work, self.store)
+        ctfy_run._checkpoint_result(self.work, self.store)
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {"flag": "candidate"})
+        self.assertEqual(result["stop_reason"], "incomplete")
+        self.assertEqual(self.store.get_fact(candidate["id"])["data"]["status"], "recorded")
+
     def test_finalize_marks_handed_off_and_does_not_roll_up_twice(self):
         candidate = self.add_answer("flag", "candidate")
         self.add_answer("flag", "wrong", "rejected")
@@ -150,12 +160,18 @@ class CtfyRunTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_with_mocks(self, auto_return=0, environ=None):
+    def run_with_mocks(self, auto_return=0, environ=None, attachment_error=None,
+                       auto_effect=None):
         with mock.patch.object(
                 ctfy_run.ctfy.CtfyClient, "from_env", return_value=self.client), \
                 mock.patch.object(ctfy_run, "configure_model", return_value="platform-model") as configure, \
-                mock.patch.object(ctfy_run.ctfy, "ensure_attachments") as attachments, \
-                mock.patch.object(ctfy_run.sapper, "main", return_value=auto_return) as auto, \
+                mock.patch.object(
+                    ctfy_run.ctfy, "ensure_attachments", side_effect=attachment_error
+                ) as attachments, \
+                mock.patch.object(
+                    ctfy_run.sapper, "main",
+                    side_effect=auto_effect, return_value=auto_return,
+                ) as auto, \
                 mock.patch.dict("os.environ", environ or {}, clear=True):
             rc = ctfy_run.run(self.work)
         return rc, configure, attachments, auto
@@ -167,12 +183,18 @@ class CtfyRunTests(unittest.TestCase):
         self.client.get_challenge.assert_called_once_with("challenge-1")
         configure.assert_called_once_with()
         attachments.assert_called_once_with(self.task, self.client, self.work)
-        auto.assert_called_once_with([
+        auto.assert_called_once()
+        argv = auto.call_args.args[0]
+        self.assertEqual(argv[:12], [
             "--store", str(self.work / ".sapper"), "auto",
             "--model", "platform-model",
             "--templates", str(ROOT / "templates" / "ctfy"),
             "--skip-permissions", "--max-steps", "5", "--max-explore", "5",
         ])
+        self.assertIn("--deadline", argv)
+        self.assertNotIn("--minutes", argv)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "300")
+        self.assertTrue(callable(auto.call_args.kwargs["checkpoint"]))
         store = ctfy_run.sapper.Store(self.work / ".sapper")
         self.assertEqual(store.load_project()["origin"], "ctfy:challenge-1")
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
@@ -192,6 +214,15 @@ class CtfyRunTests(unittest.TestCase):
         self.assertNotIn("--verify", argv)
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["stop_reason"], "auto_failed")
+
+    def test_attachment_transport_failure_is_blocked_by_infra(self):
+        error = ctfy_run.ctfy.CtfyError("attachment network unavailable")
+        error.transport = True
+        rc, _, _, auto = self.run_with_mocks(attachment_error=error)
+        self.assertEqual(rc, 0)
+        auto.assert_not_called()
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
 
     def test_platform_budget_safety_cap_and_round_minutes(self):
         cases = [
@@ -217,14 +248,66 @@ class CtfyRunTests(unittest.TestCase):
         argv = auto.call_args.args[0]
         self.assertEqual(argv[argv.index("--max-steps") + 1], "12")
         self.assertEqual(argv[argv.index("--max-explore") + 1], "3")
-        self.assertEqual(argv[argv.index("--minutes") + 1], "7")
+        self.assertIn("--deadline", argv)
+        self.assertNotIn("--minutes", argv)
+
+    def test_round_deadline_default_override_close_at_and_fallback(self):
+        now = 1_800_000_000.0
+        with mock.patch.object(ctfy_run.time, "time", return_value=now), \
+                mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ctfy_run._round_deadline({}), now + 165 * 60)
+            self.assertEqual(
+                ctfy_run._round_deadline({"close_at": "not-a-time"}), now + 165 * 60
+            )
+        with mock.patch.object(ctfy_run.time, "time", return_value=now), \
+                mock.patch.dict("os.environ", {"SAPPER_ROUND_MINUTES": "30"}, clear=True):
+            self.assertEqual(ctfy_run._round_deadline({}), now + 30 * 60)
+            earlier = datetime.fromtimestamp(now + 60, timezone.utc).isoformat()
+            self.assertEqual(ctfy_run._round_deadline({"close_at": earlier}), now + 60)
+            past = datetime.fromtimestamp(now - 60, timezone.utc).isoformat()
+            self.assertEqual(ctfy_run._round_deadline({"close_at": past}), now - 60)
+
+    def test_dispatch_timeout_default_and_precedence(self):
+        cases = [
+            ({}, "300"),
+            ({"SAPPER_TIMEOUT": "450"}, "450"),
+            ({"SAPPER_TIMEOUT": "450", "CTFY_DISPATCH_TIMEOUT": "240"}, "240"),
+        ]
+        for environ, expected in cases:
+            with self.subTest(environ=environ):
+                rc, _, _, auto = self.run_with_mocks(environ=environ)
+                self.assertEqual(rc, 0)
+                argv = auto.call_args.args[0]
+                self.assertEqual(argv[argv.index("--timeout") + 1], expected)
+
+    def test_result_checkpoint_exists_before_auto_and_preserves_ledger(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        candidate = store.add_fact(
+            "candidate", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "instance_id": "instance-1", "question_id": "flag",
+                "value": "preserved", "status": "recorded",
+            },
+        )
+
+        def inspect_checkpoint(argv, **kwargs):
+            result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["answers"], {"flag": "preserved"})
+            self.assertEqual(result["stop_reason"], "incomplete")
+            self.assertEqual(store.get_fact(candidate["id"])["data"]["status"], "recorded")
+            return 0
+
+        rc, _, _, auto = self.run_with_mocks(auto_effect=inspect_checkpoint)
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
 
     def test_invalid_budget_environment_fails_with_config_error(self):
         self.task["max_turns"] = None
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         for variable in (
             "CTFY_EVAL_MAX_TURNS", "SAPPER_MAX_STEPS",
-            "SAPPER_MAX_EXPLORE", "SAPPER_ROUND_MINUTES",
+            "SAPPER_MAX_EXPLORE", "SAPPER_ROUND_MINUTES", "CTFY_DISPATCH_TIMEOUT",
         ):
             with self.subTest(variable=variable), contextlib.redirect_stderr(io.StringIO()):
                 rc, _, _, auto = self.run_with_mocks(environ={variable: "0"})
@@ -320,7 +403,7 @@ class CtfyRunTests(unittest.TestCase):
             my_solved_question_ids=["flag"], my_fully_solved=False,
         )
 
-        def complete_again(argv):
+        def complete_again(argv, **kwargs):
             self.assertEqual(store.load_project()["status"], "active")
             question_ids = {
                 (fact.get("data") or {}).get("question_id")
@@ -384,7 +467,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            rc, configure, auto = self.run_with_auto(lambda argv: 0)
+            rc, configure, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertNotEqual(rc, 0)
         self.assertIn("questions", stderr.getvalue())
@@ -402,7 +485,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
             my_solved_question_ids=["flag"], my_fully_solved=True,
         ))
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store),
             ), 0)
@@ -433,13 +516,14 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.platform.queue(404, {"code": "instance_not_found", "message": "missing"})
         self.platform.queue(404, {"code": "instance_not_found", "message": "still missing"})
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store),
             ), 0)
             answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
             self.assertEqual(answer["data"]["status"], "recorded")
             args = ctfy_run.sapper.build_parser().parse_args(argv)
+            args.checkpoint = checkpoint
             return ctfy_run.sapper.cmd_auto(args)
 
         with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason, \
@@ -471,11 +555,12 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.platform.queue(200, verdict)
         self.platform.queue(403, {"code": "forbidden", "message": "refresh failed"})
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store),
             ), 0)
             args = ctfy_run.sapper.build_parser().parse_args(argv)
+            args.checkpoint = checkpoint
             return ctfy_run.sapper.cmd_auto(args)
 
         with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
@@ -500,11 +585,12 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
             my_solved_question_ids=["flag"], my_fully_solved=False,
         ))
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store),
             ), 0)
             args = ctfy_run.sapper.build_parser().parse_args(argv)
+            args.checkpoint = checkpoint
             return ctfy_run.sapper.cmd_auto(args)
 
         with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
@@ -532,7 +618,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.platform.queue(403, {"code": "forbidden", "message": "offline"})
 
         with contextlib.redirect_stderr(io.StringIO()):
-            rc, _, auto = self.run_with_auto(lambda argv: 0)
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertNotEqual(rc, 0)
         auto.assert_not_called()
@@ -556,15 +642,16 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
         with mock.patch.object(ctfy_run.ctfy.time, "sleep") as sleep, \
                 contextlib.redirect_stderr(io.StringIO()):
-            rc, _, auto = self.run_with_auto(lambda argv: 0)
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 0)
         auto.assert_not_called()
         self.assertEqual(len(self.platform.seen), 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
         self.assertEqual(store.get_fact(candidate["id"])["data"]["status"], "handed_off")
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["answers"], {"flag": "preserved-after-reset"})
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
 
     def test_malformed_refreshed_challenge_preserves_matching_answer_ledger(self):
         store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
@@ -579,7 +666,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.platform.queue(200, challenge_payload(my_solved_question_ids="flag"))
 
         with contextlib.redirect_stderr(io.StringIO()):
-            rc, _, auto = self.run_with_auto(lambda argv: 0)
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertNotEqual(rc, 0)
         auto.assert_not_called()
@@ -588,7 +675,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertEqual(result["answers"], {"flag": "preserved-after-malformed"})
         self.assertEqual(result["stop_reason"], "config_error")
 
-    def test_qa_run_hands_off_answer_without_instance_api(self):
+    def test_qa_run_submits_verdict_without_instance_api(self):
         local = self.work / "attachments" / "clue.txt"
         local.parent.mkdir()
         local.write_text("local clue", encoding="utf-8")
@@ -598,8 +685,14 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         )
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         self.platform.queue(200, challenge_payload(is_qa_only=True))
+        verdict = submission_payload(True)
+        verdict["question_id"] = "flag"
+        self.platform.queue(200, verdict)
+        self.platform.queue(200, challenge_payload(
+            is_qa_only=True, my_solved_question_ids=["flag"], my_fully_solved=True,
+        ))
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store, value="QA answer"),
             ), 0)
@@ -609,26 +702,70 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         auto.assert_called_once()
-        self.assertEqual(self.platform.seen, [{
-            "method": "GET", "path": "/api/v1/challenges/challenge-1",
-            "authorization": "Bearer tok-super-secret", "body": None,
-        }])
+        self.assertEqual(
+            [(call["method"], call["path"]) for call in self.platform.seen],
+            [
+                ("GET", "/api/v1/challenges/challenge-1"),
+                ("POST", "/api/v1/qa/submissions"),
+                ("GET", "/api/v1/challenges/challenge-1"),
+            ],
+        )
+        post = self.platform.seen[1]
+        self.assertEqual(post["body"], {
+            "challenge_id": "challenge-1", "competition_id": "competition-1",
+            "question_id": "flag", "answer": "QA answer",
+        })
+        self.assertNotIn("instance_id", post["body"])
+        answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(answer["data"]["status"], "accepted")
+        self.assertIsNone(answer["data"].get("instance_id"))
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["answers"], {})
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertTrue(result["fully_solved"])
+        self.assertEqual(result["stop_reason"], "done")
+
+    def test_qa_transport_failure_preserves_answer_and_stops(self):
+        self.task = instance_task(run_mode="qa", target_instance=None, target_endpoints=[])
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.platform.queue(200, challenge_payload(is_qa_only=True))
+        self.platform.queue("truncated", b'{"correct":')
+
+        def solve(argv, checkpoint=None):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store, value="QA answer"),
+            ), 0)
+            answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+            self.assertEqual(answer["data"]["status"], "recorded")
+            args = ctfy_run.sapper.build_parser().parse_args(argv)
+            args.checkpoint = checkpoint
+            return ctfy_run.sapper.cmd_auto(args)
+
+        with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
+            rc, _, _ = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        self.assertEqual(len(self.platform.seen), 2)
+        self.assertEqual(self.platform.seen[1]["method"], "POST")
         answer = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
         self.assertEqual(answer["data"]["status"], "handed_off")
-        self.assertIsNone(answer["data"].get("instance_id"))
-        self.assertEqual(self.store.load_project()["ctfy"]["run_mode"], "qa")
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["answers"], {"flag": "QA answer"})
-        self.assertEqual(result["solved"], [])
-        self.assertFalse(result["fully_solved"])
-        self.assertEqual(result["stop_reason"], "answers_handed_off")
+        self.assertEqual(result["stop_reason"], "blocked_by_infra")
 
     def test_qa_second_round_reuses_ledger_and_exports_solved_state(self):
         self.task = instance_task(run_mode="qa", target_instance=None, target_endpoints=[])
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         self.platform.queue(200, challenge_payload(is_qa_only=True))
+        verdict = submission_payload(True)
+        verdict["question_id"] = "flag"
+        self.platform.queue(200, verdict)
+        self.platform.queue(200, challenge_payload(
+            is_qa_only=True, my_solved_question_ids=["flag"], my_fully_solved=True,
+        ))
 
-        def solve(argv):
+        def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store, value="QA answer"),
             ), 0)
@@ -642,22 +779,25 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
             is_qa_only=True, my_solved_question_ids=["flag"], my_fully_solved=True,
         ))
 
-        second_rc, _, second_auto = self.run_with_auto(lambda argv: 0)
+        second_rc, _, second_auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertEqual(second_rc, 0)
         second_auto.assert_called_once()
         self.assertEqual({fact["id"] for fact in self.store.list_facts()}, original_fact_ids)
-        self.assertEqual(self.store.get_fact(answer["id"])["data"]["status"], "handed_off")
+        self.assertEqual(self.store.get_fact(answer["id"])["data"]["status"], "accepted")
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["solved"], ["flag"])
         self.assertTrue(result["fully_solved"])
         self.assertEqual(
-            [call["method"] for call in self.platform.seen], ["GET", "GET"],
+            [call["method"] for call in self.platform.seen], ["GET", "POST", "GET", "GET"],
         )
-        self.assertTrue(all(
-            call["path"] == "/api/v1/challenges/challenge-1"
-            for call in self.platform.seen
-        ))
+        self.assertEqual(
+            [call["path"] for call in self.platform.seen],
+            [
+                "/api/v1/challenges/challenge-1", "/api/v1/qa/submissions",
+                "/api/v1/challenges/challenge-1", "/api/v1/challenges/challenge-1",
+            ],
+        )
 
     def test_tcp_task_seeds_socket_service_without_target_url(self):
         self.task["target_endpoints"] = [
@@ -666,7 +806,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         self.platform.queue(200, challenge_payload())
 
-        rc, _, auto = self.run_with_auto(lambda argv: 0)
+        rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertEqual(rc, 0)
         auto.assert_called_once()
@@ -682,7 +822,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
     def test_second_round_reuses_graph_and_adds_question(self):
         self.platform.queue(200, challenge_payload())
 
-        def record_without_verdict(argv):
+        def record_without_verdict(argv, **kwargs):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
                 self.answer_args(self.store, value="unverified", submit=False),
             ), 0)
@@ -707,7 +847,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         ))
         (self.work / "result.json").unlink()
 
-        second_rc, _, second_auto = self.run_with_auto(lambda argv: 0)
+        second_rc, _, second_auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
         self.assertEqual(second_rc, 0)
         second_auto.assert_called_once()
@@ -759,6 +899,10 @@ class CtfyContainerContractTests(unittest.TestCase):
             "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple", dockerfile,
         )
 
+    def test_codex_native_dependency_version_is_pinned(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("@openai/codex@0.167.0", dockerfile)
+
     def test_ropper_python314_incompatibility_cannot_block_image_build(self):
         dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
         extras = dockerfile.split("# --- python extras", 1)[1]
@@ -769,6 +913,32 @@ class CtfyContainerContractTests(unittest.TestCase):
             "        || echo \"WARN: ropper unavailable",
             dockerfile,
         )
+
+
+class CtfyKbContractTests(unittest.TestCase):
+    def test_reverse_and_ai_security_entries_are_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        self.assertIn(
+            "kb057", {entry["id"] for entry in base.search("reverse", limit=20)}
+        )
+        self.assertIn(
+            "kb058", {entry["id"] for entry in base.search("AI security", tag="ai", limit=20)}
+        )
+
+    def test_category_commands_do_not_assume_missing_tools(self):
+        forbidden = (
+            "ghidra", "angr", "radare", "rsactftool", "sage", "zsteg",
+            "volatility", "hashcat", "one_gadget", "patchelf", "ropper",
+        )
+        for entry_id in ("kb040", "kb041", "kb042", "kb057", "kb058"):
+            with self.subTest(entry_id=entry_id):
+                data = json.loads(
+                    (ROOT / "kb" / "entries" / f"{entry_id}.json").read_text(encoding="utf-8")
+                )
+                commands = "\n".join(data.get("commands") or []).lower()
+                for tool in forbidden:
+                    self.assertNotIn(tool, commands)
 
 
 class CtfyPromptIntegrationTests(unittest.TestCase):
@@ -795,6 +965,7 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         ctfy_run.sapper.sync_ctfy_facts(
             self.store, self.task,
             challenge_payload(
+                category="rev",
                 questions=[{"id": "visible-q", "prompt": "Visible question"}],
                 my_solved_question_ids=["platform-solved-q"],
                 my_fully_solved=True,
@@ -809,14 +980,26 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         self.assertIn('\n  solved_question_ids: ["platform-solved-q"]\n', prompt)
         self.assertIn("\n  initial_gated_questions: 7\n", prompt)
         self.assertIn('\n  visible_question_ids: ["visible-q"]\n', prompt)
+        self.assertIn('\n  category: "Reverse"\n', prompt)
 
-    def test_prompt_distinguishes_qa_handoff_from_instance_post(self):
+    def test_prompt_contains_six_category_routing(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        system = ctfy_run.sapper._agents_system_prompt(self.store)
+        combined = "\n".join([reason, explore, system])
+        for label in ("Crypto", "Reverse", "Misc", "Web", "Pwn", "AI security"):
+            self.assertIn(label, combined)
+        self.assertIn("platform category", combined)
+        self.assertIn("command -v", combined)
+
+    def test_prompt_distinguishes_qa_verdict_from_instance_post(self):
         reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
         explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
         combined = reason + "\n" + explore
         self.assertIn("run_mode=qa", combined)
+        self.assertIn("POST /api/v1/qa/submissions", combined)
+        self.assertIn("transport failure", combined)
         self.assertIn("result.json", combined)
-        self.assertIn("does not send a platform POST", combined)
 
         project = self.store.load_project()
         project["ctfy"]["run_mode"] = "qa"
@@ -824,7 +1007,7 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         qa_system = ctfy_run.sapper._agents_system_prompt(self.store)
         self.assertIn("QA", qa_system)
         self.assertIn("result.json", qa_system)
-        self.assertIn("does not POST", qa_system)
+        self.assertIn("one QA verdict POST", qa_system)
         self.assertIn("transport failure", qa_system)
         self.assertIn("repeat", qa_system)
 
@@ -837,6 +1020,8 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
             "nohup", "background `&`", "wakeup", "long polling",
             "current dispatch", "checkpoint", "maximum requests or passes",
             "rate/concurrency", "wall-clock", "new evidence", "ctfy.blocker",
+            "finalization reserve", "after every evidence batch",
+            "supported candidate", "closed-vector", "precondition",
         ):
             self.assertIn(required, combined)
         self.assertIn("do not write scripts to repeat", combined)
@@ -848,11 +1033,16 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         combined = "\n".join([readme, protocol, environment])
         for required in (
             "run_mode=qa", "CTFY_EVAL_MAX_TURNS", "SAPPER_MAX_EXPLORE",
-            "SAPPER_ROUND_MINUTES", "blocked_by_infra", "answers_handed_off",
+            "SAPPER_ROUND_MINUTES", "CTFY_DISPATCH_TIMEOUT", "165",
+            "finalization reserve", "checkpoint", "POST /api/v1/qa/submissions",
+            "submission_failed", "platform_unreachable",
+            "blocked_by_infra", "answers_handed_off",
             "start_new_session", "process group", "daemonize",
         ):
             self.assertIn(required, combined)
         self.assertNotIn("implements the `instance` run mode only", protocol)
+        self.assertNotIn("does not call an instance API or send a QA or", protocol)
+        self.assertNotIn("QA 的同一命令只记录候选供 result handoff，不发送平台 POST", readme)
         self.assertNotIn("even when nothing was\nsolved", protocol)
 
     def test_templates_render_and_drive_reason_explore_verify(self):
