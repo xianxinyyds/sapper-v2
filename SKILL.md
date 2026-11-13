@@ -38,8 +38,10 @@ equally usable for ordinary multi-step agent work.
 
 The CTFY container entrypoint is `docker/entrypoint-ctfy.sh`; it executes
 `/opt/sapper/lib/ctfy_run.py` in `/ctfy/work` and supports `run_mode=instance`
-only. It refreshes the current challenge, resumes `.sapper/`, runs the CTFY
-`auto` loop, and writes `result.json`. It never lists or starts challenges.
+and `run_mode=qa`. It loads the current challenge briefing, resumes `.sapper/`,
+runs the CTFY `auto` loop, and writes `result.json`. It never lists or starts
+challenges. Accepted instance answers refresh per-question state from the current
+instance rather than relying on the static challenge's personal progress fields.
 
 Executors record and submit answers for the exact current question with:
 

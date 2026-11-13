@@ -80,7 +80,7 @@ official dry run has no `CTFY_TOKEN` or `LLM_API_KEY`.
 
 ## Normal lifecycle
 
-For each round the runner refreshes only the current challenge, resumes the
+For each round the runner loads only the current challenge briefing, resumes the
 existing graph, configures the selected model CLI, prepares attachments, and
 runs the single-challenge `auto` loop with the CTFY prompts. Instance attachments
 with a null path are downloaded from the current instance. QA attachments must
@@ -98,9 +98,12 @@ sapper answer "FLAG{example}" --question "flag" --submit
 
 In instance mode, the answer is recorded before one submission POST. Submission
 POSTs are never retried automatically, and executors must not write their own
-repeated-POST scripts. A correct response refreshes the challenge so gated
-questions can enter the graph. An accepted fact is persisted before that refresh;
-a later refresh failure cannot roll back `accepted` or remove it from `solved`.
+repeated-POST scripts. A correct response refreshes the current instance, whose
+per-question `answered_correctly` state and newly unlocked questions enter the
+graph. The static challenge's `my_solved_question_ids` and `my_fully_solved` are
+not treated as per-instance progress. An accepted fact is persisted before that
+refresh; a later refresh failure cannot roll back `accepted` or remove it from
+`solved`.
 
 In QA mode, the same command records the answer before one verdict request to
 `POST /api/v1/qa/submissions`, using the task's `competition_id`, `challenge_id`,
@@ -121,12 +124,15 @@ sapper ctfy-health
 It reads only the current task's instance, sends no POST, and prints availability
 rather than instance credentials. A confirmed missing instance records an
 `instance_unavailable` blocker; there is no sleep/poll loop and no instance
-creation. A refresh failure records `challenge_refresh_failed`. All visible
-questions being solved while `fully_solved=false` and no new question is visible
-records `gating_pending`. Other transport kinds are `platform_unreachable` and
-`instance_health_unreachable`; executor-confirmed DNS failures use the typed
-`target_dns_unavailable` marker. Blockers stop further reason/explore work and preserve
-recorded or accepted answers.
+creation. If every known visible question is already accepted and no initial or
+known gated question remains, instance teardown after an accepted answer can
+instead finish as `done`. A refresh failure records `challenge_refresh_failed`.
+Static challenge state showing all visible questions solved while
+`fully_solved=false`, with no next question visible, records `gating_pending`.
+Other transport kinds are `platform_unreachable` and `instance_health_unreachable`;
+executor-confirmed DNS failures use `target_dns_unavailable`, and a structured
+`status=instance_down` executor fact becomes `instance_unavailable`. Blockers stop
+further reason/explore work and preserve recorded or accepted answers.
 
 The CTFY planner supports concise routing for Crypto, Reverse, Misc, Web, Pwn and
 AI security, with platform category preferred over task/attachment inference. Misc
@@ -156,10 +162,16 @@ Answer facts have these states:
 `answers` contains only the latest unverified `recorded` candidate for each
 question. Accepted, rejected, submission-failed, handed-off, and legacy Arena flags are excluded.
 After a successful result write, the exported candidates become `handed_off`.
-`solved` combines locally accepted question ids with the platform's solved list;
-`fully_solved` comes only from the platform challenge response.
+`solved` combines locally accepted question ids with the platform's solved list.
+`fully_solved` comes from the platform challenge response or an instance's
+`grace_kind=solved`, not from a model prediction.
 
-`done` is used only for a completed graph or authoritative `fully_solved=true`.
+`done` is used for a completed graph, authoritative `fully_solved=true`, or the
+case where every known visible question is accepted or platform-solved, the
+initial gated count is zero, and no known hidden/unresolved question or blocker
+remains. Consequently `done` can coexist with `fully_solved=false` when the
+static challenge does not expose per-instance completion. Confirmed completion
+overrides a stale failure outcome and exits `0`.
 An ordinary unfinished run may exit `0` with `incomplete`, `no_progress`,
 `max_steps`, `explore_cap`, or `deadline`. Transport-fallback QA candidates produce
 `answers_handed_off`; accepted QA verdicts can instead reach `done`. A structured
@@ -172,13 +184,17 @@ or `unsupported_run_mode` and exit non-zero. Exit code `0` alone never means
 `done`.
 
 Reason calls retain bounded retries for non-timeout transient errors. Explore
-calls and all engine timeouts are not retried wholesale. Each engine subprocess
-uses `start_new_session=True`; timeout, exception, and normal return clean up its
-**process group** with `SIGKILL` and bounded drain/reaping. A process that
-actively daemonizes or otherwise leaves that group is outside this guarantee.
-Prompts therefore forbid nohup, background `&`, wakeups, long polling, and work
-that waits for a later dispatch. Long analysis must be split into bounded slices
-with checkpoints and concluded in the current dispatch.
+calls and all engine timeouts are not retried wholesale. Planner and executor
+prompts receive the per-dispatch hard time budget, which is also checked between
+frontier intents so the finalization reserve is not consumed by another dispatch.
+A timeout preserves bounded stdout/stderr tails with configured credentials
+redacted. Each engine subprocess uses `start_new_session=True`; timeout,
+exception, and normal return clean up its **process group** with `SIGKILL` and
+bounded drain/reaping. A process that actively daemonizes or otherwise leaves
+that group is outside this guarantee. Prompts therefore forbid nohup, background
+`&`, wakeups, long polling, and work that waits for a later dispatch. Long
+analysis must be split into bounded slices with checkpoints and concluded in
+the current dispatch.
 
 ## Build and local verification
 

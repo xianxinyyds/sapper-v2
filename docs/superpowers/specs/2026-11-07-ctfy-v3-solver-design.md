@@ -89,13 +89,13 @@ CTFY 使用独立提示模板，防止旧 `arena start/list/hint/close` 指令�
 
 提交响应以 `correct: true|false` 为准，不复用旧 Arena 的 HTTP 200 判断。提交 POST 不自动重试，避免响应不明时重复消耗 wrong-attempt budget。传输失败时答案保留为 `recorded`，由最终结果兜底提交；成功写入结果后将其标为 `handed_off`，后续轮次不再自动携带。已 `accepted` 的答案计入 `solved`，不重复放入最终 `answers`；已 `rejected` 或 `handed_off` 的答案也不放入。
 
-每轮开始刷新 challenge，以平台 `my_solved_question_ids/my_fully_solved` 更新图中的已解状态；`fully_solved` 不来自 Agent 猜测。结果只包含有依据的字段和 `stop_reason`。
+每轮开始读取当前 challenge briefing；instance 模式提交正确后刷新当前实例，以 `answered_correctly` 更新逐题状态，以 `grace_kind=solved` 更新整体完成状态。静态 challenge 的 `my_solved_question_ids/my_fully_solved` 不作为实例进度。QA 仍使用 challenge 的对应字段。`fully_solved` 不来自 Agent 猜测，结果只包含有依据的字段和 `stop_reason`。
 
 ## 多轮与完成条件
 
-同一 `$CTFY_WORK_DIR/.sapper` 跨轮保留。每轮重新读取 task、刷新 challenge，并同步新 endpoint、附件和 questions；已有 question fact 不重复创建。平台已 solved 的 question 不依赖本地提交记录也能识别。
+同一 `$CTFY_WORK_DIR/.sapper` 跨轮保留。每轮重新读取 task、刷新 challenge briefing，并同步新 endpoint、附件和 questions；已有 question fact 不重复创建。平台已 solved 的 question 不依赖本地提交记录也能识别。
 
-CTFY reason prompt 只有在所有当前可见问题均已 accepted、没有仍被 gated 的问题、平台表示 fully solved 时才允许完成图。若还有未解问题或 gated questions，单题 accepted 不得触发项目完成。若模型提前完成图而后续轮次出现新工作，入口使用受测的 `Store.reopen_project()` 恢复 active；已有 goal edge 在再次完成时幂等复用，不重复创建。
+平台明确 fully solved 时可以完成。静态字段未表示 fully solved 时，仅允许在初始 gated 数为零、所有已知可见问题均已 accepted 或列为 solved、没有已知隐藏或未解问题且无 blocker 时完成；单题 accepted 不能覆盖其他可见或 gated 问题。此时 `stop_reason=done` 与 `result.fully_solved=false` 可以并存。若模型提前完成图而后续轮次出现新工作，入口使用受测的 `Store.reopen_project()` 恢复 active；已有 goal edge 在再次完成时幂等复用，不重复创建。
 
 ## 错误与退出
 

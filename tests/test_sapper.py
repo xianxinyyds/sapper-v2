@@ -451,6 +451,7 @@ class CtfyAnswerTests(unittest.TestCase):
                 return response
 
         self.client = FakeClient()
+        self.client.instance_responses = [self._instance()]
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -479,6 +480,22 @@ class CtfyAnswerTests(unittest.TestCase):
             "id": "submission-1", "correct": correct, "solve_time_s": 1.0,
             "solve_rank": 1, "question_id": "flag", "challenge_fully_solved": correct,
             "attempts_remaining": None, "ranked": True, "unranked_reason": "",
+        }
+
+    def _instance(self, questions=None, solved=None, fully=False):
+        questions = self.task["questions"] if questions is None else questions
+        solved = {"flag"} if solved is None else set(solved)
+        return {
+            "id": "instance-1", "challenge_id": "challenge-1", "name": "Web",
+            "category": "web", "description": "Solve it",
+            "grace_kind": "solved" if fully else "",
+            "questions": [
+                {
+                    **question, "unlocked": True,
+                    "answered_correctly": question["id"] in solved,
+                }
+                for question in questions
+            ],
         }
 
     def _answer(self, value="FLAG{x}", question="flag", submit=True, client_factory=None):
@@ -523,7 +540,8 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertEqual(fact["data"]["status"], "accepted")
         self.assertEqual(fact["data"]["question_id"], "flag")
         self.assertTrue(json.loads(fact["data"]["result"])["correct"])
-        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+        self.assertEqual(self.client.instance_calls, ["instance-1"])
+        self.assertEqual(self.client.challenge_calls, [])
 
     def test_incorrect_answer_is_rejected(self):
         self.client.responses = [self._reply(False)]
@@ -589,9 +607,7 @@ class CtfyAnswerTests(unittest.TestCase):
 
     def test_accepted_answer_survives_challenge_refresh_failure(self):
         self.client.responses = [self._reply(True)]
-        self.client.get_challenge = mock.Mock(
-            side_effect=ctfy.CtfyError("refresh offline")
-        )
+        self.client.instance_responses = [ctfy.CtfyError("refresh offline")]
         self.assertEqual(self._answer(), 0)
         fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
         self.assertEqual(fact["data"]["status"], "accepted")
@@ -763,13 +779,14 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertEqual(metadata["tags"], ["rsa"])
 
     def test_correct_answer_refreshes_gated_questions(self):
-        self.challenge["questions"] = self.task["questions"] + [{"id": "q3", "prompt": "Unlocked"}]
-        self.challenge["my_solved_question_ids"] = ["flag"]
+        questions = self.task["questions"] + [{"id": "q3", "prompt": "Unlocked"}]
+        self.client.instance_responses = [self._instance(questions=questions)]
         reply = self._reply(True)
         reply["challenge_fully_solved"] = False
         self.client.responses = [reply]
         self.assertEqual(self._answer(), 0)
-        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+        self.assertEqual(self.client.instance_calls, ["instance-1"])
+        self.assertEqual(self.client.challenge_calls, [])
         self.assertTrue(any(
             (f.get("data") or {}).get("record_type") == "question"
             and (f.get("data") or {}).get("question_id") == "q3"
@@ -778,8 +795,22 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertEqual(self.store.load_project()["ctfy"]["solved_question_ids"], ["flag"])
         self.assertIsNone(self.store.load_project()["ctfy"].get("blocker"))
 
+    def test_instance_answer_state_does_not_require_static_full_flag(self):
+        self.task = self._write_task(["flag"])
+        self.client.instance_responses = [self._instance(fully=False)]
+        self.client.responses = [self._reply(True)]
+        self.assertEqual(self._answer(), 0)
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["question_state_source"], "instance")
+        self.assertEqual(metadata["solved_question_ids"], ["flag"])
+        self.assertFalse(metadata["fully_solved"])
+        self.assertTrue(sapper._ctfy_questions_complete(self.store))
+
     def test_gating_blocker_survives_sync_and_clears_when_question_unlocks(self):
         self.task = self._write_task(["flag"])
+        self.task["gated_questions"] = 1
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.client.instance_responses = [self._instance()]
         self.challenge["questions"] = self.task["questions"]
         self.challenge["my_solved_question_ids"] = ["flag"]
         reply = self._reply(True)
@@ -1220,6 +1251,31 @@ class AutoLoopTests(unittest.TestCase):
     def add_intent(self, description="work"):
         return self.store.add_intent([self.seed["id"]], description, "test")
 
+    def accept(self, visible=("flag",), gated=0):
+        project = self.store.load_project()
+        project["ctfy"] = {
+            "challenge_id": "challenge-1", "run_mode": "instance",
+            "solved_question_ids": [], "fully_solved": False,
+            "initial_gated_questions": gated, "visible_question_ids": list(visible),
+            "question_state_source": "instance",
+        }
+        self.store.save_project(project)
+        for question_id in visible:
+            self.store.add_fact(
+                f"question {question_id}", "ctfy", kind="note",
+                data={
+                    "platform": "ctfy", "record_type": "question",
+                    "challenge_id": "challenge-1", "question_id": question_id,
+                },
+            )
+        self.store.add_fact(
+            "accepted flag", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "question_id": "flag", "value": "flag-value", "status": "accepted",
+            },
+        )
+
     def args(self, **overrides):
         values = {
             "store": str(self.store.root), "templates": str(self.templates),
@@ -1346,6 +1402,15 @@ class AutoLoopTests(unittest.TestCase):
             self.store.load_project()["ctfy"]["blocker"]["kind"],
             "target_dns_unavailable",
         )
+
+    def test_instance_down_status_becomes_structured_blocker(self):
+        sapper._apply_executor_blocker(self.store, {
+            "description": "origin remains unavailable",
+            "data": {"status": "instance_down"},
+        })
+        blocker = self.store.load_project()["ctfy"]["blocker"]
+        self.assertEqual(blocker["kind"], "instance_unavailable")
+        self.assertEqual(blocker["detail"], "origin remains unavailable")
 
     def test_prose_and_unknown_blockers_do_not_stop_auto(self):
         for marker in (None, "not-a-blocker"):
@@ -1513,6 +1578,28 @@ class AutoLoopTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(outcome["reason"], "completed")
 
+    def test_accepted_visible_question_completes_without_static_full_flag(self):
+        self.accept()
+        with mock.patch.object(sapper, "_run_reason_raw") as reason:
+            rc, outcome = self.run_auto(self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "completed")
+        reason.assert_not_called()
+
+    def test_unsolved_visible_question_prevents_accepted_completion(self):
+        self.accept(visible=("flag", "q2"))
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("noop", "none")):
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "no_progress")
+
+    def test_initially_gated_question_prevents_accepted_completion(self):
+        self.accept(gated=1)
+        with mock.patch.object(sapper, "_run_reason_raw", return_value=("noop", "none")):
+            rc, outcome = self.run_auto(self.args(max_steps=3))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "no_progress")
+
     def test_deadline_and_blocker_do_not_call_reason(self):
         project = self.store.load_project()
         project["ctfy"] = {"blocker": {"kind": "instance_unavailable"}}
@@ -1552,6 +1639,17 @@ class AutoLoopTests(unittest.TestCase):
             rc, outcome = self.run_auto(self.args(minutes=6))
         self.assertEqual(rc, 0)
         self.assertEqual(outcome["reason"], "completed")
+    def test_dispatch_timeout_and_prompt_respect_finalization_reserve(self):
+        self.add_intent()
+        with mock.patch.object(sapper, "deadline_from_args", return_value=1600), \
+                mock.patch.object(sapper.time, "time", return_value=1000), \
+                mock.patch.object(sapper, "_run_reason_raw", return_value=("intents", "ready")), \
+                mock.patch.object(sapper, "_run_explore_raw", side_effect=self.conclude) as explore:
+            rc, outcome = self.run_auto(self.args(timeout=600, max_steps=1))
+        self.assertEqual(rc, 0)
+        self.assertEqual(outcome["reason"], "max_steps")
+        self.assertEqual(explore.call_args.args[4], 300)
+        self.assertEqual(explore.call_args.kwargs["dispatch_budget"], "300 seconds")
 
 
 class ExploreLifecycleTests(unittest.TestCase):
@@ -1710,6 +1808,29 @@ class EngineExecutionTests(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         killpg.assert_called_once_with(4242, signal.SIGKILL)
         self.assertEqual(proc.communicate.call_count, 2)
+
+    def test_engine_timeout_preserves_redacted_partial_output(self):
+        proc = mock.Mock()
+        proc.pid = 4242
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(
+                ["engine"], 1, output=b"partial stdout",
+                stderr=b"temporary-secret\nconnection refused",
+            ),
+            ("", ""),
+        ]
+        with mock.patch.dict("os.environ", {"LLM_API_KEY": "temporary-secret"}), \
+                mock.patch.object(sapper.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(sapper.os, "killpg"):
+            with self.assertRaises(sapper.EngineTimeout) as caught:
+                sapper._run_engine_once(
+                    ["engine"], "prompt", 1, Path.cwd(), "engine", operation="explore",
+                )
+        message = str(caught.exception)
+        self.assertIn("partial stdout", message)
+        self.assertIn("connection refused", message)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn("temporary-secret", message)
 
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_engine_timeout_kills_grandchild_in_process_group(self):

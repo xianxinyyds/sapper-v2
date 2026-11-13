@@ -89,11 +89,17 @@ Do not create a second raw flag fact for an answer already recorded by `sapper a
   rate/concurrency, and wall-clock limits. Without new evidence, do not expand the
   dictionary or repeat a same-class scan. A precise failed attempt and the next best
   lead are useful; endless retries are not.
+- The hard outer dispatch budget is {dispatch_budget}, including model and tool time.
+  Use a shorter command deadline and conclude with a checkpoint before that cap.
 - Never use nohup, background `&`, a scheduled wakeup, long polling, or waiting for
   another dispatch. Split long work into bounded slices, write a checkpoint inside
   the work directory, and conclude with its confirmed result in the current dispatch.
 - Avoid destructive target actions. If execution fails, report the exact error and
   blocked dependency rather than inventing success.
+- If the target is confirmed unavailable, stop probing and conclude with
+  `data.ctfy_blocker="instance_unavailable"` and a concise `ctfy_blocker_detail`.
+  For confirmed DNS failure use `target_dns_unavailable`. Do not spend the remaining
+  dispatch on handwritten health-check loops or wait for a later target restart.
 
 # Context
 ## Graph

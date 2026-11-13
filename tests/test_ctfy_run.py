@@ -338,6 +338,28 @@ class CtfyRunTests(unittest.TestCase):
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["stop_reason"], "explore_failed")
 
+    def test_accepted_completion_overrides_stale_auto_failure(self):
+        store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
+        store.add_fact(
+            "accepted answer", "test", kind="flag",
+            data={
+                "platform": "ctfy", "challenge_id": "challenge-1",
+                "question_id": "flag", "value": "accepted", "status": "accepted",
+            },
+        )
+        project = store.load_project()
+        project["last_auto"] = {
+            "reason": "explore_failed", "explore_attempts": 1, "detail": "timeout",
+        }
+        store.save_project(project)
+
+        rc, _, _, _ = self.run_with_mocks(auto_return=1)
+
+        self.assertEqual(rc, 0)
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertEqual(result["stop_reason"], "done")
+
     def test_new_round_clears_stale_blocker_before_sync(self):
         store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
         project = store.load_project()
@@ -481,9 +503,14 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         verdict["question_id"] = "flag"
         self.platform.queue(200, challenge_payload())
         self.platform.queue(200, verdict)
-        self.platform.queue(200, challenge_payload(
-            my_solved_question_ids=["flag"], my_fully_solved=True,
-        ))
+        self.platform.queue(200, {
+            "id": "instance-1", "challenge_id": "challenge-1", "name": "Web",
+            "category": "web", "description": "Solve it", "grace_kind": "",
+            "questions": [{
+                "id": "flag", "prompt": "Flag", "unlocked": True,
+                "answered_correctly": True,
+            }],
+        })
 
         def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
@@ -508,7 +535,33 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["answers"], {})
         self.assertEqual(result["solved"], ["flag"])
-        self.assertTrue(result["fully_solved"])
+        self.assertFalse(result["fully_solved"])
+        self.assertEqual(result["stop_reason"], "done")
+
+    def test_accepted_answer_instance_close_completes_without_more_model_calls(self):
+        verdict = submission_payload(True)
+        verdict["question_id"] = "flag"
+        verdict["challenge_fully_solved"] = False
+        self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, verdict)
+        self.platform.queue(404, {"code": "instance_not_found", "message": "solved"})
+
+        def solve(argv, checkpoint=None):
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store),
+            ), 0)
+            args = ctfy_run.sapper.build_parser().parse_args(argv)
+            args.checkpoint = checkpoint
+            return ctfy_run.sapper.cmd_auto(args)
+
+        with mock.patch.object(ctfy_run.sapper, "_run_reason_raw") as reason:
+            rc, _, _ = self.run_with_auto(solve)
+
+        self.assertEqual(rc, 0)
+        reason.assert_not_called()
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["solved"], ["flag"])
+        self.assertFalse(result["fully_solved"])
         self.assertEqual(result["stop_reason"], "done")
 
     def test_missing_instance_stops_auto_and_hands_off_recorded_answer(self):

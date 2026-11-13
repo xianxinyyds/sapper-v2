@@ -1226,7 +1226,8 @@ def render_graph_text(store: Store) -> str:
     return "\n".join(lines)
 
 
-def render_prompt(store: Store, template_text: str, time_budget: str = "") -> str:
+def render_prompt(store: Store, template_text: str, time_budget: str = "",
+                  dispatch_budget: str = "") -> str:
     """Render a prompt template with the current graph. Simple {key} substitution."""
     g = build_graph_view(store)
     p = g["project"]
@@ -1244,12 +1245,13 @@ def render_prompt(store: Store, template_text: str, time_budget: str = "") -> st
         ),
         "max_intents": "3",
         "time_budget": _prompt_inline(time_budget),
+        "dispatch_budget": dispatch_budget,
     }
     return _replace_placeholders(template_text, replacements)
 
 
 def render_intent_prompt(store: Store, template_text: str, intent: dict,
-                         worker: str | None = None) -> str:
+                         worker: str | None = None, dispatch_budget: str = "") -> str:
     g = build_graph_view(store)
     # Recall: surface prior facts/intents whose title/description look similar
     # to THIS intent. Excludes the intent itself (it would otherwise score 1.0
@@ -1265,6 +1267,7 @@ def render_intent_prompt(store: Store, template_text: str, intent: dict,
         "worker_id": worker or "",
         "intent_description": _prompt_inline(intent["description"]),
         "recall_block": recall_block,
+        "dispatch_budget": dispatch_budget,
     }
     return _replace_placeholders(template_text, replacements)
 
@@ -1614,10 +1617,26 @@ def _run_engine_once(argv, prompt, timeout, cwd, engine, operation="model") -> d
         raise FGError(f"`{engine}` CLI not found on PATH; install it or fix SAPPER_BIN.")
     try:
         stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         _kill_engine_group(proc)
+        details = []
+        for label, value in (("stderr", exc.stderr), ("stdout", exc.stdout)):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", "replace")
+            text = str(value or "")
+            for variable in (
+                "CTFY_TOKEN", "LLM_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+            ):
+                secret = os.environ.get(variable)
+                if secret:
+                    text = text.replace(secret, "[redacted]")
+            text = text.strip()
+            if text:
+                details.append(f"{label}_tail={text[-500:]!r}")
+        suffix = f"; {'; '.join(details)}" if details else ""
         raise EngineTimeout(
-            f"{engine} {operation} dispatch timed out after {timeout:g}s"
+            f"{engine} {operation} dispatch timed out after {timeout:g}s{suffix}"
         ) from None
     except BaseException:
         _kill_engine_group(proc)
@@ -1964,10 +1983,11 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             title=f"attachment:{name}", doc=f"size: {attachment.get('size', 'unknown')}",
         )
     source = challenge if challenge is not None else task
+    source_questions = [q for q in source.get("questions", []) if isinstance(q, dict)]
+    per_instance = any("answered_correctly" in q for q in source_questions) \
+        or "grace_kind" in source
     visible_question_ids = []
-    for question in source.get("questions", []):
-        if not isinstance(question, dict):
-            continue
+    for question in source_questions:
         question_id = str(question.get("id") or "")
         visible_question_ids.append(question_id)
         prompt = str(question.get("prompt") or "")
@@ -1984,13 +2004,20 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
                 kind="note", data={"challenge_id": challenge_id}, title=f"CTFY {record_type}",
             )
     if challenge is not None:
-        solved = challenge.get("my_solved_question_ids", [])
+        if per_instance:
+            solved = [
+                str(q.get("id") or "") for q in source_questions
+                if q.get("answered_correctly") is True
+            ]
+        else:
+            solved = challenge.get("my_solved_question_ids", [])
         if not isinstance(solved, list) or not all(isinstance(q, str) for q in solved):
             raise FGError("CTFY challenge my_solved_question_ids must be a string list")
         project = store.load_project()
         previous_metadata = project.get("ctfy") or {}
         previous_blocker = previous_metadata.get("blocker")
-        fully_solved = challenge.get("my_fully_solved") is True
+        fully_solved = challenge.get("my_fully_solved") is True \
+            or challenge.get("grace_kind") == "solved"
         solved_ids = list(dict.fromkeys(solved))
         metadata = {
             "challenge_id": challenge_id,
@@ -1999,13 +2026,15 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             "fully_solved": fully_solved,
             "initial_gated_questions": task.get("gated_questions", 0),
             "visible_question_ids": visible_question_ids,
+            "question_state_source": "instance" if per_instance else "challenge",
         }
         category = _normalize_ctfy_category(
             source.get("category") or challenge_data.get("category")
         )
         if category is not None:
             metadata["category"] = category
-        raw_tags = source["tags"] if "tags" in source else challenge_data.get("tags")
+        raw_tags = source["tags"] if "tags" in source \
+            else previous_metadata.get("tags") or challenge_data.get("tags")
         if isinstance(raw_tags, list):
             tags = list(dict.fromkeys(
                 tag.strip() for tag in raw_tags if isinstance(tag, str) and tag.strip()
@@ -2013,7 +2042,8 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             if tags:
                 metadata["tags"] = tags
         waiting_for_gate = bool(visible_question_ids) and not fully_solved \
-            and set(visible_question_ids).issubset(solved_ids)
+            and set(visible_question_ids).issubset(solved_ids) \
+            and (not per_instance or bool(task.get("gated_questions", 0)))
         if waiting_for_gate:
             if isinstance(previous_blocker, dict) \
                     and previous_blocker.get("kind") == "gating_pending":
@@ -2159,9 +2189,17 @@ def cmd_answer(args) -> int:
             store, {"instance_unavailable", "instance_health_unreachable", "platform_unreachable"}
         )
         try:
-            challenge = client.get_challenge(challenge_id)
+            if task["run_mode"] == "instance":
+                challenge = client.get_instance(instance_id)
+            else:
+                challenge = client.get_challenge(challenge_id)
         except module.CtfyError as exc:
-            _set_ctfy_blocker(store, "challenge_refresh_failed", exc)
+            if exc.code == "instance_not_found" and _ctfy_questions_complete(store):
+                print(f"{fact['id']} remains accepted; instance closed without more visible work")
+                return 0
+            kind = "instance_unavailable" if exc.code == "instance_not_found" \
+                else "challenge_refresh_failed"
+            _set_ctfy_blocker(store, kind, exc)
             print(f"{fact['id']} remains accepted; challenge refresh blocked: {exc}")
             return 0
         sync_ctfy_facts(store, task, challenge)
@@ -3426,7 +3464,10 @@ def _agents_system_prompt(store: Store, intent_id: str | None = None,
 
 def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> int:
     tpl = _load_template(templates_dir, "reason.md")
-    prompt = render_prompt(store, tpl, time_budget=getattr(args, "time_budget", "") or "")
+    prompt = render_prompt(
+        store, tpl, time_budget=getattr(args, "time_budget", "") or "",
+        dispatch_budget=f"{timeout:g} seconds",
+    )
     if args.dry_run:
         print(prompt)
         return 0
@@ -3471,7 +3512,9 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
         )
     worker = _worker_id(model)
     tpl = _load_template(templates_dir, "explore.md")
-    prompt = render_intent_prompt(store, tpl, intent, worker)
+    prompt = render_intent_prompt(
+        store, tpl, intent, worker, dispatch_budget=f"{timeout:g} seconds",
+    )
     if args.dry_run:
         print(prompt)
         return 0
@@ -4253,12 +4296,46 @@ def format_time_budget(deadline: float | None) -> str:
 _AUTO_FINALIZE_RESERVE_S = 300
 
 
-def _auto_project_reason(project: dict) -> str | None:
+def _ctfy_questions_complete(store: Store) -> bool:
+    metadata = store.load_project().get("ctfy") or {}
+    if metadata.get("initial_gated_questions", 0) != 0 \
+            or isinstance(metadata.get("blocker"), dict):
+        return False
+    visible = {
+        q for q in metadata.get("visible_question_ids", [])
+        if isinstance(q, str) and q
+    }
+    if not visible:
+        return False
+    solved = {
+        q for q in metadata.get("solved_question_ids", [])
+        if isinstance(q, str) and q
+    }
+    known = set()
+    for fact in store.list_facts():
+        data = fact.get("data") or {}
+        if data.get("platform") != "ctfy" \
+                or data.get("challenge_id") != metadata.get("challenge_id"):
+            continue
+        question_id = data.get("question_id")
+        if not isinstance(question_id, str) or not question_id:
+            continue
+        if data.get("record_type") == "question":
+            known.add(question_id)
+        elif fact.get("kind") == "flag" and data.get("status") == "accepted":
+            solved.add(question_id)
+    return visible.issubset(solved) and known.issubset(visible | solved)
+
+
+def _auto_project_reason(store: Store) -> str | None:
+    project = store.load_project()
     if project.get("status") == "completed" \
             or (project.get("ctfy") or {}).get("fully_solved") is True:
         return "completed"
     if isinstance((project.get("ctfy") or {}).get("blocker"), dict):
         return "blocker"
+    if _ctfy_questions_complete(store):
+        return "completed"
     return None
 
 
@@ -4287,6 +4364,8 @@ def _auto_checkpoint(args) -> None:
 def _apply_executor_blocker(store: Store, fact: dict) -> None:
     data = fact.get("data") or {}
     kind = data.get("ctfy_blocker")
+    if kind is None and data.get("status") == "instance_down":
+        kind = "instance_unavailable"
     allowed = {
         "instance_unavailable", "instance_health_unreachable",
         "platform_unreachable", "target_dns_unavailable",
@@ -4343,7 +4422,7 @@ def cmd_auto(args) -> int:
             break
         args.time_budget = format_time_budget(soft_deadline)
         project = store.load_project()
-        project_reason = _auto_project_reason(project)
+        project_reason = _auto_project_reason(store)
         if project_reason is not None:
             stop_reason = project_reason
             stop_detail = str(project_reason)
@@ -4387,7 +4466,7 @@ def cmd_auto(args) -> int:
         print(f"[auto]        reason -> {summary}")
 
         project = store.load_project()
-        project_reason = _auto_project_reason(project)
+        project_reason = _auto_project_reason(store)
         if project_reason is not None:
             stop_reason = project_reason
             stop_detail = summary
@@ -4427,12 +4506,21 @@ def cmd_auto(args) -> int:
             if explore_count >= max_explore:
                 cap_reached = True
                 break
+            dispatch_timeout = float(timeout)
+            if soft_deadline is not None:
+                remaining = soft_deadline - time.time()
+                if remaining < 1:
+                    stop_reason = "deadline"
+                    stop_detail = "no time remains for another explore dispatch"
+                    break
+                dispatch_timeout = min(dispatch_timeout, remaining)
             print(f"[auto] step {step}.2 explore {intent['id']}")
             explore_count += 1
             try:
                 fact = _run_explore_raw(
-                    store, templates_dir, intent, model, timeout, skip, cwd,
+                    store, templates_dir, intent, model, dispatch_timeout, skip, cwd,
                     claim=True, deadline=deadline,
+                    dispatch_budget=f"{dispatch_timeout:.0f} seconds",
                 )
                 _apply_executor_blocker(store, fact)
             except FGError as exc:
@@ -4451,7 +4539,7 @@ def cmd_auto(args) -> int:
                 continue
             finally:
                 _auto_checkpoint(args)
-            project_reason = _auto_project_reason(store.load_project())
+            project_reason = _auto_project_reason(store)
             if project_reason is not None:
                 stop_reason = project_reason
                 stop_detail = f"explore {intent['id']} changed project state"
@@ -4495,7 +4583,7 @@ def cmd_auto(args) -> int:
                 break
 
         project = store.load_project()
-        project_reason = _auto_project_reason(project)
+        project_reason = _auto_project_reason(store)
         if project_reason is not None:
             stop_reason = project_reason
             stop_detail = summary
@@ -4527,7 +4615,9 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd, time_budget
                     deadline: float | None = None) -> tuple[str, str]:
     """Like _dispatch_reason but returns (kind, summary) instead of printing."""
     tpl = _load_template(templates_dir, "reason.md")
-    prompt = render_prompt(store, tpl, time_budget=time_budget)
+    prompt = render_prompt(
+        store, tpl, time_budget=time_budget, dispatch_budget=f"{timeout:g} seconds",
+    )
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd, operation="reason", retry=True, deadline=deadline,
@@ -4539,7 +4629,7 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd, time_budget
 
 
 def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, claim=False,
-                     deadline: float | None = None) -> dict:
+                     deadline: float | None = None, dispatch_budget: str = "") -> dict:
     if intent["to"] is not None:
         return store.get_fact(intent["to"])
     if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
@@ -4548,7 +4638,10 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
         )
     worker = _worker_id(model)
     tpl = _load_template(templates_dir, "explore.md")
-    prompt = render_intent_prompt(store, tpl, intent, worker)
+    prompt = render_intent_prompt(
+        store, tpl, intent, worker,
+        dispatch_budget=dispatch_budget or f"{timeout:g} seconds",
+    )
     if claim:
         store.claim_intent(intent["id"], worker)
     try:

@@ -225,14 +225,16 @@ def run(work_dir: Path) -> int:
     project = store.load_project()
     outcome = project.get("last_auto")
     outcome_reason = outcome.get("reason") if isinstance(outcome, dict) else None
-    if outcome_reason in {"model_error", "explore_failed"}:
+    completed = project.get("status") == "completed" \
+        or (project.get("ctfy") or {}).get("fully_solved") is True \
+        or outcome_reason == "completed" or sapper._ctfy_questions_complete(store)
+    if completed:
+        stop_reason = "done"
+        return_code = 0
+    elif outcome_reason in {"model_error", "explore_failed"}:
         stop_reason = outcome_reason
     elif return_code != 0:
         stop_reason = "auto_failed"
-    elif project.get("status") == "completed" \
-            or (project.get("ctfy") or {}).get("fully_solved") is True \
-            or outcome_reason == "completed":
-        stop_reason = "done"
     elif outcome_reason == "blocker":
         stop_reason = "blocked_by_infra"
     elif task["run_mode"] == "qa" and answers:

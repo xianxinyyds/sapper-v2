@@ -58,16 +58,23 @@ priority over all new work. A blocker is cleared only by authoritative refreshed
 state or the bounded health command, never by repeating the same request in a loop.
 
 # Completion gate
-Return `complete` ONLY when the graph's platform metadata says
-`ctfy.fully_solved: true`, every visible question is accepted or listed as solved,
-and there is no unresolved or gated question. A locally plausible answer, a single
-accepted question, or a model prediction is not completion. If any new or gated
-question remains, propose work instead. If work is already covered, return empty data.
+Return `complete` only when there is no blocker and either the graph's platform
+metadata says `ctfy.fully_solved: true`, or all of these hold:
+`ctfy.initial_gated_questions` is zero, every known visible question is accepted
+or listed as solved, and no known question remains hidden or unresolved. In the
+latter case, per-instance `answered_correctly` and accepted answer facts are valid
+evidence even when the static challenge's `my_fully_solved` remains false.
+A locally plausible answer or a model prediction is not completion. A single
+accepted question is insufficient when other visible or gated questions remain.
+If work is already covered, return empty data.
 
 # Time budget
 ```
 {time_budget}
 ```
+Each executor intent must fit within {dispatch_budget} of total model and tool time.
+Set a shorter command-level deadline, checkpoint evidence, and conclude within that
+dispatch; never give a command a longer wall-clock limit than its outer dispatch.
 Empty means no deadline was supplied. Prefer cheap, evidence-producing steps and
 never leave a discovered answer unrecorded. Keep intents small and checkpoint after
 every evidence batch. When the countdown reaches the finalization reserve, propose
