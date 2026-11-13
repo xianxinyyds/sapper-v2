@@ -1966,6 +1966,13 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             "challenge_id": challenge_id, "label": label, "proto": proto,
             "url": url, "host": parsed.hostname, "port": port,
         }
+        if endpoint.get("access") is not None:
+            data["access"] = str(endpoint["access"])
+        credentials = endpoint.get("credentials")
+        if isinstance(credentials, dict):
+            for field in ("username", "password", "key_file"):
+                if isinstance(credentials.get(field), str) and credentials[field]:
+                    data[f"auth_{field}"] = credentials[field]
         add_once(
             "endpoint", f"{label}:{proto}:{url}", f"CTFY endpoint {label}: {url}",
             kind="service", data=data, title=f"endpoint:{label}",
@@ -2192,7 +2199,9 @@ def cmd_answer(args) -> int:
             if task["run_mode"] == "instance":
                 challenge = client.get_instance(instance_id)
             else:
-                challenge = client.get_challenge(challenge_id)
+                challenge = client.get_challenge(
+                    challenge_id, competition_id=competition_id,
+                )
         except module.CtfyError as exc:
             if exc.code == "instance_not_found" and _ctfy_questions_complete(store):
                 print(f"{fact['id']} remains accepted; instance closed without more visible work")

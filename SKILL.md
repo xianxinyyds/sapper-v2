@@ -56,8 +56,12 @@ so later rounds do not submit them again. Model configuration comes only from
 Codex routes are supported without a personal-key fallback.
 
 The legacy `sapper arena` and `sapper bench` workflows remain available for
-other environments but are **not** in the CTFY run path. See `docker/CTFY.md` for
-build, dry-run, result, and local mock verification instructions.
+other environments but are **not** in the CTFY run path. For local preliminary-round
+play, `lib/ctfy_local.py` is the host-side lifecycle companion: it starts or reuses
+an instance, builds the task, runs the image, hands off unverified answers and cleans
+up. The container entrypoint has no instance-management logic; a local player token
+may still be broader than a hosted scoped token and must be temporary and minimal.
+See `docker/CTFY.md` for its commands, build, dry-run, result, and local verification.
 
 ## Scope — strictly per-project (IMPORTANT)
 

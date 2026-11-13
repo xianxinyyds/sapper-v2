@@ -180,7 +180,9 @@ class CtfyRunTests(unittest.TestCase):
         rc, configure, attachments, auto = self.run_with_mocks()
 
         self.assertEqual(rc, 0)
-        self.client.get_challenge.assert_called_once_with("challenge-1")
+        self.client.get_challenge.assert_called_once_with(
+            "challenge-1", competition_id="",
+        )
         configure.assert_called_once_with()
         attachments.assert_called_once_with(self.task, self.client, self.work)
         auto.assert_called_once()
@@ -758,9 +760,9 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertEqual(
             [(call["method"], call["path"]) for call in self.platform.seen],
             [
-                ("GET", "/api/v1/challenges/challenge-1"),
+                ("GET", "/api/v1/challenges/challenge-1?competition_id=competition-1"),
                 ("POST", "/api/v1/qa/submissions"),
-                ("GET", "/api/v1/challenges/challenge-1"),
+                ("GET", "/api/v1/challenges/challenge-1?competition_id=competition-1"),
             ],
         )
         post = self.platform.seen[1]
@@ -847,8 +849,10 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertEqual(
             [call["path"] for call in self.platform.seen],
             [
-                "/api/v1/challenges/challenge-1", "/api/v1/qa/submissions",
-                "/api/v1/challenges/challenge-1", "/api/v1/challenges/challenge-1",
+                "/api/v1/challenges/challenge-1?competition_id=competition-1",
+                "/api/v1/qa/submissions",
+                "/api/v1/challenges/challenge-1?competition_id=competition-1",
+                "/api/v1/challenges/challenge-1?competition_id=competition-1",
             ],
         )
 

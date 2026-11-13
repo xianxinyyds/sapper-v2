@@ -196,6 +196,64 @@ that group is outside this guarantee. Prompts therefore forbid nohup, background
 analysis must be split into bounded slices with checkpoints and concluded in
 the current dispatch.
 
+## Local preliminary-round driver
+
+`lib/ctfy_local.py` is a host-side companion, not the CTFY-0001 container entrypoint.
+It uses only the Python standard library and raw REST JSON, so optional SDK model
+changes cannot block an instance read. It lists challenges, reuses one matching
+running instance or starts one and waits for readiness, builds the v3 task, runs the
+image, submits any unverified answers left in `result.json`, then stops the instance.
+Only the host driver calls lifecycle APIs; the container entrypoint still has no
+start/stop logic. A local player token may nevertheless have broader permissions
+than the hosted run's scoped token, so use a temporary, least-privilege token.
+
+```bash
+export CTFY_PLATFORM_URL=https://ctfy.tsinghua.edu.cn
+export CTFY_TOKEN='<temporary player token with instance write access>'
+export LLM_FLAVOR=anthropic
+export LLM_API_KEY='<model key>'
+export LLM_MODEL=glm-5.3
+export LLM_BASE_URL=https://open.bigmodel.cn/api/anthropic
+
+python3 lib/ctfy_local.py challenges --competition '<competition-id>'
+python3 lib/ctfy_local.py instances --competition '<competition-id>'
+python3 lib/ctfy_local.py run CTFARENA-000 --competition '<competition-id>' \
+    --minutes 20 --max-turns 8 --ttl 3600
+python3 lib/ctfy_local.py stop '<instance-id>'
+```
+
+The default work directory is `runs/<competition>/<challenge>/<instance>` (or `qa`),
+which is ignored by Git. An explicit `--work-dir` is reusable only for the same
+challenge, competition and instance, preventing an old answer ledger leaking into a
+fresh instance. Startup failures, container errors and container timeouts trigger
+cleanup of the owned resources. A container timeout removes only this run's named
+container; no broad Docker cleanup is performed.
+
+By default a non-shared instance is stopped even when it was reused. Use
+`--keep-instance` to continue working against the same instance and work directory.
+Shared instances are never stopped by this driver. `--prepare-only` downloads and
+validates the task without calling the model; combine it with `--keep-instance` if
+the target must remain running. Unsupported engagement networking is refused
+explicitly rather than silently probing unreachable internal addresses.
+
+For `is_qa_only=true`, no instance is started. Static attachments, including nested
+paths, are downloaded to the work directory and passed as local QA paths; the local
+runner adds no extra attachment-size budget beyond platform limits. Instance
+attachments are still obtained through the current instance. TCP access metadata
+and any supplied endpoint credentials are retained in the graph.
+
+`result.json.answers` is handed off once through the correct instance or QA grader
+**before** instance teardown. Outcomes, including transport or HTTP errors, are in
+`handoff.json`; do not interpret `answers_handed_off` as proof of acceptance.
+Accepted answers and current instance state remain authoritative for completion.
+Host-side failures exit non-zero; an unfinished or infrastructure-blocked inner
+solver is not equivalent to a solved challenge.
+
+This driver is for local development and preliminary-round play. It does not replace
+the official hosted runner, does not implement challenge authoring, AWD or VPN, and
+should be used with a temporary, competition-scoped token. Registration is separate:
+a token without `teams:write` cannot register Solo for a new competition.
+
 ## Build and local verification
 
 Build from the repository root:

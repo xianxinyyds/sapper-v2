@@ -164,7 +164,10 @@ def run(work_dir: Path) -> int:
         return _fail(work_dir, reason, exc)
     try:
         client = ctfy.CtfyClient.from_env()
-        challenge = client.get_challenge(task["challenge"]["id"])
+        competition_id = task.get("competition_id", "") if task["run_mode"] == "qa" else ""
+        challenge = client.get_challenge(
+            task["challenge"]["id"], competition_id=competition_id,
+        )
     except ctfy.CtfyError as exc:
         reason = "blocked_by_infra" if exc.transport else "config_error"
         exit_code = 0 if exc.transport else 2

@@ -101,9 +101,13 @@ class CtfyClient:
                 raise CtfyError(f"CTFY {method} {path} returned non-JSON") from exc
         raise AssertionError("unreachable")
 
-    def get_challenge(self, challenge_id: str) -> dict:
+    def get_challenge(self, challenge_id: str, competition_id: str = "") -> dict:
         segment = self._segment(challenge_id, "challenge_id")
-        result = self._request("GET", f"/api/v1/challenges/{segment}", retry=True)
+        path = f"/api/v1/challenges/{segment}"
+        if competition_id:
+            self._segment(competition_id, "competition_id")
+            path += "?" + urllib.parse.urlencode({"competition_id": competition_id})
+        result = self._request("GET", path, retry=True)
         if not isinstance(result, dict):
             raise CtfyError("CTFY challenge response must be an object")
         if not isinstance(result.get("questions"), list):
@@ -117,17 +121,105 @@ class CtfyClient:
             raise CtfyError("CTFY instance response must be an object")
         return result
 
+    def list_instances(self, challenge_id: str = "") -> list[dict]:
+        path = "/api/v1/instances?limit=200"
+        if challenge_id:
+            path += "&" + urllib.parse.urlencode({"challenge_id": challenge_id})
+        result = self._request("GET", path, retry=True)
+        items = result.get("items") if isinstance(result, dict) else result
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise CtfyError("CTFY instance list must contain objects")
+        return items
+
+    def get_instance_status(self, instance_id: str) -> dict:
+        segment = self._segment(instance_id, "instance_id")
+        result = self._request("GET", f"/api/v1/instances/{segment}/status")
+        if not isinstance(result, dict):
+            raise CtfyError("CTFY instance status response must be an object")
+        return result
+
+    def start_instance(self, challenge_id: str, competition_id: str,
+                       ttl: int | None = None, *, timeout: int = 300,
+                       on_created=None) -> dict:
+        self._segment(challenge_id, "challenge_id")
+        self._segment(competition_id, "competition_id")
+        if timeout < 1:
+            raise CtfyError("instance startup timeout must be positive")
+        body = {"challenge_id": challenge_id, "competition_id": competition_id}
+        if ttl is not None:
+            if type(ttl) is not int or ttl < 1:
+                raise CtfyError("instance ttl must be a positive integer")
+            body["ttl"] = ttl
+        result = self._request("POST", "/api/v1/instances", body=body)
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str) \
+                or not result["id"].strip():
+            raise CtfyError("CTFY instance start response requires an id")
+        instance_id = result["id"]
+        if on_created is not None:
+            on_created(instance_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.get_instance_status(instance_id)
+            state = status.get("status")
+            if state in {"ready", "running"}:
+                segment = self._segment(instance_id, "instance_id")
+                instance = self._request(
+                    "GET", f"/api/v1/instances/{segment}", retry=True,
+                )
+                if not isinstance(instance, dict):
+                    raise CtfyError("CTFY instance response must be an object")
+                return instance
+            if state in {"failed", "error", "stopped", "expired"}:
+                raise CtfyError(f"CTFY instance startup ended with status {state!r}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CtfyError(
+                    f"CTFY instance {instance_id} did not become ready within {timeout}s",
+                    transport=True,
+                )
+            time.sleep(min(2.0, remaining))
+
+    def stop_instance(self, instance_id: str) -> None:
+        segment = self._segment(instance_id, "instance_id")
+        try:
+            self._request("DELETE", f"/api/v1/instances/{segment}")
+        except CtfyError as exc:
+            if exc.status != 404:
+                raise
+
     @staticmethod
     def _attachment_name(name: str) -> str:
-        if not isinstance(name, str) or not name or name in {".", ".."} \
-                or Path(name).is_absolute() or Path(name).name != name:
+        if not isinstance(name, str) or not name or "\\" in name:
+            raise CtfyError(f"unsafe CTFY attachment name {name!r}")
+        parts = name.split("/")
+        if len(parts) > 16 or any(
+                not part or part in {".", ".."} or part.startswith(".")
+                or any(ord(char) < 32 or ord(char) == 127 for char in part)
+                for part in parts):
             raise CtfyError(f"unsafe CTFY attachment name {name!r}")
         return name
 
+    @staticmethod
+    def _attachment_url_name(name: str) -> str:
+        parts = CtfyClient._attachment_name(name).split("/")
+        return "/".join(urllib.parse.quote(part, safe="") for part in parts)
+
     def download_attachment(self, instance_id: str, name: str, destination: Path) -> None:
         instance = self._segment(instance_id, "instance_id")
-        filename = self._segment(self._attachment_name(name), "attachment name")
-        path = f"/api/v1/instances/{instance}/attachments/{filename}"
+        filename = self._attachment_url_name(name)
+        self._download_to_path(
+            f"/api/v1/instances/{instance}/attachments/{filename}", destination,
+        )
+
+    def download_challenge_attachment(self, challenge_id: str, name: str,
+                                      destination: Path) -> None:
+        challenge = self._segment(challenge_id, "challenge_id")
+        filename = self._attachment_url_name(name)
+        self._download_to_path(
+            f"/api/v1/challenges/{challenge}/attachments/{filename}", destination,
+        )
+
+    def _download_to_path(self, path: str, destination: Path) -> None:
         req = urllib.request.Request(
             self.base_url + path,
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/octet-stream"},
