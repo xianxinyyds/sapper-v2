@@ -147,6 +147,37 @@ numpy, safetensors and ONNX metadata inspection without model runtimes. Full nuc
 templates, Sage, Ghidra, browsers, Android/multi-arch suites and heavyweight ML
 runtimes are not bundled.
 
+## Offline Web tooling
+
+All Web analysis dependencies are installed at image build time. Runtime containers
+must not download packages, gadget chains, wordlists, or other dependencies, and
+must not run package installers to supplement the image.
+
+- **HTTP/2 differential analysis:** use `nghttp` for explicit challenge requests and
+  `httpx.Client(http2=True)` or `h2` for scripted protocol comparisons.
+- **Session and WebSocket scripts:** use `httpx` for session/state checks and
+  `websockets` for WebSocket clients against the current challenge only.
+- **Flask sessions:** decode with `flask-unsign --decode --cookie '<cookie>'` and
+  sign reviewed test data with `flask-unsign --sign --cookie "{'logged_in': True}"
+  --secret 'test-only-secret'`.
+- **PHP analysis:** list gadgets with `phpggc -l`, generate a selected PHPGGC chain
+  with `phpggc <chain> [parameters]`, and use `php` only for minimal, reviewed,
+  standalone snippets.
+
+Do not start or execute a complete untrusted attachment project. Extract and inspect
+attachments, then run only the minimal reviewed snippets needed to reproduce a
+specific behavior.
+
+PHPGGC is the upstream `master` snapshot at commit
+[`f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c`](https://github.com/ambionics/phpggc/commit/f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c)
+(the upstream repository has no tags), licensed under Apache-2.0. The build context
+archive comes from
+`https://codeload.github.com/ambionics/phpggc/tar.gz/f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c`;
+`docker/phpggc.tar.gz` has SHA256
+`566d9f270585de42effc5e407070c0c815fefc30bb8842595e7367b37cc1eeba`.
+It contains the root `phpggc` executable and no `.git`, `.venv`, `vendor`, or
+`node_modules` tree.
+
 ## Result and exit semantics
 
 Answer facts have these states:

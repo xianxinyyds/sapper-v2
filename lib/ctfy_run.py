@@ -88,7 +88,8 @@ def finalize_result(work_dir: Path, store: sapper.Store, stop_reason: str) -> No
 
 
 def prepare_graph(work_dir: Path, task: dict,
-                  challenge: dict | None = None) -> sapper.Store:
+                  challenge: dict | None = None,
+                  progress: dict | None = None) -> sapper.Store:
     challenge_id = task["challenge"]["id"]
     origin = f"ctfy:{challenge_id}"
     store = sapper.Store(work_dir / ".sapper")
@@ -102,7 +103,7 @@ def prepare_graph(work_dir: Path, task: dict,
         metadata = project.get("ctfy") or {}
         if metadata.pop("blocker", None) is not None:
             store.save_project(project)
-    sapper.sync_ctfy_facts(store, task, challenge)
+    sapper.sync_ctfy_facts(store, task, challenge, progress=progress)
     return store
 
 
@@ -165,6 +166,11 @@ def run(work_dir: Path) -> int:
     try:
         client = ctfy.CtfyClient.from_env()
         challenge = client.get_challenge(task["challenge"]["id"])
+        progress = challenge
+        if task["run_mode"] == "instance":
+            progress = client.get_instance(
+                task["target_instance"], retry=True, require_questions=True,
+            )
     except ctfy.CtfyError as exc:
         reason = "blocked_by_infra" if exc.transport else "config_error"
         exit_code = 0 if exc.transport else 2
@@ -177,7 +183,7 @@ def run(work_dir: Path) -> int:
             pass
         return _fail(work_dir, reason, exc, exit_code=exit_code)
     try:
-        store = prepare_graph(work_dir, task, challenge)
+        store = prepare_graph(work_dir, task, challenge, progress=progress)
     except (ctfy.CtfyError, sapper.FGError) as exc:
         candidate_store = sapper.Store(work_dir / ".sapper")
         try:
@@ -188,8 +194,9 @@ def run(work_dir: Path) -> int:
             pass
         return _fail(work_dir, "config_error", exc)
     try:
-        if store.load_project()["status"] == "completed" \
-                and challenge.get("my_fully_solved") is not True:
+        project = store.load_project()
+        if project["status"] == "completed" \
+                and (project.get("ctfy") or {}).get("fully_solved") is not True:
             store.reopen_project()
         _checkpoint_result(work_dir, store)
         model = configure_model()
@@ -199,6 +206,7 @@ def run(work_dir: Path) -> int:
             or _positive_env("SAPPER_TIMEOUT") or 300
         deadline = _round_deadline(challenge)
         ctfy.ensure_attachments(task, client, work_dir)
+        sapper.sync_ctfy_facts(store, task, challenge, attachments_only=True)
     except (ctfy.CtfyError, sapper.FGError) as exc:
         transport = getattr(exc, "transport", False)
         return _fail(

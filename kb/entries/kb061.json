@@ -1,0 +1,19 @@
+{
+  "id": "kb061",
+  "title": "Web 框架路由、调试面与实例生命周期",
+  "description": "Web framework routing：Flask/Werkzeug、Django、FastAPI 与 Spring Actuator",
+  "detail": "1. 仅对当前任务明确授权的 endpoint 做元数据和路由检查；每个 intent 默认不超过 20 个请求、并发 1、5 分钟，保存原始请求/响应和覆盖清单。\n2. 框架入口：Flask/Werkzeug 看 /console 与调试响应；Django 看调试 404 和路由列表；FastAPI 看 /docs、/openapi.json；Spring 看 /actuator、/actuator/health、/actuator/env 等已暴露端点。只读元数据，配置和环境输出脱敏后记录，不假定入口存在。\n3. routing：用已知不存在路径作对照，以 404/405/308/OPTIONS/Allow 区分路由不存在、方法不允许和斜杠重定向；一次只改路径尾斜杠或方法。\n4. 生命周期：固定少量 canary（一个已知正常路由、一个已知不存在路由和静态响应 hash）识别目标重启或行为改变；只有状态改变后才重新检查旧负结果。调试面暴露后优先寻找配置、环境和启动信息，不做无依据的 Werkzeug PIN 爆破。\n5. 负结果记录路径、方法、状态码和请求上限；达到上限、canary 未变且对照无新证据，或路由前提被证伪即关闭，不扩大枚举。",
+  "commands": [
+    "curl -sS --max-time 15 -i -X OPTIONS 'http://T/candidate'",
+    "curl -sS --max-time 15 -i 'http://T/candidate/'",
+    "curl -sS --max-time 15 -i 'http://T/openapi.json'"
+  ],
+  "tags": [
+    "web",
+    "werkzeug",
+    "routing",
+    "framework"
+  ],
+  "source": "CTFY Web 黑盒与白盒解题能力增强设计",
+  "created_at": "2026-11-13T11:15:05Z"
+}

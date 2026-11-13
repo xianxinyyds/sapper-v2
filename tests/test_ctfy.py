@@ -566,6 +566,32 @@ class CtfyClientTests(unittest.TestCase):
             )
             self.assertEqual(self.platform.seen[0]["authorization"], "Bearer tok-x")
             self.assertEqual(list(work.glob("attachments/.attachment-*.tmp")), [])
+            attachments = task["attachments"]
+            self.assertEqual(attachments[0]["path"], "/ctfy/work/attachments/crackme")
+            self.assertEqual(attachments[1]["path"], str(work / "attachments" / "dump.bin"))
+
+    def test_mixed_attachments_update_only_downloaded_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            task = instance_task(attachments=[
+                {"name": "local.bin", "size": 4, "path": "/ctfy/work/attachments/local.bin"},
+                {"name": "first.bin", "size": 5, "path": None},
+                {"name": "second.bin", "size": 6, "path": None},
+            ])
+            self.platform.queue(200, b"first")
+            self.platform.queue(200, b"second")
+
+            ctfy.ensure_attachments(task, self.client, work)
+
+            paths = {item["name"]: item["path"] for item in task["attachments"]}
+            self.assertEqual(paths["local.bin"], "/ctfy/work/attachments/local.bin")
+            self.assertEqual(paths["first.bin"], str(work / "attachments" / "first.bin"))
+            self.assertEqual(paths["second.bin"], str(work / "attachments" / "second.bin"))
+            self.assertEqual(len(self.platform.seen), 2)
+            self.assertEqual([call["path"] for call in self.platform.seen], [
+                "/api/v1/instances/instance-1/attachments/first.bin",
+                "/api/v1/instances/instance-1/attachments/second.bin",
+            ])
 
     def test_qa_attachment_must_exist_locally_without_instance_download(self):
         with tempfile.TemporaryDirectory() as tmp:

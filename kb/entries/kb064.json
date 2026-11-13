@@ -1,0 +1,19 @@
+{
+  "id": "kb064",
+  "title": "Web 文件包含与路径穿越",
+  "description": "Web LFI/RFI、traversal、include 与文件读到 RCE 的有界验证",
+  "detail": "1. 只对当前任务明确授权的 endpoint 和已定位的文件参数做验证；每个 intent 默认不超过 20 个请求、并发 1、5 分钟。先用已知存在的可读文件与不存在路径对照，证明文件读取或路径控制，再构造更重的利用链。\n2. LFI/RFI：检查 include/require 类参数、目录穿越、PHP Wrapper（php://filter、php://input、data:// 仅在配置与证据支持时）、日志/Session 包含和上传转包含；RFI 不默认外连，远程包含前提未证实即关闭。\n3. 路径与组合：覆盖 Zip Slip 等解压路径问题，以及任意文件读到源码、配置、密钥再到 RCE 的组合路径。payload 从少量规范化和编码变体开始，一次只改一个变量；不得读取任务范围外文件。\n4. 每次保留原始请求/响应、Body Hash、文件内容特征和对照；负结果写明参数、方法、wrapper、编码与请求上限。已知答案不能复现、前提证伪、达到预算或两组对照无新增证据即关闭，不扩大字典。",
+  "commands": [
+    "curl -sS --max-time 15 -G --data-urlencode 'file=../../../../etc/passwd' 'http://T/view'",
+    "curl -sS --max-time 15 -G --data-urlencode 'file=php://filter/convert.base64-encode/resource=index.php' 'http://T/view'",
+    "curl -sS --max-time 15 -G --data-urlencode 'file=definitely-not-present' 'http://T/view'"
+  ],
+  "tags": [
+    "web",
+    "lfi",
+    "traversal",
+    "include"
+  ],
+  "source": "CTFY Web 黑盒与白盒解题能力增强设计",
+  "created_at": "2026-11-13T11:15:05Z"
+}

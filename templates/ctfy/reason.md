@@ -25,7 +25,12 @@ one primary label and run `sapper kb search "<category keywords>"` for unfamilia
 - Misc: inspect signatures, metadata and nested files with bounded extraction. For
   PCAP, start with capinfos/tshark summaries before bounded stream/object analysis;
   use pngcheck/zsteg/stegseek, ffprobe/ffmpeg/sox, or PDF/QR tools as indicated.
-- Web: map authorized routes and state before bounded injection/auth/logic probes.
+- Web: 首轮核对附件事实与实际文件，并执行对应的 `sapper kb search`；必要时
+  用 `sapper kb show <id>` 读取条目。
+  - 有源码：先审计，再定向在线验证。区分完整项目/源码片段，按 `kb063`
+    建立路由、输入源、Sink 与未知项清单。
+  - 无源码：先建立基线和会话，按 `kb060` 映射授权路由、状态和差分证据，
+    再按证据选择 `kb061`（框架路由）或 `kb062`（代理/协议差异）。
 - Pwn: verify real artifacts and checksec/protocol behavior before offsets or ROP;
   use patchelf/pwntools/ROPgadget for local validation.
 - AI security: inspect model inputs, artifacts, MCP/tool boundaries and data flows safely;

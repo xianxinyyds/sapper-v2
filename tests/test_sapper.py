@@ -433,7 +433,7 @@ class CtfyAnswerTests(unittest.TestCase):
                 self.challenge_calls.append(challenge_id)
                 return test.challenge
 
-            def get_instance(self, instance_id):
+            def get_instance(self, instance_id, *, retry=False, require_questions=False):
                 self.instance_calls.append(instance_id)
                 response = self.instance_responses.pop(0)
                 if isinstance(response, Exception):
@@ -614,6 +614,30 @@ class CtfyAnswerTests(unittest.TestCase):
         blocker = self.store.load_project()["ctfy"]["blocker"]
         self.assertEqual(blocker["kind"], "challenge_refresh_failed")
 
+    def test_malformed_instance_refresh_preserves_accepted_answer(self):
+        self.client.responses = [self._reply(True)]
+        malformed = self._instance()
+        malformed["questions"] = None
+        self.client.instance_responses = [malformed]
+
+        with self.assertRaises(sapper.FGError):
+            self._answer()
+
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "accepted")
+
+    def test_missing_questions_refresh_preserves_accepted_answer(self):
+        self.client.responses = [self._reply(True)]
+        malformed = self._instance()
+        del malformed["questions"]
+        self.client.instance_responses = [malformed]
+
+        with self.assertRaises(sapper.FGError):
+            self._answer()
+
+        fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
+        self.assertEqual(fact["data"]["status"], "accepted")
+
     def test_qa_submit_applies_accepted_verdict_and_refreshes(self):
         self._use_qa()
         self.challenge["my_solved_question_ids"] = ["flag"]
@@ -628,6 +652,24 @@ class CtfyAnswerTests(unittest.TestCase):
         fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
         self.assertEqual(fact["data"]["status"], "accepted")
         self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+
+    def test_qa_state_ignores_instance_shaped_fields(self):
+        self._use_qa()
+        self.challenge.update({
+            "grace_kind": "solved",
+            "my_solved_question_ids": ["q2"],
+            "my_fully_solved": False,
+            "questions": [{
+                **question, "answered_correctly": question["id"] == "flag",
+            } for question in self.task["questions"]],
+        })
+
+        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["question_state_source"], "challenge")
+        self.assertEqual(metadata["solved_question_ids"], ["q2"])
+        self.assertFalse(metadata["fully_solved"])
 
     def test_qa_submit_applies_rejected_verdict(self):
         self._use_qa()
@@ -720,8 +762,10 @@ class CtfyAnswerTests(unittest.TestCase):
             "scope": ["target:1337"], "rules_of_engagement": ["no brute force"],
         })
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
-        self.challenge["questions"] = [{"id": "q3", "prompt": "Second stage"}]
-        self.challenge["my_solved_question_ids"] = ["flag"]
+        self.challenge = self._instance(
+            questions=self.task["questions"] + [{"id": "q3", "prompt": "Second stage"}],
+            solved=["flag"],
+        )
         sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
         first_count = len(self.store.list_facts())
         sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
@@ -767,6 +811,16 @@ class CtfyAnswerTests(unittest.TestCase):
         metadata = self.store.load_project()["ctfy"]
         self.assertNotIn("category", metadata)
         self.assertNotIn("tags", metadata)
+
+    def test_category_less_instance_refresh_preserves_previous_web_category(self):
+        initial = self._instance()
+        refreshed = self._instance()
+        refreshed.pop("category")
+        sapper.sync_ctfy_facts(self.store, self.task, initial)
+
+        sapper.sync_ctfy_facts(self.store, self.task, refreshed)
+
+        self.assertEqual(self.store.load_project()["ctfy"]["category"], "Web")
 
     def test_sync_ctfy_facts_uses_task_category_when_refresh_omits_it(self):
         self.task["challenge"]["category"] = "crypto"
@@ -820,13 +874,15 @@ class CtfyAnswerTests(unittest.TestCase):
         metadata = self.store.load_project()["ctfy"]
         self.assertEqual(metadata["blocker"]["kind"], "gating_pending")
 
-        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        sapper.sync_ctfy_facts(self.store, self.task, self._instance())
         self.assertEqual(
             self.store.load_project()["ctfy"]["blocker"]["kind"], "gating_pending"
         )
 
-        self.challenge["questions"].append({"id": "q2", "prompt": "Unlocked"})
-        sapper.sync_ctfy_facts(self.store, self.task, self.challenge)
+        unlocked = self._instance(
+            questions=self.task["questions"] + [{"id": "q2", "prompt": "Unlocked"}]
+        )
+        sapper.sync_ctfy_facts(self.store, self.task, unlocked)
         self.assertIsNone(self.store.load_project()["ctfy"].get("blocker"))
 
     def test_ctfy_handoff_status_is_supported(self):

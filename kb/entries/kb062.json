@@ -1,0 +1,21 @@
+{
+  "id": "kb062",
+  "title": "Web 边缘代理与 HTTP 协议差异",
+  "description": "Web proxy 与 HTTP/2 协议差分：nghttp、h2、httpx 有界复核",
+  "detail": "1. 前置与预算：仅针对当前任务明确授权的 endpoint，且先有路由或代理解析差异再进入协议向量。每个协议族使用独立 intent，默认不超过 12 个请求、并发 1、5 分钟；保存 curl/nghttp verbose、自写 h2/httpx 脚本、原始响应和对照矩阵。\n2. 差分面：Host 与 :authority、绝对形式 URI、路径归一化、双重编码和重复 Header；比较 HTTP/1.1 与 HTTP/2 的路由差异以及代理到后端的协议转换。一次只改变一个字段，并保留同语义对照。\n3. 工具：nghttp -nv 做单次 HTTP/2 记录，h2 仅用于确需底层帧或 Header 控制的最小脚本，httpx.Client(http2=True) 复现高层 session。CONNECT、Upgrade、WebSocket 只在已有路由或协议证据时进入后续分支。\n4. CL.TE/TE.CL 等请求走私只在出现明确解析差异后做最小确认；不默认盲打，不影响共享基础设施或其他用户。\n5. 每个协议族分别记录已测 Header、路径、协议、负结果和请求上限；差异消失、前提证伪、达到预算或两组对照无新证据即关闭该族，不把向量合并成无界扫描。",
+  "commands": [
+    "curl -sS --max-time 15 -D - -o /dev/null --http1.1 'https://T/'",
+    "timeout 15s nghttp -nv 'https://T/'",
+    "timeout 15s nghttp -nv -H':authority: T' 'https://T/'",
+    "python3 -I h2_diff.py"
+  ],
+  "tags": [
+    "web",
+    "http2",
+    "proxy",
+    "nghttp",
+    "h2"
+  ],
+  "source": "CTFY Web 黑盒与白盒解题能力增强设计",
+  "created_at": "2026-11-13T11:15:05Z"
+}

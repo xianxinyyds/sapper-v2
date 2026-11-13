@@ -17,6 +17,19 @@ from test_ctfy import (  # noqa: E402
 )
 
 
+def instance_payload(**overrides):
+    payload = {
+        "id": "instance-1", "challenge_id": "challenge-1", "name": "Web",
+        "category": "web", "description": "Solve it", "grace_kind": "",
+        "questions": [{
+            "id": "flag", "prompt": "Flag", "unlocked": True,
+            "answered_correctly": False,
+        }],
+    }
+    payload.update(overrides)
+    return payload
+
+
 class CtfyDryRunTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -156,6 +169,7 @@ class CtfyRunTests(unittest.TestCase):
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         self.client = mock.Mock()
         self.client.get_challenge.return_value = challenge_payload()
+        self.client.get_instance.return_value = instance_payload()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -413,17 +427,29 @@ class CtfyRunTests(unittest.TestCase):
     def test_completed_graph_reopens_when_new_question_unlocked(self):
         store = ctfy_run.prepare_graph(
             self.work, self.task,
-            challenge_payload(my_solved_question_ids=["flag"], my_fully_solved=True),
+            instance_payload(
+                grace_kind="solved",
+                questions=[{
+                    "id": "flag", "prompt": "Flag", "unlocked": True,
+                    "answered_correctly": True,
+                }],
+            ),
         )
         evidence = store.add_fact("evidence", "test")
         original_edge = store.complete_project([evidence["id"]], "done", "test")
         self.client.get_challenge.return_value = challenge_payload(
-            questions=[
-                {"id": "flag", "prompt": "Flag"},
-                {"id": "q2", "prompt": "Newly unlocked"},
-            ],
-            my_solved_question_ids=["flag"], my_fully_solved=False,
+            my_solved_question_ids=["flag"], my_fully_solved=True,
         )
+        self.client.get_instance.return_value = instance_payload(questions=[
+            {
+                "id": "flag", "prompt": "Flag", "unlocked": True,
+                "answered_correctly": True,
+            },
+            {
+                "id": "q2", "prompt": "Newly unlocked", "unlocked": True,
+                "answered_correctly": False,
+            },
+        ])
 
         def complete_again(argv, **kwargs):
             self.assertEqual(store.load_project()["status"], "active")
@@ -484,6 +510,238 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
             "submit": submit, "creator": "test", "title": None,
         })()
 
+    def test_startup_retries_instance_and_projects_refreshed_progress(self):
+        self.platform.queue(200, challenge_payload(
+            category="rev", tags=["static-challenge"],
+            my_solved_question_ids=["flag"], my_fully_solved=True,
+        ))
+        self.platform.queue(503, {"code": "temporary", "message": "try again"})
+        refreshed = instance_payload(questions=[{
+            "id": "q2", "prompt": "Current question", "unlocked": True,
+            "answered_correctly": False,
+        }])
+        refreshed.pop("category")
+        self.platform.queue(200, refreshed)
+
+        with mock.patch.object(ctfy_run.ctfy.time, "sleep") as sleep:
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
+
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["question_state_source"], "instance")
+        self.assertEqual(metadata["visible_question_ids"], ["q2"])
+        self.assertEqual(metadata["solved_question_ids"], [])
+        self.assertFalse(metadata["fully_solved"])
+        self.assertEqual(metadata["category"], "Reverse")
+        self.assertEqual(metadata["tags"], ["static-challenge"])
+        self.assertEqual(
+            [(call["method"], call["path"]) for call in self.platform.seen],
+            [
+                ("GET", "/api/v1/challenges/challenge-1"),
+                ("GET", "/api/v1/instances/instance-1"),
+                ("GET", "/api/v1/instances/instance-1"),
+            ],
+        )
+        sleep.assert_called_once_with(1.0)
+
+    def test_malformed_startup_refresh_preserves_existing_graph(self):
+        store = ctfy_run.prepare_graph(
+            self.work, self.task,
+            instance_payload(questions=[{
+                "id": "flag", "prompt": "Flag", "unlocked": True,
+                "answered_correctly": True,
+            }]),
+        )
+        project = store.load_project()
+        project["ctfy"]["blocker"] = {
+            "kind": "instance_unavailable", "created_at": "old", "detail": "prior state",
+        }
+        store.save_project(project)
+        before = store.load_project()
+        self.platform.queue(200, challenge_payload(
+            questions=[{"id": "q2", "prompt": "Static replacement"}],
+            my_solved_question_ids=[], my_fully_solved=False,
+        ))
+        self.platform.queue(200, instance_payload(questions=None))
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        self.assertIn("questions", stderr.getvalue())
+        self.assertEqual(store.load_project(), before)
+
+    def test_missing_questions_startup_refresh_preserves_existing_graph(self):
+        store = ctfy_run.prepare_graph(
+            self.work, self.task,
+            instance_payload(questions=[{
+                "id": "flag", "prompt": "Flag", "unlocked": True,
+                "answered_correctly": True,
+            }]),
+        )
+        before = store.load_project()
+        self.platform.queue(200, challenge_payload(
+            questions=[{"id": "q2", "prompt": "Static replacement"}],
+            my_solved_question_ids=[], my_fully_solved=False,
+        ))
+        missing = instance_payload()
+        del missing["questions"]
+        self.platform.queue(200, missing)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        self.assertIn("questions", stderr.getvalue())
+        self.assertEqual(store.load_project(), before)
+
+    def test_attachment_download_does_not_replay_static_instance_progress(self):
+        self.task = instance_task(
+            gated_questions=1,
+            attachments=[{"name": "source.zip", "size": 4, "path": None}],
+        )
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.platform.queue(200, challenge_payload(
+            questions=[{"id": "q2", "prompt": "Static replacement"}],
+            my_solved_question_ids=[], my_fully_solved=False,
+        ))
+        self.platform.queue(200, instance_payload(questions=[{
+            "id": "flag", "prompt": "Flag", "unlocked": True,
+            "answered_correctly": True,
+        }]))
+        self.platform.queue(200, b"zip!")
+
+        rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
+
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["question_state_source"], "instance")
+        self.assertEqual(metadata["visible_question_ids"], ["flag"])
+        self.assertEqual(metadata["solved_question_ids"], ["flag"])
+        self.assertEqual(metadata["blocker"]["kind"], "gating_pending")
+        attachment = next(
+            fact for fact in self.store.list_facts()
+            if (fact.get("data") or {}).get("record_type") == "attachment"
+        )
+        expected_path = self.work / "attachments" / "source.zip"
+        self.assertEqual(attachment["data"]["path"], str(expected_path))
+        self.assertEqual(attachment["data"]["download_required"], "false")
+        self.assertEqual(expected_path.read_bytes(), b"zip!")
+
+    def test_state_refresh_retries_while_health_remains_single_attempt(self):
+        ctfy_run.prepare_graph(self.work, self.task, instance_payload())
+        env = {
+            "CTFY_WORK_DIR": str(self.work),
+            "CTFY_PLATFORM_URL": self.platform.base_url,
+            "CTFY_TOKEN": "tok-super-secret",
+        }
+        health_args = type("Args", (), {"store": str(self.store.root)})()
+        self.platform.queue(503, {"code": "temporary", "message": "health unavailable"})
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(ctfy_run.ctfy.time, "sleep") as sleep:
+            with self.assertRaises(ctfy_run.sapper.FGError):
+                ctfy_run.sapper.cmd_ctfy_health(health_args)
+            self.assertEqual(len(self.platform.seen), 1)
+
+            verdict = submission_payload(True)
+            verdict["question_id"] = "flag"
+            self.platform.queue(200, verdict)
+            self.platform.queue(503, {"code": "temporary", "message": "try again"})
+            self.platform.queue(200, instance_payload(questions=[
+                {
+                    "id": "flag", "prompt": "Flag", "unlocked": True,
+                    "answered_correctly": True,
+                },
+                {
+                    "id": "q2", "prompt": "Next question", "unlocked": True,
+                    "answered_correctly": False,
+                },
+            ]))
+            self.assertEqual(ctfy_run.sapper.cmd_answer(
+                self.answer_args(self.store),
+            ), 0)
+
+        metadata = self.store.load_project()["ctfy"]
+        self.assertEqual(metadata["visible_question_ids"], ["flag", "q2"])
+        self.assertEqual(metadata["solved_question_ids"], ["flag"])
+        self.assertIsNone(metadata.get("blocker"))
+        self.assertEqual(
+            [(call["method"], call["path"]) for call in self.platform.seen],
+            [
+                ("GET", "/api/v1/instances/instance-1"),
+                ("POST", "/api/v1/submissions"),
+                ("GET", "/api/v1/instances/instance-1"),
+                ("GET", "/api/v1/instances/instance-1"),
+            ],
+        )
+        sleep.assert_called_once_with(1.0)
+
+    def test_downloaded_attachment_fact_survives_stale_task_sync(self):
+        self.task = instance_task(attachments=[
+            {"name": "source.zip", "size": 4, "path": None},
+        ])
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
+        self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
+        self.platform.queue(200, b"zip!")
+        observed = {}
+
+        def inspect_facts(argv, checkpoint=None):
+            attachments = [
+                fact for fact in self.store.list_facts()
+                if (fact.get("data") or {}).get("record_type") == "attachment"
+            ]
+            self.assertEqual(len(attachments), 1)
+            fact = attachments[0]
+            self.assertEqual(
+                fact["data"]["path"], str(self.work / "attachments" / "source.zip")
+            )
+            self.assertEqual(fact["data"]["download_required"], "false")
+            observed["fact_id"] = fact["id"]
+            observed["fact_count"] = len(self.store.list_facts())
+            return 0
+
+        rc, _, auto = self.run_with_auto(inspect_facts)
+
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
+        self.assertIsNone(self.task["attachments"][0]["path"])
+        ctfy_run.sapper.sync_ctfy_facts(self.store, self.task, challenge_payload())
+        attachments = [
+            fact for fact in self.store.list_facts()
+            if (fact.get("data") or {}).get("record_type") == "attachment"
+        ]
+        self.assertEqual(len(attachments), 1)
+        fact = attachments[0]
+        self.assertEqual(fact["id"], observed["fact_id"])
+        self.assertEqual(len(self.store.list_facts()), observed["fact_count"])
+        self.assertEqual(
+            fact["data"]["path"], str(self.work / "attachments" / "source.zip")
+        )
+        self.assertEqual(fact["data"]["download_required"], "false")
+
+    def test_attachment_update_rejects_non_attachment_fact(self):
+        self.store.init("ctfy:challenge-1", "solve challenge-1")
+        note = self.store.add_fact(
+            "ordinary note", "test", kind="note",
+            data={"platform": "ctfy", "record_type": "note", "value": "keep"},
+        )
+        original = self.store.get_fact(note["id"])
+
+        with self.assertRaises(ctfy_run.sapper.FGError):
+            self.store.update_attachment_fact(
+                note["id"], str(self.work / "attachments" / "source.zip")
+            )
+
+        self.assertEqual(self.store.get_fact(note["id"]), original)
+
     def test_null_challenge_questions_fail_cleanly_with_result(self):
         self.platform.queue(200, challenge_payload(questions=None))
 
@@ -502,6 +760,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         verdict = submission_payload(True)
         verdict["question_id"] = "flag"
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
         self.platform.queue(200, verdict)
         self.platform.queue(200, {
             "id": "instance-1", "challenge_id": "challenge-1", "name": "Web",
@@ -543,6 +802,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         verdict["question_id"] = "flag"
         verdict["challenge_fully_solved"] = False
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
         self.platform.queue(200, verdict)
         self.platform.queue(404, {"code": "instance_not_found", "message": "solved"})
 
@@ -566,6 +826,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
     def test_missing_instance_stops_auto_and_hands_off_recorded_answer(self):
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
         self.platform.queue(404, {"code": "instance_not_found", "message": "missing"})
         self.platform.queue(404, {"code": "instance_not_found", "message": "still missing"})
 
@@ -590,6 +851,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
             [(call["method"], call["path"]) for call in self.platform.seen],
             [
                 ("GET", "/api/v1/challenges/challenge-1"),
+                ("GET", "/api/v1/instances/instance-1"),
                 ("POST", "/api/v1/submissions"),
                 ("GET", "/api/v1/instances/instance-1"),
             ],
@@ -605,6 +867,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         verdict["question_id"] = "flag"
         verdict["challenge_fully_solved"] = False
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
         self.platform.queue(200, verdict)
         self.platform.queue(403, {"code": "forbidden", "message": "refresh failed"})
 
@@ -629,14 +892,18 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "blocked_by_infra")
 
     def test_gating_blocker_stops_without_more_model_calls(self):
+        self.task["gated_questions"] = 1
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         verdict = submission_payload(True)
         verdict["question_id"] = "flag"
         verdict["challenge_fully_solved"] = False
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
         self.platform.queue(200, verdict)
-        self.platform.queue(200, challenge_payload(
-            my_solved_question_ids=["flag"], my_fully_solved=False,
-        ))
+        self.platform.queue(200, instance_payload(questions=[{
+            "id": "flag", "prompt": "Flag", "unlocked": True,
+            "answered_correctly": True,
+        }]))
 
         def solve(argv, checkpoint=None):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
@@ -707,6 +974,8 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "blocked_by_infra")
 
     def test_malformed_refreshed_challenge_preserves_matching_answer_ledger(self):
+        self.task = instance_task(run_mode="qa", target_instance=None, target_endpoints=[])
+        (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         store = ctfy_run.prepare_graph(self.work, self.task, challenge_payload())
         candidate = store.add_fact(
             "candidate", "test", kind="flag",
@@ -858,6 +1127,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         ]
         (self.work / "task.json").write_text(json.dumps(self.task), encoding="utf-8")
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
 
         rc, _, auto = self.run_with_auto(lambda argv, **kwargs: 0)
 
@@ -874,6 +1144,7 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
     def test_second_round_reuses_graph_and_adds_question(self):
         self.platform.queue(200, challenge_payload())
+        self.platform.queue(200, instance_payload())
 
         def record_without_verdict(argv, **kwargs):
             self.assertEqual(ctfy_run.sapper.cmd_answer(
@@ -898,6 +1169,16 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
         self.platform.queue(200, challenge_payload(
             questions=self.task["questions"], my_fully_solved=False,
         ))
+        self.platform.queue(200, instance_payload(questions=[
+            {
+                "id": "flag", "prompt": "Flag", "unlocked": True,
+                "answered_correctly": False,
+            },
+            {
+                "id": "q2", "prompt": "Second answer", "unlocked": True,
+                "answered_correctly": False,
+            },
+        ]))
         (self.work / "result.json").unlink()
 
         second_rc, _, second_auto = self.run_with_auto(lambda argv, **kwargs: 0)
@@ -925,6 +1206,35 @@ class CtfyLocalPlatformRunTests(unittest.TestCase):
 
 
 class CtfyContainerContractTests(unittest.TestCase):
+    def test_web_tools_and_offline_phpggc_are_declared(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        apt_install = dockerfile.split(
+            "apt-get install -y --no-install-recommends \\\n", 1,
+        )[1].split("&& setcap", 1)[0]
+        for package in ("nghttp2-client", "php-cli"):
+            with self.subTest(package=package):
+                self.assertIn(package, apt_install)
+
+        extras = dockerfile.split("# --- python extras", 1)[1]
+        mandatory = extras.split("\n#", 1)[0]
+        for requirement in ("httpx[http2]", "h2", "websockets", "flask-unsign"):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, mandatory)
+
+        for declaration in ("docker/phpggc.tar.gz", "/opt/phpggc", "phpggc -l"):
+            with self.subTest(declaration=declaration):
+                self.assertIn(declaration, dockerfile)
+        self.assertTrue((ROOT / "docker" / "phpggc.tar.gz").is_file())
+
+        documentation = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        for tool in ("nghttp", "PHPGGC", "flask-unsign"):
+            with self.subTest(tool=tool):
+                self.assertIn(tool, documentation)
+        self.assertIn("must not download", documentation)
+        for excluded in ("chromium", "playwright", "semgrep", "onnxruntime"):
+            with self.subTest(excluded=excluded):
+                self.assertNotIn(excluded, dockerfile)
+
     def test_absolute_entrypoint_and_image_wiring(self):
         entrypoint = (ROOT / "docker" / "entrypoint-ctfy.sh").read_text(encoding="utf-8")
         self.assertIn("exec python3 /opt/sapper/lib/ctfy_run.py", entrypoint)
@@ -949,7 +1259,7 @@ class CtfyContainerContractTests(unittest.TestCase):
     def test_python_packages_use_reachable_build_mirror(self):
         dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple", dockerfile,
+            "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple", dockerfile,
         )
 
     def test_codex_native_dependency_version_is_pinned(self):
@@ -1071,6 +1381,91 @@ class CtfyContainerContractTests(unittest.TestCase):
 
 
 class CtfyKbContractTests(unittest.TestCase):
+    def test_web_workflow_entries_are_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        for query, expected, expected_tags in (
+            ("web session evidence", "kb060", {"web", "session", "evidence", "differential"}),
+            ("Werkzeug routing", "kb061", {"web", "werkzeug", "routing", "framework"}),
+            ("HTTP/2 proxy", "kb062", {"web", "http2", "proxy", "nghttp", "h2"}),
+            ("web source audit", "kb063", {"web", "source-audit", "whitebox", "minimal-poc"}),
+            ("LFI traversal", "kb064", {"web", "lfi", "traversal", "include"}),
+        ):
+            with self.subTest(query=query):
+                results = base.search(query, limit=20)
+                self.assertIn(expected, {entry["id"] for entry in results})
+                entry = next(item for item in results if item["id"] == expected)
+                self.assertIn("web", entry["tags"])
+                self.assertEqual(set(entry["tags"]), expected_tags)
+
+    def test_web_kb_matches_offline_image_and_source_safety(self):
+        entries = {
+            entry_id: json.loads(
+                (ROOT / "kb" / "entries" / f"{entry_id}.json").read_text(encoding="utf-8")
+            )
+            for entry_id in ("kb001", "kb004", "kb005", "kb016", "kb039", "kb043", "kb052")
+        }
+        self.assertIn("sourcesContent", entries["kb001"]["detail"])
+
+        kb004_commands = "\n".join(entries["kb004"].get("commands") or [])
+        self.assertNotIn("tplmap", kb004_commands)
+        self.assertIn("{{7*7}}", entries["kb004"]["detail"])
+
+        kb005_text = entries["kb005"]["detail"] + "\n" + "\n".join(
+            entries["kb005"].get("commands") or []
+        )
+        self.assertIn("phpggc", kb005_text)
+        self.assertIn("不启动完整附件项目", entries["kb005"]["detail"])
+
+        for entry_id in ("kb016", "kb052"):
+            with self.subTest(entry_id=entry_id):
+                detail = entries[entry_id]["detail"]
+                self.assertNotIn("nuclei 全模板", detail)
+                self.assertIn("没有本地 nuclei 模板", detail)
+                self.assertIn("定向手工验证", detail)
+                self.assertIn("不等待联网下载", detail)
+
+        kb039_text = entries["kb039"]["detail"] + "\n" + "\n".join(
+            entries["kb039"].get("commands") or []
+        )
+        self.assertIn("签名", kb039_text)
+        self.assertIn("flask-unsign", kb039_text)
+        self.assertIn("签名而非加密", entries["kb039"]["detail"])
+        self.assertNotIn("可解密 session", entries["kb039"]["detail"].lower())
+        self.assertNotIn("解密", entries["kb039"]["description"])
+        kb039_commands = entries["kb039"].get("commands") or []
+        for operation in ("--unsign", "--sign"):
+            with self.subTest(operation=operation):
+                command = next(
+                    (item for item in kb039_commands if operation in item), "",
+                )
+                self.assertIn("--no-literal-eval", command)
+        for required in ("字面量", "纯数字", "123456", "Python 字面量引号"):
+            with self.subTest(literal_handling=required):
+                self.assertIn(required, entries["kb039"]["detail"])
+
+        kb043_commands = "\n".join(entries["kb043"].get("commands") or [])
+        self.assertNotIn("ddddocr", kb043_commands)
+        self.assertNotIn("ddddocr", entries["kb043"]["detail"].lower())
+
+        for entry_id in ("kb062", "kb063"):
+            entries[entry_id] = json.loads(
+                (ROOT / "kb" / "entries" / f"{entry_id}.json").read_text(encoding="utf-8")
+            )
+        kb062_text = entries["kb062"]["detail"] + "\n" + "\n".join(
+            entries["kb062"].get("commands") or []
+        )
+        self.assertIn("nghttp", kb062_text)
+        kb063_commands = entries["kb063"].get("commands") or []
+        self.assertGreaterEqual(len(kb063_commands), 3)
+        for command in kb063_commands[:3]:
+            with self.subTest(command=command):
+                self.assertIn("attachments", command)
+        self.assertNotRegex("\n".join(kb063_commands), r"(?<!\w)attachment(?!\w)")
+        for required in ("完整项目", "源码片段", "最小 PoC", "不得直接启动完整项目"):
+            with self.subTest(required=required):
+                self.assertIn(required, entries["kb063"]["detail"])
+
     def test_reverse_and_ai_security_entries_are_searchable(self):
         module = ctfy_run.sapper._load_kb_module()
         base = module.KnowledgeBase(module.KnowledgeBase.default_root())
@@ -1151,6 +1546,7 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_reason_prompt_contains_current_platform_completion_state(self):
+        self.task.update({"run_mode": "qa", "target_instance": None})
         self.task["gated_questions"] = 7
         ctfy_run.sapper.sync_ctfy_facts(
             self.store, self.task,
@@ -1186,6 +1582,25 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
             "patchelf", "fpylll", "safetensors",
         ):
             self.assertIn(tool, combined)
+
+    def test_web_prompt_routes_source_and_blackbox_without_project_execution(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        combined = reason + "\n" + explore
+        for required in (
+            "kb060", "kb061", "kb062", "kb063",
+            "完整项目", "源码片段", "最小 PoC",
+            "sapper kb search", "不得直接启动", "不联网安装",
+            "closed-vector", "maximum requests or passes",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, combined)
+
+        self.assertIn("有源码：先审计，再定向在线验证", reason)
+        self.assertIn("无源码：先建立基线和会话", reason)
+        for required in ("保存审计清单", "会话/原始响应脚本", "不得只写抽象原则"):
+            with self.subTest(explore_required=required):
+                self.assertIn(required, explore)
 
     def test_prompt_distinguishes_qa_verdict_from_instance_post(self):
         reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")

@@ -2,10 +2,10 @@
   "id": "kb052",
   "title": "版本指纹方法论",
   "description": "一切 CVE 打击的前置：先把版本钉死",
-  "detail": "顺序：1 响应头/cookie 名（X-Powered-By、JSESSIONID、PHPSESSID、think_var）2 favicon hash 3 报错页堆栈 4 /actuator /package.json /composer.json /.git/HEAD 5 whatweb。钉死版本→查 kb050→没有就 nuclei 全模板（限速）。版本未知时不要盲打 payload。",
+  "detail": "顺序：1 响应头/cookie 名（X-Powered-By、JSESSIONID、PHPSESSID、think_var）2 favicon hash 3 报错页堆栈 4 /actuator /package.json /composer.json /.git/HEAD 5 whatweb。钉死版本→查 kb050→没有本地 nuclei 模板时不等待联网下载，转定向手工验证，不进行默认全模板扫描。版本未知时不要盲打 payload；每次验证保留原始响应与负结果，单指纹/单 CVE 分支达到预定请求上限或前提证伪即关闭。",
   "commands": [
-    "whatweb http://T",
-    "curl -sI http://T | head -20"
+    "timeout 30s whatweb http://T",
+    "curl -sSI --max-time 15 http://T | head -20"
   ],
   "tags": [
     "recon",

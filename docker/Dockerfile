@@ -10,9 +10,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SAPPER_RETRY_MODEL=3
 
 # --- offline tooling (Kali packages) -----------------------------------------
-# Pin a reliable mirror: the default http.kali.org redirect can land on
-# mirrors that fail to resolve in build sandboxes.
-RUN echo 'deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free non-free-firmware' \
+# Bootstrap CA certificates via signed HTTP metadata, then use only HTTPS.
+RUN echo 'deb http://mirrors.ustc.edu.cn/kali kali-rolling main contrib non-free non-free-firmware' \
+        > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/kali.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && echo 'deb https://mirrors.ustc.edu.cn/kali kali-rolling main contrib non-free non-free-firmware' \
         > /etc/apt/sources.list \
     && echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dnsutils whois openssh-client sshpass \
         openssl gnupg \
         nmap masscan \
-        whatweb wafw00f nikto \
+        whatweb wafw00f nikto nghttp2-client php-cli \
         gobuster ffuf dirb wfuzz feroxbuster dirsearch arjun cewl \
         sqlmap \
         hydra \
@@ -81,11 +85,12 @@ RUN npm install -g --allow-scripts=@anthropic-ai/claude-code \
     && npm cache clean --force
 
 # --- python extras ----------------------------------------------------------
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 RUN pip3 install --no-cache-dir --break-system-packages \
         requests pyjwt "unicorn==2.0.1.post1" "capstone>=5.0.1,<6" "setuptools<81" pwntools \
         pycryptodome sympy ROPgadget \
         pycryptodomex ratelimit termcolor cprint \
+        "httpx[http2]==0.28.1" "h2==4.4.1" "websockets==17.4" "flask-unsign==1.2.1" \
         "git-dumper==1.0.9" "xortool==1.1.0"
 # heavy/compiled extras: failure here must not kill the build (kb mentions them
 # as optional; stdlib+sympy covers most crypto)
@@ -95,6 +100,7 @@ RUN pip3 install --no-cache-dir --break-system-packages gmpy2 z3-solver \
 COPY docker/pwninit /usr/local/bin/pwninit
 COPY docker/RsaCtfTool.tar.gz /tmp/RsaCtfTool.tar.gz
 COPY docker/jwt_tool.tar.gz /tmp/jwt_tool.tar.gz
+COPY docker/phpggc.tar.gz /tmp/phpggc.tar.gz
 RUN chmod +x /usr/local/bin/pwninit \
     && mkdir -p /tmp/RsaCtfTool \
     && tar -xzf /tmp/RsaCtfTool.tar.gz --exclude='*/.venv' --strip-components=1 -C /tmp/RsaCtfTool \
@@ -104,11 +110,16 @@ RUN chmod +x /usr/local/bin/pwninit \
     && chmod +x /opt/jwt_tool/jwt_tool.py \
     && python3 -c "from pathlib import Path; p=Path('/opt/jwt_tool/jwt_tool.py'); s=p.read_text(); old='configparser.ConfigParser(allow_no_value=True)'; assert s.count(old) == 1; p.write_text(s.replace(old, 'configparser.ConfigParser(allow_no_value=True, delimiters=(\"=\",))'))" \
     && ln -s /opt/jwt_tool/jwt_tool.py /usr/local/bin/jwt_tool \
+    && mkdir -p /opt/phpggc \
+    && tar -xzf /tmp/phpggc.tar.gz --strip-components=1 -C /opt/phpggc \
+    && chmod +x /opt/phpggc/phpggc \
+    && ln -s /opt/phpggc/phpggc /usr/local/bin/phpggc \
     && rm -rf /tmp/RsaCtfTool \
-    && rm -f /tmp/RsaCtfTool.tar.gz /tmp/jwt_tool.tar.gz \
+    && rm -f /tmp/RsaCtfTool.tar.gz /tmp/jwt_tool.tar.gz /tmp/phpggc.tar.gz \
     && pwninit --help >/dev/null \
     && RsaCtfTool --help >/dev/null \
-    && jwt_tool --help >/dev/null
+    && jwt_tool --help >/dev/null \
+    && phpggc -l >/dev/null
 
 # --- sapper -----------------------------------------------------------------
 COPY lib/        /opt/sapper/lib/

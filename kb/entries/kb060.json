@@ -1,0 +1,19 @@
+{
+  "id": "kb060",
+  "title": "Web 会话、差分证据与停损工作流",
+  "description": "Web session 会话基线、differential response evidence 与有界停损",
+  "detail": "1. 作用域与预算：仅访问当前任务明确授权的 endpoint。每个 intent 先声明最大请求数（默认不超过 20）、并发 1 和 5 分钟 wall-clock；脚本、原始请求/响应、Cookie Jar、CSRF Token、认证状态和对照表保存到 /ctfy/work。\n2. 基线：用 httpx.Client 维护 session，固定 Cookie、重定向策略和已知输入，保存基准状态码、Body Hash、关键 Header、Location 和响应长度。Agent 自写的 session_diff.py 应复用同一会话逻辑，不要每个 intent 重新实现。\n3. differential：一次只改一个变量并保留已知答案对照，同时比较状态码、Body Hash、关键 Header、重定向、响应长度和有界时序。scanner warning、单次异常或模型推断都不是漏洞成立证据。\n4. 负结果与关闭：记录已覆盖的 endpoint、参数、方法、协议、payload 类别和实际请求上限；前提被证伪、达到预算或连续两组对照无新增 evidence 时关闭假设。没有新证据不得扩大字典、并发或重复同类扫描。",
+  "commands": [
+    "mkdir -p evidence && curl -sS --max-time 15 -D evidence/baseline.headers -o evidence/baseline.body 'http://T/'",
+    "python3 -I session_diff.py",
+    "sha256sum evidence/baseline.body evidence/variant.body"
+  ],
+  "tags": [
+    "web",
+    "session",
+    "evidence",
+    "differential"
+  ],
+  "source": "CTFY Web 黑盒与白盒解题能力增强设计",
+  "created_at": "2026-11-13T11:15:05Z"
+}

@@ -1,10 +1,13 @@
 {
   "id": "kb039",
   "title": "Cookie/Session 攻击",
-  "description": "伪造/固定/解密/注入四路",
-  "detail": "1. 看结构：base64 解开看字段（user/role/isAdmin 常见）\n2. 序列化串：rO0AB（java）/ Tzoy（php \"O:2:\"）→ 反序列化条目\n3. 可解密 session（泄露 key/弱 key）：flask unpick 反序列化 RCE（.level 字段注入）\n4. 伪造：字段改 role=admin 重签（key 从 git 泄露/配置拿）\n5. 固定：登出后 session 不失效/登录前设置 session id\n6. jwt 见专条\n7. oauth/oidc：redirect_uri、state 缺失 CSRF、code 重放\n8. auto-binding 参数污染：注册多传 role 字段（mass assignment）",
+  "description": "伪造/固定/签名验证/注入四路",
+  "detail": "1. 看结构：base64 解开看字段（user/role/isAdmin 常见）\n2. 序列化串：rO0AB（java）/ Tzoy（php \"O:2:\"）→ 反序列化条目\n3. Flask 客户端 Session 默认是签名而非加密：先用 flask-unsign --decode 读取明文；能解码不等于能伪造。只有泄露 key 或弱 key 证据时才做有界候选验证，再修改字段重签。\n4. 伪造：字段改 role=admin 重签（key 从 git 泄露/配置拿）。flask-unsign 默认按 Python 字面量解析 secret/字典候选；纯数字等字面量形态的秘密（如 123456）使用原始字符串时必须加 --no-literal-eval，否则可能漏报或重签失败；不加该参数时改用 Python 字面量引号（如 \"'123456'\"，字典候选同样带引号）。candidates.txt 只包含源码/配置泄露和少量已知默认候选，先声明条数上限，命中即停；未命中只关闭该字典，不联网下载更大字典。在线复核默认不超过 5 个请求、并发 1，保存原始响应；不能复现或达到上限即关闭。\n5. 固定：登出后 session 不失效/登录前设置 session id\n6. jwt 见专条\n7. oauth/oidc：redirect_uri、state 缺失 CSRF、code 重放\n8. auto-binding 参数污染：注册多传 role 字段（mass assignment）",
   "commands": [
-    "echo 'rO0ABXNyAB...' | base64 -d | xxd | head"
+    "echo 'rO0ABXNyAB...' | base64 -d | xxd | head",
+    "flask-unsign --decode --cookie '<cookie>'",
+    "flask-unsign --unsign --cookie '<cookie>' --wordlist candidates.txt --threads 1 --chunk-size 16 --no-literal-eval",
+    "flask-unsign --sign --cookie \"{'role': 'admin'}\" --secret '<confirmed-secret>' --no-literal-eval"
   ],
   "tags": [
     "web",

@@ -110,11 +110,17 @@ class CtfyClient:
             raise CtfyError("CTFY challenge response questions must be a list")
         return result
 
-    def get_instance(self, instance_id: str) -> dict:
+    def get_instance(
+            self, instance_id: str, *, retry: bool = False,
+            require_questions: bool = False) -> dict:
         segment = self._segment(instance_id, "instance_id")
-        result = self._request("GET", f"/api/v1/instances/{segment}")
+        result = self._request("GET", f"/api/v1/instances/{segment}", retry=retry)
         if not isinstance(result, dict):
             raise CtfyError("CTFY instance response must be an object")
+        if require_questions and "questions" not in result:
+            raise CtfyError("CTFY instance response questions must be a list")
+        if "questions" in result and not isinstance(result["questions"], list):
+            raise CtfyError("CTFY instance response questions must be a list")
         return result
 
     @staticmethod
@@ -241,11 +247,12 @@ def ensure_attachments(task: dict, client: CtfyClient, work_dir: Path) -> None:
                 raise CtfyError(f"CTFY QA attachment is not a local file: {attachment['path']}")
             continue
         name = client._attachment_name(attachment.get("name"))
-        pending.append(name)
-    for name in pending:
+        pending.append((name, attachment))
+    for name, attachment in pending:
         client.download_attachment(
             task["target_instance"], name, work_dir / "attachments" / name,
         )
+        attachment["path"] = str(work_dir / "attachments" / name)
 
 
 def load_task(work_dir: Path) -> dict:
