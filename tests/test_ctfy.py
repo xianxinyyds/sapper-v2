@@ -98,6 +98,7 @@ class LocalPlatform:
 
             do_GET = _handle
             do_POST = _handle
+            do_DELETE = _handle
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -692,6 +693,77 @@ class CtfyClientTests(unittest.TestCase):
                     ctfy.ensure_attachments(task, self.client, work)
             self.assertFalse((Path(tmp) / "escape").exists())
             self.assertEqual(self.platform.seen, [])
+
+
+class CtfyLocalClientTests(unittest.TestCase):
+    def setUp(self):
+        self.platform = LocalPlatform()
+        self.client = ctfy.CtfyClient(self.platform.base_url, "tok-x")
+
+    def tearDown(self):
+        self.platform.close()
+
+    def test_scoped_challenge_and_nested_attachment_urls(self):
+        self.platform.queue(200, challenge_payload())
+        challenge = self.client.get_challenge("challenge-1", competition_id="competition-1")
+        self.assertEqual(challenge["id"], "challenge-1")
+        self.platform.queue(200, b"attachment")
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "attachments" / "tools" / "linux" / "solver #1.bin"
+            self.client.download_challenge_attachment(
+                "challenge-1", "tools/linux/solver #1.bin", destination,
+            )
+            self.assertEqual(destination.read_bytes(), b"attachment")
+        self.assertEqual([call["path"] for call in self.platform.seen], [
+            "/api/v1/challenges/challenge-1?competition_id=competition-1",
+            "/api/v1/challenges/challenge-1/attachments/tools/linux/solver%20%231.bin",
+        ])
+
+    def test_attachment_name_rejects_noncanonical_or_hidden_paths(self):
+        for name in ("a//b", "./a", "a/", "a\\b", ".hidden/file", "a/.hidden", "a/\x00b"):
+            with self.subTest(name=name), self.assertRaises(ctfy.CtfyError):
+                self.client.download_attachment("instance-1", name, Path("unused"))
+        self.assertEqual(self.platform.seen, [])
+
+    def test_instance_start_waits_for_full_state_and_stop_is_idempotent(self):
+        created = []
+        self.platform.queue(202, {"id": "instance-1"})
+        self.platform.queue(200, {"id": "instance-1", "status": "starting"})
+        self.platform.queue(200, {
+            "id": "instance-1", "status": "ready",
+            "start_timeline": [{"phase": "files"}, {"phase": "addresses"}],
+        })
+        self.platform.queue(200, {
+            "id": "instance-1", "status": "ready", "questions": [],
+            "services": [], "attachments": [],
+        })
+        with mock.patch("ctfy.time.sleep") as sleep:
+            result = self.client.start_instance(
+                "challenge-1", "competition-1", ttl=1800,
+                timeout=10, on_created=created.append,
+            )
+        self.assertEqual(result["id"], "instance-1")
+        self.assertEqual(created, ["instance-1"])
+        sleep.assert_called_once_with(2.0)
+        self.platform.queue(404, {"code": "instance_not_found", "message": "gone"})
+        self.client.stop_instance("instance-1")
+        self.assertEqual(self.platform.seen[0]["body"], {
+            "challenge_id": "challenge-1", "competition_id": "competition-1", "ttl": 1800,
+        })
+        self.assertEqual(self.platform.seen[-1]["method"], "DELETE")
+
+    def test_instance_list_accepts_page_envelope(self):
+        self.platform.queue(200, {
+            "items": [{"id": "instance-1", "competition_id": "competition-1"}],
+            "total": 1, "limit": 200, "offset": 0,
+        })
+        self.assertEqual(self.client.list_instances("challenge-1"), [{
+            "id": "instance-1", "competition_id": "competition-1",
+        }])
+        self.assertEqual(
+            self.platform.seen[0]["path"],
+            "/api/v1/instances?limit=200&challenge_id=challenge-1",
+        )
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 | 文件 | 职责 | 常见修改场景 |
 |---|---|---|
 | `lib/ctfy.py` | CTFY HTTP client、task 校验、附件与 `result.json` | 平台协议、GET 重试、结果格式 |
+| `lib/ctfy_local.py` | 初赛本机宿主编排：启动/复用实例、运行镜像、答案移交与清理 | 本地比赛、少量动态验证 |
 | `lib/ctfy_run.py` | 单题生命周期入口 | dry-run、图恢复、auto 调度、退出语义 |
 | `lib/ctfy_engine.py` | 平台模型变量到 CLI 的映射 | Claude Code / 新执行器接入 |
 | `lib/codex_engine.py` | Codex 非交互适配器 | Codex 参数、输出和错误处理 |

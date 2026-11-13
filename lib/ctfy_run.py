@@ -165,7 +165,10 @@ def run(work_dir: Path) -> int:
         return _fail(work_dir, reason, exc)
     try:
         client = ctfy.CtfyClient.from_env()
-        challenge = client.get_challenge(task["challenge"]["id"])
+        competition_id = task.get("competition_id", "") if task["run_mode"] == "qa" else ""
+        challenge = client.get_challenge(
+            task["challenge"]["id"], competition_id=competition_id,
+        )
         progress = challenge
         if task["run_mode"] == "instance":
             progress = client.get_instance(

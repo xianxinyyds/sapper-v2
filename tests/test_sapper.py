@@ -429,8 +429,8 @@ class CtfyAnswerTests(unittest.TestCase):
                     raise response
                 return response
 
-            def get_challenge(self, challenge_id):
-                self.challenge_calls.append(challenge_id)
+            def get_challenge(self, challenge_id, competition_id=""):
+                self.challenge_calls.append((challenge_id, competition_id))
                 return test.challenge
 
             def get_instance(self, instance_id, *, retry=False, require_questions=False):
@@ -651,7 +651,9 @@ class CtfyAnswerTests(unittest.TestCase):
         self.assertEqual(self.client.calls, [])
         fact = next(f for f in self.store.list_facts() if f.get("kind") == "flag")
         self.assertEqual(fact["data"]["status"], "accepted")
-        self.assertEqual(self.client.challenge_calls, ["challenge-1"])
+        self.assertEqual(
+            self.client.challenge_calls, [("challenge-1", "competition-1")],
+        )
 
     def test_qa_state_ignores_instance_shaped_fields(self):
         self._use_qa()
@@ -848,6 +850,21 @@ class CtfyAnswerTests(unittest.TestCase):
         ))
         self.assertEqual(self.store.load_project()["ctfy"]["solved_question_ids"], ["flag"])
         self.assertIsNone(self.store.load_project()["ctfy"].get("blocker"))
+
+    def test_endpoint_access_and_credentials_reach_the_executor_graph(self):
+        self.task["target_endpoints"] = [{
+            "label": "service", "type": "tcp", "url": "target.example:1337",
+            "access": "tls_sni",
+            "credentials": {"username": "player", "password": "target-password"},
+        }]
+        sapper.sync_ctfy_facts(self.store, self.task)
+        endpoint = next(
+            fact for fact in self.store.list_facts()
+            if (fact.get("data") or {}).get("record_type") == "endpoint"
+        )
+        self.assertEqual(endpoint["data"]["access"], "tls_sni")
+        self.assertEqual(endpoint["data"]["auth_username"], "player")
+        self.assertEqual(endpoint["data"]["auth_password"], "target-password")
 
     def test_instance_answer_state_does_not_require_static_full_flag(self):
         self.task = self._write_task(["flag"])

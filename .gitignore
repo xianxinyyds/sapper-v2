@@ -17,6 +17,7 @@ fact-graph.html
 
 # Stray session logs / scratch
 agents/
+/runs/
 *.log
 .DS_Store
 .idea/
