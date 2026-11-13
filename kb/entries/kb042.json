@@ -2,11 +2,14 @@
   "id": "kb042",
   "title": "Pwn 二进制与协议验证工作流",
   "description": "先核对真实附件和协议，再做有界偏移、泄露与 ROP 验证",
-  "detail": "1. 前置检查：题目宣传的 ELF/source/libc 是否真实存在且可读；只有占位 README 时先做本地审计，不连续数小时猜远程布局。\n2. 有附件时：file/readelf/nm/objdump + checksec 看架构、NX/PIE/RELRO/Canary；没有附件时先确认服务协议、banner、命令、分帧和错误行为。\n3. 栈溢出：用唯一模式或已知本地程序确定偏移，再选择 ret2win 或 ret2libc；远程黑盒 variants 建 coverage matrix，同一假设族被否定后停止。\n4. 格式化字符串：先证明 %p 泄露或 %n 写确实生效；不得把字面回显当格式化漏洞。\n5. 堆与保护：按真实 libc 版本判断 tcache/UAF/unsorted bin；Canary/PIE 需要泄露证据，patchelf、one_gadget 不是默认依赖。\n6. ROP：优先 pwntools.ROP、ROPgadget 和 objdump；ropper 不可用时回退而不是安装。\n7. 先在本地已知程序/输入上验证 exploit，再做有界远程请求；每次崩溃、泄露和连接行为立即 checkpoint，禁止无 candidate 的 submission intent。",
+  "detail": "1. 前置检查：题目宣传的 ELF/source/libc 是否真实存在且可读；只有占位 README 时先做本地审计，不连续数小时猜远程布局。\n2. 有附件时：file/readelf/nm/objdump + checksec 看架构、NX/PIE/RELRO/Canary；没有附件时先确认服务协议、banner、命令、分帧和错误行为。strace/ltrace 只跟踪本地样本。\n3. 栈溢出：用唯一模式或已知本地程序确定偏移，再选择 ret2win 或 ret2libc；远程黑盒 variants 建 coverage matrix，同一假设族被否定后停止。\n4. 格式化字符串：先证明 %p 泄露或 %n 写确实生效；不得把字面回显当格式化漏洞。\n5. 堆与保护：按真实 libc 版本判断 tcache/UAF/unsorted bin；Canary/PIE 需要泄露证据。patchelf/one_gadget 只作用于题目实际 libc；pwninit 在可写副本目录运行，且必须同时提供本地 --libc 和 --ld，禁止运行时下载。\n6. ROP 使用 pwntools.ROP、ROPgadget、ropper 或 objdump；seccomp 规则用 seccomp-tools 验证。\n7. 先在本地已知程序/输入上验证 exploit，再做有界远程请求；每次崩溃、泄露和连接行为立即 checkpoint，禁止无 candidate 的 submission intent。",
   "commands": [
     "file pwn1 && checksec --file=pwn1 && readelf -h -S -s pwn1",
     "python3 -I -c \"from pwn import *; print(ROP('pwn1').find_gadget(['ret']))\"",
-    "objdump -d pwn1"
+    "objdump -d pwn1",
+    "patchelf --print-interpreter pwn1",
+    "ropper --file pwn1 --nocolor --search ret",
+    "pwninit --bin pwn1 --libc libc.so.6 --ld ld-linux-x86-64.so.2"
   ],
   "tags": [
     "pwn"

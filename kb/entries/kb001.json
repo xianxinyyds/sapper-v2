@@ -2,10 +2,11 @@
   "id": "kb001",
   "title": "Web 信息收集工作流",
   "description": "打点上手顺序：指纹→目录→泄露→参数",
-  "detail": "按顺序做，每步产出记为 service/loot fact：\n1. 指纹：whatweb / 响应头 / favicon hash（Wappalyzer 规则）\n2. robots.txt / sitemap.xml / .well-known/\n3. 目录：优先 gobuster；dirsearch 仅在 command -v 成功时可选；重点：/admin /login /api /backup /upload\n4. 泄露：.git/ .svn/ .DS_Store .env .bak .swp swagger druid actuator\n5. JS 分析：jsfinder 提取接口与硬编码 key\n6. 参数：OPTIONS、隐藏参数（arjun）\n原则：指纹定版本 → 直接搜对应 CVE（见 CVE 速查条目）；发现泄露直接进 loot。",
+  "detail": "按顺序做，每步产出记为 service/loot fact：\n1. 指纹：whatweb / 响应头 / favicon hash。\n2. robots.txt / sitemap.xml / .well-known/。\n3. 目录：优先 gobuster，也可 dirsearch；重点：/admin /login /api /backup /upload。\n4. 泄露：.git/ .svn/ .DS_Store .env .bak .swp swagger druid actuator；确认 .git 后用 git-dumper。\n5. JS 保存到工作目录后用 grep/Python 提取接口与硬编码 key。\n6. 参数：OPTIONS 或 arjun。nmap 仅做有界 TCP connect 扫描（-sT），不依赖 masscan/SYN/raw socket。\n原则：指纹定版本 → 定向验证对应 CVE；发现泄露直接进 loot。",
   "commands": [
-    "gobuster dir -u http://T -w /usr/share/wordlists/dirb/common.txt -x 404",
-    "curl -s http://T/robots.txt"
+    "gobuster dir -u http://T -w /usr/share/dirb/wordlists/common.txt -b 404",
+    "curl -s http://T/robots.txt",
+    "nmap -sT -Pn --top-ports 100 --max-retries 2 --host-timeout 60s T"
   ],
   "tags": [
     "web",

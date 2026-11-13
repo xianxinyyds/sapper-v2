@@ -1,0 +1,21 @@
+{
+  "id": "kb059",
+  "title": "Misc PCAP 流量分析工作流",
+  "description": "用 capinfos、tshark 和 ngrep 对离线流量摘要有界分析，再跟踪会话或提取数据",
+  "detail": "1. 先用 file/capinfos 确认格式、包数、时长和链路类型，再用 tshark -n -q 的协议层级与会话统计确定方向；-n 避免名称解析，原始 PCAP 保持不变。\n2. 先按 HTTP/DNS/FTP/SMTP 等实际协议过滤，记录帧号、地址、端口和流编号，再对选定的 TCP 流做 follow；不要无差别展开所有包或所有流。\n3. HTTP 关注请求、响应和 file_data，DNS 关注查询名与异常编码，FTP/SMTP 关注明文凭据、命令和附件。需要导出 HTTP 对象时使用 --export-objects 指向工作目录下的新目录，并检查文件数量与总大小。TLS 没有任务提供的密钥时不能假定可解密。\n4. USB 先确认链路类型、设备、端点和方向，再提取 usb.capdata、usbhid.data 或 usb.data_fragment；键盘/鼠标恢复必须依据实际 HID 报告格式。蓝牙 ATT 查看 btatt.value，Modbus 结合功能码和方向分析 modbus.data；保留原始十六进制并小步验证解码。\n5. ngrep -I 可对离线 PCAP 做快速内容定位，但不能替代协议字段和流上下文。editcap/mergecap/reordercap 只用于有界裁剪、合并或重排副本，输出留在工作目录。\n6. 只分析任务附件或明确授权的捕获文件，不在比赛容器里主动抓取其他流量，不联网下载解析器。每个过滤、导出和解码步骤都应有明确输入、上限和可复现输出。",
+  "commands": [
+    "capinfos capture.pcap && tshark -n -r capture.pcap -q -z io,phs -z conv,tcp",
+    "tshark -n -r capture.pcap -Y 'http.request || dns || ftp' -T fields -e frame.number -e ip.src -e ip.dst -e _ws.col.protocol -e _ws.col.info",
+    "tshark -n -r capture.pcap -q -z follow,tcp,ascii,0",
+    "mkdir -p extracted/http && tshark -n -r capture.pcap --export-objects http,extracted/http",
+    "tshark -n -r capture.pcap -Y 'usb.capdata || usbhid.data || btatt.value || modbus.data' -T fields -e frame.number -e usb.capdata -e usbhid.data -e btatt.value -e modbus.data",
+    "ngrep -I capture.pcap -q 'pattern'"
+  ],
+  "tags": [
+    "misc",
+    "pcap",
+    "traffic"
+  ],
+  "source": "本机 TShark 离线解析核验与 CTF Misc 工作流",
+  "created_at": "2026-11-12T15:27:48Z"
+}

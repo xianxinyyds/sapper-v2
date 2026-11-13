@@ -2,9 +2,10 @@
   "id": "kb009",
   "title": "JWT 攻击",
   "description": "none/弱密钥/kid 三板斧",
-  "detail": "1. alg=none：去签名段（老库中招）\n2. 弱密钥：先用 pyjwt 解码并验证声明；字典爆破仅在 hashcat/jwt_tool 和目标字典均存在且有新证据时限次执行（secret/key/123456/uuid）\n3. kid 注入：kid 指向文件或 SQL 注入路径\n4. 算法混淆 RS256→HS256 用公钥当 HMAC 密钥\n改 payload：role admin / user id 1。jwt.io 手改，注意 base64url。hashcat、jwt_tool 和 rockyou 不是默认可用依赖，先 command -v 和检查路径。",
+  "detail": "1. alg=none：去签名段（老库中招）。\n2. 弱密钥：先用 pyjwt 解码并验证声明；jwt_tool 只在有目标字典和新证据时限次尝试，rockyou 路径见 kb034。\n3. kid 注入：kid 指向文件或 SQL 注入路径。\n4. 算法混淆 RS256→HS256 用公钥当 HMAC 密钥。\n改 payload：role admin / user id 1，注意 base64url；不联网下载规则或字典。当前 jwt_tool 2.3.0 即使成功解析也可能返回 1，需以解码输出为准。",
   "commands": [
-    "python3 -I -c \"import base64,json,sys; p=sys.argv[1].split('.')[1]; print(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))))\" '<jwt>'"
+    "python3 -I -c \"import base64,json,sys; p=sys.argv[1].split('.')[1]; print(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))))\" '<jwt>'",
+    "jwt_tool '<jwt>'"
   ],
   "tags": [
     "web",

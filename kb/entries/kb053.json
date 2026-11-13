@@ -1,10 +1,10 @@
 {
   "id": "kb053",
   "title": "nuclei 高效打法",
-  "description": "模板存在时的限速扫描与无模板降级",
-  "detail": "先 nuclei -version 并检查 nuclei-templates 目录；镜像只保证二进制，不保证模板。1 有模板时定向 -tags，避免无目标全扫。2 需要扫描时限速 -rl 20 + 排除 dos/fuzz 类。3 无模板不联网升级，改用 curl/Python 对已知 CVE 做单个证据验证。4 命中立刻 sapper fact 记录 -k vuln -d cve=xxx。靶机崩=零分，宁可慢。",
+  "description": "无内置模板时的离线降级与有限模板扫描",
+  "detail": "镜像只内置 nuclei 引擎，不内置完整 nuclei-templates，不联网更新。只有任务提供模板或已有本地模板时才用 -t/-templates 定向扫描，并加 -duc 禁止更新检查、-rl 20 限速且排除 dos/fuzz。没有模板就用 curl/Python 对已知 CVE 做单个证据验证；扫描告警必须复核后才记 vuln fact。",
   "commands": [
-    "nuclei -version",
+    "nuclei -version -duc",
     "find \"$HOME\" -maxdepth 2 -type d -name nuclei-templates"
   ],
   "tags": [

@@ -18,12 +18,18 @@ and `sapper doc <id>` to reuse prior evidence rather than duplicating work.
 # Category routing
 Use the platform category first, then question/attachment/endpoint evidence; choose
 one primary label and run `sapper kb search "<category keywords>"` for unfamiliar work.
-- Crypto: identify the construction before math; validate recovery on a known local oracle.
-- Reverse: start with file/strings/readelf/nm/objdump, then gdb only when needed.
-- Misc: inspect signatures, metadata and nested files with bounded extraction.
+- Crypto: identify the construction before math; validate recovery on a known local
+  oracle and use fpylll/RsaCtfTool only for selected offline attacks.
+- Reverse: start with file/strings/readelf/nm/objdump; use upx/radare2/strace/ltrace/gdb
+  as evidence requires.
+- Misc: inspect signatures, metadata and nested files with bounded extraction. For
+  PCAP, start with capinfos/tshark summaries before bounded stream/object analysis;
+  use pngcheck/zsteg/stegseek, ffprobe/ffmpeg/sox, or PDF/QR tools as indicated.
 - Web: map authorized routes and state before bounded injection/auth/logic probes.
-- Pwn: verify real artifacts and checksec/protocol behavior before offsets or ROP.
-- AI security: inspect model inputs, artifacts, MCP/tool boundaries and data flows safely.
+- Pwn: verify real artifacts and checksec/protocol behavior before offsets or ROP;
+  use patchelf/pwntools/ROPgadget for local validation.
+- AI security: inspect model inputs, artifacts, MCP/tool boundaries and data flows safely;
+  use safetensors/onnx for metadata without heavyweight runtimes.
 
 Create a submission intent only when a supported candidate and reproducible evidence
 already exist; otherwise schedule analysis. Every intent must name its required

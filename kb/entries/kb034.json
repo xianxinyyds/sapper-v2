@@ -1,10 +1,11 @@
 {
   "id": "kb034",
   "title": "字典与 wordlist 位置",
-  "description": "常用字典路径与生成",
-  "detail": "kali 自带：/usr/share/wordlists/（rockyou.txt.gz 解压、dirb/common.txt、dirbuster/、wfuzz/）\n目录扫描：common.txt 起步 → directory-list-2.3-medium；中文项目加 admin/login/api/guangdong 后缀思维\n参数 fuzz：burp 参数名字典、arjun 自带\n用户名：目标域相关信息生成（姓名拼音规则：zhangsan/zs/zhang.san）+ 常见 admin/test/root/guest\n密码变形：公司缩写+年份（corp2026）、admin@123、P@ssw0rd\n生成：cewl 从页面抓关键词做密码表；hashcat --stdout 规则变异\n字典放仓库 dicts/ 自带的几个轻量版（比赛环境离线时兜底）。 NOTE(2026-11-11): the image removes IOCs, Misc, Username_Lists and Discovery/DNS from seclists, not the entire Passwords tree. Surviving wordlists live under /usr/share/wordlists/ and dirb common.txt; ls the exact path before relying on it. If no suitable password list exists, hand-craft a bounded targeted one from target-page keywords (company/site names + years).",
+  "description": "镜像内实际字典路径与有界使用",
+  "detail": "1. Web 目录：先用 /usr/share/dirb/wordlists/common.txt 或 /usr/share/seclists/Discovery/Web-Content/common.txt；需要扩展时检查 raft-medium-directories.txt 等现有文件，不假定旧 directory-list 路径存在。\n2. 密码：rockyou 位于 /usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt.tar.gz。先查看归档，再只解压到工作目录，限制展开大小和尝试次数。\n3. 用户名和变形：根据目标页面、公司/项目名、姓名拼音和年份生成小型目标字典；arjun 可使用其自带参数字典。\n4. 不联网下载字典，不把完整大字典当作默认第一步；没有新证据时停止同类爆破。",
   "commands": [
-    "gzip -d /usr/share/wordlists/rockyou.txt.gz"
+    "ls -l /usr/share/dirb/wordlists/common.txt /usr/share/seclists/Discovery/Web-Content/common.txt",
+    "tar -tzf /usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt.tar.gz"
   ],
   "tags": [
     "recon",

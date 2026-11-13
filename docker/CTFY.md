@@ -129,7 +129,17 @@ records `gating_pending`. Other transport kinds are `platform_unreachable` and
 recorded or accepted answers.
 
 The CTFY planner supports concise routing for Crypto, Reverse, Misc, Web, Pwn and
-AI security, with platform category preferred over task/attachment inference.
+AI security, with platform category preferred over task/attachment inference. Misc
+includes offline PCAP analysis with capinfos/tshark/ngrep, image steganography with
+pngcheck/zsteg/stegseek, audio/video processing with ffprobe/ffmpeg/sox, PDF/QR
+extraction, 7zip archives, bounded fcrackzip/john attempts, and local GnuPG inputs.
+The image deliberately excludes Sleuth Kit and hashcat. Web/Pwn/Reverse also include
+non-privileged nmap connect scans, working Impacket examples, strace/ltrace, patchelf,
+gcc/make, gdbserver, ropper, UPX, radare2 and YARA. Crypto adds fpylll, ecdsa,
+xortool and explicitly selected offline RsaCtfTool attacks; AI attachments can use
+numpy, safetensors and ONNX metadata inspection without model runtimes. Full nuclei
+templates, Sage, Ghidra, browsers, Android/multi-arch suites and heavyweight ML
+runtimes are not bundled.
 
 ## Result and exit semantics
 

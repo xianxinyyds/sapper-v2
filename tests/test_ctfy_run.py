@@ -903,16 +903,118 @@ class CtfyContainerContractTests(unittest.TestCase):
         dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("@openai/codex@0.167.0", dockerfile)
 
-    def test_ropper_python314_incompatibility_cannot_block_image_build(self):
+    def test_lightweight_category_tools_are_declared(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        apt_install = dockerfile.split(
+            "apt-get install -y --no-install-recommends \\\n", 1,
+        )[1].split("&& setcap", 1)[0]
+        for package in (
+            "ruby-dev", "openssh-client", "sshpass", "feroxbuster", "dirsearch", "arjun", "cewl",
+            "strace", "ltrace", "patchelf", "gcc", "make", "libc6-dev", "gdbserver", "ropper",
+            "upx-ucl", "radare2", "yara", "python3-fpylll", "python3-ecdsa",
+            "hashid", "hash-identifier", "python3-numpy", "python3-onnx",
+            "python3-safetensors",
+        ):
+            with self.subTest(package=package):
+                self.assertIn(package, apt_install)
+        for requirement in (
+            '"xortool==1.1.0"', '"git-dumper==1.0.9"',
+            "one_gadget --version 2.1.1", "seccomp-tools --version 1.7.1",
+        ):
+            self.assertIn(requirement, dockerfile)
+        for source in (
+            "COPY docker/pwninit /usr/local/bin/pwninit",
+            "COPY docker/RsaCtfTool.tar.gz /tmp/RsaCtfTool.tar.gz",
+            "COPY docker/jwt_tool.tar.gz /tmp/jwt_tool.tar.gz",
+        ):
+            self.assertIn(source, dockerfile)
+        for artifact in ("pwninit", "RsaCtfTool.tar.gz", "jwt_tool.tar.gz"):
+            self.assertTrue((ROOT / "docker" / artifact).is_file(), artifact)
+        for package in (
+            "sagemath", "ghidra", "chromium", "apktool", "jadx", "qemu-user",
+            "gdb-multiarch", "onnxruntime", "torch", "transformers", "sleuthkit", "hashcat",
+        ):
+            self.assertNotIn(package, dockerfile)
+        self.assertNotIn("pip3 install --no-cache-dir --break-system-packages ropper", dockerfile)
+
+    def test_binwalk_capstone_stays_on_compatible_major(self):
         dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
         extras = dockerfile.split("# --- python extras", 1)[1]
         mandatory = extras.split("\n#", 1)[0]
-        self.assertNotIn("ropper", mandatory)
+        self.assertIn('"capstone>=5.0.1,<6"', mandatory)
+
+    def test_rsa_source_install_excludes_development_symlink(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("--exclude='*/.venv'", dockerfile)
         self.assertIn(
-            "RUN pip3 install --no-cache-dir --break-system-packages ropper \\\n"
-            "        || echo \"WARN: ropper unavailable",
+            "pip3 install --no-cache-dir --break-system-packages /tmp/RsaCtfTool \\",
             dockerfile,
         )
+        self.assertNotIn(
+            "pip3 install --no-cache-dir --break-system-packages /tmp/RsaCtfTool.tar.gz",
+            dockerfile,
+        )
+
+    def test_jwt_tool_python314_config_and_command_are_fixed(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("delimiters=(", dockerfile)
+        self.assertIn("runuser -u agent -- jwt_tool config-init", dockerfile)
+        self.assertIn("test -s /home/agent/.jwt_tool/jwtconf.ini", dockerfile)
+        kb009 = json.loads(
+            (ROOT / "kb" / "entries" / "kb009.json").read_text(encoding="utf-8")
+        )
+        commands = "\n".join(kb009.get("commands") or [])
+        self.assertIn("jwt_tool '<jwt>'", commands)
+        self.assertNotIn("jwt_tool -C -d '<jwt>'", commands)
+
+    def test_runtime_compatibility_repairs_are_declared(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        extras = dockerfile.split("# --- python extras", 1)[1]
+        mandatory = extras.split("\n#", 1)[0]
+        self.assertIn('"setuptools<81"', mandatory)
+        self.assertIn("setcap -r /usr/lib/nmap/nmap", dockerfile)
+        self.assertIn("! -name python3-impacket", dockerfile)
+        self.assertNotIn("&& rm -rf /usr/share/doc \\", dockerfile)
+
+    def test_wordlist_paths_match_the_image(self):
+        kb001 = json.loads(
+            (ROOT / "kb" / "entries" / "kb001.json").read_text(encoding="utf-8")
+        )
+        kb034 = json.loads(
+            (ROOT / "kb" / "entries" / "kb034.json").read_text(encoding="utf-8")
+        )
+        web_commands = "\n".join(kb001.get("commands") or [])
+        wordlist_text = kb034.get("detail", "") + "\n" + "\n".join(kb034.get("commands") or [])
+        self.assertIn("/usr/share/dirb/wordlists/common.txt", web_commands)
+        self.assertIn("gobuster dir -u http://T -w", web_commands)
+        self.assertIn("-b 404", web_commands)
+        self.assertNotIn("/usr/share/wordlists/dirb", web_commands + wordlist_text)
+        self.assertIn("rockyou.txt.tar.gz", wordlist_text)
+        self.assertNotIn("rockyou.txt.gz", wordlist_text)
+
+    def test_misc_tools_are_declared_without_excluded_tools(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        apt_install = dockerfile.split(
+            "apt-get install -y --no-install-recommends \\\n", 1,
+        )[1].split("&& rm -rf /var/lib/apt/lists/*", 1)[0]
+        for package in (
+            "tshark", "ruby", "stegseek", "pngcheck", "ffmpeg", "sox",
+            "poppler-utils", "zbar-tools", "7zip", "fcrackzip", "john",
+            "ngrep", "gnupg",
+        ):
+            with self.subTest(package=package):
+                self.assertIn(package, apt_install)
+        for package in ("sleuthkit", "hashcat"):
+            self.assertNotIn(package, dockerfile)
+        self.assertIn(
+            "gem install --no-document zsteg --version 0.2.14", dockerfile,
+        )
+        kb040 = json.loads(
+            (ROOT / "kb" / "entries" / "kb040.json").read_text(encoding="utf-8")
+        )
+        commands = "\n".join(kb040.get("commands") or [])
+        self.assertIn("7z l archive.bin", commands)
+        self.assertNotIn("7zz", commands)
 
 
 class CtfyKbContractTests(unittest.TestCase):
@@ -926,12 +1028,47 @@ class CtfyKbContractTests(unittest.TestCase):
             "kb058", {entry["id"] for entry in base.search("AI security", tag="ai", limit=20)}
         )
 
-    def test_category_commands_do_not_assume_missing_tools(self):
-        forbidden = (
-            "ghidra", "angr", "radare", "rsactftool", "sage", "zsteg",
-            "volatility", "hashcat", "one_gadget", "patchelf", "ropper",
+    def test_misc_pcap_entry_is_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        self.assertIn(
+            "kb059", {
+                entry["id"]
+                for entry in base.search("pcap tshark", tag="misc", limit=20)
+            },
         )
-        for entry_id in ("kb040", "kb041", "kb042", "kb057", "kb058"):
+        data = json.loads(
+            (ROOT / "kb" / "entries" / "kb059.json").read_text(encoding="utf-8")
+        )
+        commands = "\n".join(data.get("commands") or [])
+        self.assertIn("capinfos", commands)
+        self.assertIn("tshark", commands)
+
+    def test_excluded_tools_are_not_recommended(self):
+        for path in (ROOT / "kb" / "entries").glob("kb*.json"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            text = data.get("detail", "") + "\n" + "\n".join(data.get("commands") or [])
+            for tool in ("hashcat", "sleuthkit", "sleuth kit"):
+                with self.subTest(entry=path.name, tool=tool):
+                    self.assertNotIn(tool, text.lower())
+
+    def test_lightweight_tools_are_discoverable_in_existing_entries(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        for query, expected in (
+            ("rsa fpylll", "kb041"),
+            ("pwn patchelf", "kb042"),
+            ("reverse radare2", "kb057"),
+            ("safetensors onnx", "kb058"),
+        ):
+            with self.subTest(query=query):
+                self.assertIn(
+                    expected, {entry["id"] for entry in base.search(query, limit=20)}
+                )
+
+    def test_category_commands_do_not_assume_missing_tools(self):
+        forbidden = ("ghidra", "angr", "sage", "volatility", "hashcat")
+        for entry_id in ("kb040", "kb041", "kb042", "kb057", "kb058", "kb059"):
             with self.subTest(entry_id=entry_id):
                 data = json.loads(
                     (ROOT / "kb" / "entries" / f"{entry_id}.json").read_text(encoding="utf-8")
@@ -991,6 +1128,11 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
             self.assertIn(label, combined)
         self.assertIn("platform category", combined)
         self.assertIn("command -v", combined)
+        for tool in (
+            "capinfos", "tshark", "zsteg", "ffprobe", "radare2",
+            "patchelf", "fpylll", "safetensors",
+        ):
+            self.assertIn(tool, combined)
 
     def test_prompt_distinguishes_qa_verdict_from_instance_post(self):
         reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")

@@ -1,11 +1,16 @@
 {
   "id": "kb040",
   "title": "Misc 隐写与杂项速查",
-  "description": "用现有 file/xxd/binwalk/steghide/exiftool 做有界文件分析",
-  "detail": "1. file + xxd 头部：改后缀不改真身；png/jpg/zip/rar 头修复。\n2. strings 配合偏移和原始字节复核，不把唯一字符串直接当成完整证据。\n3. binwalk 只做有界嵌入/嵌套识别；压缩包先声明层数、总展开大小和单文件上限，防止 zip bomb。\n4. 图片和文档：优先 exiftool 查注释/GPS，steghide 检查可支持格式；zsteg、stegsolve 只在 command -v 成功时可选。\n5. 压缩包：伪加密先检查标志位；hashcat/john/bkcrack 不是默认依赖，爆破必须有新证据、目标字典和次数上限。\n6. 音频/流量/内存：现有工具能解析才继续；volatility3、Wireshark 等未安装时记录缺失依赖，不联网安装。\n7. 编码链：base 家族/rot/异或按特征用 Python 小步验证，保留输入输出对应关系。",
+  "description": "用文件、隐写、音视频和文档 CLI 做有界分析；PCAP 流量分析见 kb059",
+  "detail": "1. file + xxd 头部：改后缀不改真身；png/jpg/zip/rar 头修复。\n2. strings 配合偏移和原始字节复核，不把唯一字符串直接当成完整证据。\n3. binwalk 只做有界嵌入/嵌套识别；压缩包先声明层数、总展开大小和单文件上限，防止 zip bomb。\n4. 图片和文档：exiftool 查注释/GPS，steghide 检查支持的格式；pngcheck 验证 PNG 结构，zsteg 检查 PNG/BMP 位平面，stegseek 用于 steghide 种子/口令分析。PDF 用 pdfinfo/pdftotext/pdfimages，二维码用 zbarimg。\n5. 压缩包与加密附件：7z/unzip/zipdetails 先检查结构和伪加密标志位；fcrackzip/john 只在新证据、目标字典、次数和时限均明确时使用。gpg 只使用任务提供的密钥或口令，不联网取钥。\n6. 音视频：ffprobe/ffmpeg 查格式、流和声道，必要时转成 WAV；sox 检查统计信息或生成频谱图，输出放在工作目录并限制时长与尺寸。PCAP 流量分析见 kb059；不要在运行时安装工具。\n7. 编码链：base 家族/rot/异或按特征用 Python 小步验证，保留输入输出对应关系。",
   "commands": [
     "file sample && xxd -l 128 sample && strings -a -t x sample",
-    "binwalk sample && exiftool sample"
+    "binwalk sample && exiftool sample",
+    "pngcheck image.png && zsteg image.png",
+    "ffprobe media.bin && sox audio.wav -n stat",
+    "pdfinfo document.pdf && pdftotext document.pdf -",
+    "zbarimg --quiet --raw qrcode.png",
+    "7z l archive.bin"
   ],
   "tags": [
     "misc"
