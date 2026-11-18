@@ -1,0 +1,23 @@
+{
+  "id": "kb068",
+  "title": "Reverse static offsets xrefs 静态证据与校验定位",
+  "description": "Reverse static-analysis、ELF、offsets、xrefs、objdump、radare2 的 VA 与文件偏移证据链",
+  "detail": "1. 前置与预算：清点附件、SHA256、权限、格式、可见源码，并用 command -v 核对工具；先静态后动态。最低成本证据先固定 file/hash、输入分支线索和节区，再进入反汇编。每个假设声明有限本地轮次/时间与 wall-clock（如两轮静态复核、10 分钟），重试需要新证据；远程仅针对当前任务授权 endpoint，每个 intent 默认最多 20 次远程请求、并发 1、5 分钟。\n2. 最低成本证据链：依次保存 file → strings -a -t x → readelf -h/-S/-s/-r → nm -an → objdump -d 的原始输出；需要 xrefs 时再用 radare2。每条关键常量、指令和分支同时记录 VA、文件偏移、所属节区及 VA↔offset 映射依据，strings 的显示偏移不能未经验证当作 VA，二者不得混淆。\n3. 校验定位：从输入读取、比较指令、编码常量和成功/失败分支建立函数边界、调用图与交叉引用；用精确反汇编确认比较宽度、条件和数据流。函数边界证据、字符串猜测与未证实假设必须分栏记录，flag 形状字符串不是答案。\n4. 对照与负结果：保存正常/异常输入对应的预期静态分支、相关 bytes、反汇编和偏移对照，记录无法解释的引用与未覆盖区域。stripped 符号缺失、间接跳转目标未解析或函数未覆盖时明确标未知，负结果写明已查节区、符号、重定位、xrefs 和剩余假设，不宣称已完整覆盖。\n5. 关闭与 closed-vector：前提证伪、达到本地/远程预算，或两轮静态复核无新证据即关闭该假设；关闭前保存最小证据索引和未知项，不直接转入无界动态单步，也不重复已经证伪的字符串或偏移猜测。",
+  "commands": [
+    "file attachments/rev1 && sha256sum attachments/rev1 && strings -a -t x attachments/rev1",
+    "readelf -h -S -s -r -l attachments/rev1 && nm -an attachments/rev1",
+    "objdump -d -M intel attachments/rev1",
+    "r2 -q -e scr.color=false -c 'aaa; afl; axt @ TARGET_VA; pdf @ TARGET_VA' attachments/rev1"
+  ],
+  "tags": [
+    "reverse",
+    "static-analysis",
+    "elf",
+    "offsets",
+    "xrefs",
+    "objdump",
+    "radare2"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-reverse-kb-expansion-design.md",
+  "created_at": "2026-11-18T13:19:49Z"
+}

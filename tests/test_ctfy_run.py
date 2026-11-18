@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import io
 import json
 import sys
@@ -1277,7 +1278,8 @@ class CtfyContainerContractTests(unittest.TestCase):
         )[1].split("&& setcap", 1)[0]
         for package in (
             "ruby-dev", "openssh-client", "sshpass", "feroxbuster", "dirsearch", "arjun", "cewl",
-            "strace", "ltrace", "patchelf", "gcc", "make", "libc6-dev", "gdbserver", "ropper",
+            "gdb", "checksec", "strace", "ltrace", "patchelf", "gcc", "make", "libc6-dev",
+            "gdbserver", "ropper",
             "upx-ucl", "radare2", "yara", "python3-fpylll", "python3-ecdsa",
             "hashid", "hash-identifier", "python3-numpy", "python3-onnx",
             "python3-safetensors",
@@ -1285,7 +1287,7 @@ class CtfyContainerContractTests(unittest.TestCase):
             with self.subTest(package=package):
                 self.assertIn(package, apt_install)
         for requirement in (
-            '"xortool==1.1.0"', '"git-dumper==1.0.9"',
+            '"xortool==1.1.0"', '"git-dumper==1.0.9"', "pwntools", "ROPgadget",
             "one_gadget --version 2.1.1", "seccomp-tools --version 1.7.1",
         ):
             self.assertIn(requirement, dockerfile)
@@ -1384,6 +1386,281 @@ class CtfyContainerContractTests(unittest.TestCase):
         self.assertNotIn("7zz", commands)
 
 
+class CtfyCryptoSmokeContractTests(unittest.TestCase):
+    def test_crypto_smoke_interface_and_exit_contract(self):
+        import crypto_smoke
+
+        for interface in ("check_public_key", "check_modes_protocol", "check_prng"):
+            with self.subTest(interface=interface):
+                function = getattr(crypto_smoke, interface, None)
+                self.assertTrue(callable(function))
+                self.assertEqual(list(inspect.signature(function).parameters), ["root"])
+        self.assertEqual(list(inspect.signature(crypto_smoke.main).parameters), [])
+        self.assertEqual(
+            list(inspect.signature(crypto_smoke.result_exit_code).parameters),
+            ["failures", "skips"],
+        )
+        for failures, skips, expected in (
+            (0, 0, 0), (0, 1, 2), (1, 0, 1), (1, 1, 1),
+        ):
+            with self.subTest(failures=failures, skips=skips):
+                self.assertEqual(crypto_smoke.result_exit_code(failures, skips), expected)
+
+    def test_crypto_smoke_main_requires_three_pass_groups(self):
+        import crypto_smoke
+
+        checks = ("check_public_key", "check_modes_protocol", "check_prng")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            with mock.patch.object(crypto_smoke, "os") as mocked_os:
+                mocked_os.geteuid.return_value = 1000
+                with mock.patch.object(crypto_smoke, "resource"), \
+                        mock.patch.multiple(crypto_smoke, **{
+                            name: mock.DEFAULT for name in checks
+                        }):
+                    self.assertEqual(crypto_smoke.main(), 0)
+        output = stdout.getvalue()
+        for group in ("public-key", "modes-protocol", "prng"):
+            self.assertIn(f"PASS {group}", output)
+        self.assertNotIn("FAIL", output)
+        self.assertNotIn("SKIP", output)
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(crypto_smoke, "os") as mocked_os, \
+                mock.patch.object(crypto_smoke, "resource"), \
+                mock.patch.object(crypto_smoke, "check_public_key", side_effect=AssertionError), \
+                mock.patch.object(crypto_smoke, "check_modes_protocol"), \
+                mock.patch.object(crypto_smoke, "check_prng"):
+            mocked_os.geteuid.return_value = 1000
+            self.assertEqual(crypto_smoke.main(), 1)
+
+    def test_crypto_ec_order_rejects_known_curve_multiples(self):
+        import crypto_smoke
+
+        curve = type("KnownCurve", (), {"order": 11})()
+        crypto_smoke._require_known_curve_order(curve, 11)
+        with self.assertRaisesRegex(ValueError, "declared order"):
+            crypto_smoke._require_known_curve_order(curve, 22)
+
+    def test_crypto_cbc_recovery_closes_on_ambiguous_first_byte(self):
+        import crypto_smoke
+
+        queries = []
+        checkpoints = []
+
+        def ambiguous_padding(probe):
+            queries.append(probe)
+            return probe[15] in (0x17, 0x42)
+
+        with self.assertRaisesRegex(ValueError, "not unique"):
+            crypto_smoke._recover_cbc_padding_block(
+                ambiguous_padding, bytes(16), bytes(16), checkpoints.append,
+            )
+        self.assertEqual(len(queries), 256)
+        self.assertEqual(checkpoints, [])
+
+    def test_crypto_time_pid_requires_held_out_prediction(self):
+        import crypto_smoke
+
+        with tempfile.TemporaryDirectory() as tmp:
+            crypto_smoke.check_prng(Path(tmp))
+            evidence = json.loads(
+                (Path(tmp) / "prng-evidence.json").read_text(encoding="utf-8")
+            )
+        time_pid = evidence["time_pid"]
+        self.assertEqual(time_pid.get("held_out_expected_hex"), "0x3e551772")
+        self.assertEqual(time_pid.get("held_out_predicted_hex"), "0x3e551772")
+        self.assertIs(time_pid.get("selection_observations_replayed"), True)
+        self.assertIs(time_pid.get("prediction_verified"), True)
+        self.assertEqual(time_pid["tested_candidates"], 9)
+        self.assertEqual(time_pid["no_hit_candidates_tested"], 9)
+
+    def test_crypto_oracle_gates_fail_closed(self):
+        import crypto_smoke
+
+        stable_calls = []
+
+        def stable_ecb(probe):
+            stable_calls.append(probe)
+            return b"deterministic-ciphertext"
+
+        self.assertTrue(crypto_smoke._require_deterministic_ecb(stable_ecb, b"probe"))
+        self.assertEqual(stable_calls, [b"probe", b"probe"])
+
+        changing_calls = []
+
+        def changing_ecb(probe):
+            changing_calls.append(probe)
+            return bytes((len(changing_calls),))
+
+        with self.assertRaisesRegex(ValueError, "non-deterministic ECB"):
+            crypto_smoke._require_deterministic_ecb(changing_ecb, b"probe")
+        self.assertEqual(changing_calls, [b"probe", b"probe"])
+
+        padding_calls = []
+
+        def padding_query(label, result):
+            def query():
+                padding_calls.append(label)
+                return result
+            return query
+
+        self.assertTrue(crypto_smoke._require_padding_distinguishable(
+            padding_query("valid", True), padding_query("invalid", False),
+        ))
+        self.assertEqual(padding_calls, ["valid", "invalid"])
+        padding_calls.clear()
+        with self.assertRaisesRegex(ValueError, "not distinguishable"):
+            crypto_smoke._require_padding_distinguishable(
+                padding_query("valid", False), padding_query("invalid", False),
+            )
+        self.assertEqual(padding_calls, ["valid", "invalid"])
+
+    def test_crypto_smoke_documentation_contract(self):
+        documentation = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        section = documentation.split("## Offline Crypto tooling", 1)[1].split(
+            "## Result and exit semantics", 1,
+        )[0]
+        self.assertIn("Offline Crypto", documentation)
+        for required in (
+            "tests/crypto_smoke.py", "--network none", "--user agent",
+            "pycryptodome", "ecdsa", "fpylll", "sympy", "RsaCtfTool", "xortool", "OpenSSL",
+            "RsaCtfTool --attack wiener", "独立验证", "限制", "oracle", "预算",
+            "4097 recovery-counter", "4098", "2 + 4096B", "bounded `D`",
+            "real Crypto challenge A/B", "other platforms", "solve rates",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, section)
+        for forbidden in ("--attack all", "factordb", "sendtofdb"):
+            with self.subTest(forbidden=forbidden):
+                self.assertIn(f"禁止 `{forbidden}`", section)
+        execution_example = section.split("```bash\n", 1)[1].split("```", 1)[0]
+        for required in (
+            "docker run --rm --network none --user agent", "--entrypoint python3",
+            '"$PWD/tests:/tests:ro"', "-w /tmp", "/tests/crypto_smoke.py",
+        ):
+            with self.subTest(execution=required):
+                self.assertIn(required, execution_example)
+
+    def test_crypto_tool_declaration_contract(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        for requirement in ("pycryptodome", "sympy", '"xortool==1.1.0"'):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, dockerfile)
+        for package in ("openssl", "python3-fpylll", "python3-ecdsa"):
+            with self.subTest(package=package):
+                self.assertIn(package, dockerfile)
+        for declaration in (
+            "COPY docker/RsaCtfTool.tar.gz /tmp/RsaCtfTool.tar.gz",
+            "RsaCtfTool --help",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertIn(declaration, dockerfile)
+
+
+class CtfyPwnSmokeContractTests(unittest.TestCase):
+    def test_pwn_smoke_version_and_exit_contract(self):
+        import pwn_smoke
+
+        self.assertTrue(
+            hasattr(pwn_smoke, "supports_safelinking"),
+            "pwn_smoke.supports_safelinking is missing",
+        )
+        self.assertTrue(
+            hasattr(pwn_smoke, "result_exit_code"),
+            "pwn_smoke.result_exit_code is missing",
+        )
+        for version, expected in (((2, 31), False), ((2, 32), True), ((2, 43), True)):
+            with self.subTest(version=version):
+                self.assertEqual(pwn_smoke.supports_safelinking(version), expected)
+        for failures, skips, expected in (
+            (0, 0, 0), (0, 1, 2), (1, 0, 1), (1, 1, 1),
+        ):
+            with self.subTest(failures=failures, skips=skips):
+                self.assertEqual(pwn_smoke.result_exit_code(failures, skips), expected)
+
+    def test_pwn_smoke_documentation_contract(self):
+        documentation = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        for required in (
+            "Offline Pwn", "tests/pwn_smoke.py", "--network none", "--user agent",
+            "env -i", "socketcall", "同 UID", "not a strong sandbox",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, documentation)
+
+        pwn_section = documentation.split("## Offline Pwn tooling", 1)[1].split(
+            "## Result and exit semantics", 1,
+        )[0]
+        execution_example = pwn_section.split("```bash\n", 1)[1].split("```", 1)[0]
+        for required in (
+            "env -i PATH=", "< work/input.txt", "./work/pwn1_patched", "timeout ",
+            "strace -f", "--inject=socket:error=EPERM",
+            "--inject=socketcall:error=EPERM", "prlimit", "--cpu=", "--as=", "--fsize=",
+        ):
+            with self.subTest(execution_control=required):
+                self.assertIn(required, execution_example)
+
+
+class CtfyReverseSmokeContractTests(unittest.TestCase):
+    def test_reverse_smoke_interface_and_exit_contract(self):
+        import reverse_smoke
+
+        for interface in (
+            "build_fixtures", "check_static", "check_dynamic", "check_pack_vm", "main",
+        ):
+            with self.subTest(interface=interface):
+                self.assertTrue(callable(getattr(reverse_smoke, interface, None)))
+        for failures, skips, expected in (
+            (0, 0, 0), (0, 1, 2), (1, 0, 1), (1, 1, 1),
+        ):
+            with self.subTest(failures=failures, skips=skips):
+                self.assertEqual(reverse_smoke.result_exit_code(failures, skips), expected)
+
+    def test_reverse_smoke_documentation_contract(self):
+        documentation = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        section = documentation.split("## Offline Reverse tooling", 1)[1].split(
+            "## Result and exit semantics", 1,
+        )[0]
+        self.assertIn("Offline Reverse", documentation)
+        for required in (
+            "tests/reverse_smoke.py", "--network none", "--user agent",
+            "strace -f", "--inject=socket:error=EPERM",
+            "--inject=socketcall:error=EPERM", "ptrace conflict", "live GDB", "ltrace",
+            "externally verified", "credential-free", "disposable", "UPX", "copies",
+            "original hash", "real Reverse challenge A/B", "other platforms", "solve rates",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, section)
+        execution_example = section.split("```bash\n", 1)[1].split("```", 1)[0]
+        for required in (
+            "env -i PATH=", "timeout ", "prlimit", "--cpu=", "--as=", "--fsize=",
+            "strace -f", "--inject=socket:error=EPERM",
+            "--inject=socketcall:error=EPERM", "./work/rev1", "< work/input.txt",
+        ):
+            with self.subTest(execution_control=required):
+                self.assertIn(required, execution_example)
+
+    def test_reverse_tool_declaration_contract(self):
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        apt_install = dockerfile.split(
+            "apt-get install -y --no-install-recommends \\\n", 1,
+        )[1].split("&& setcap", 1)[0]
+        for package in ("file", "gcc", "radare2", "upx-ucl", "yara", "gdb", "strace", "ltrace"):
+            with self.subTest(package=package):
+                self.assertIn(package, apt_install)
+        documentation = (ROOT / "docker" / "CTFY.md").read_text(encoding="utf-8")
+        section = documentation.split("## Offline Reverse tooling", 1)[1].split(
+            "## Result and exit semantics", 1,
+        )[0]
+        for path in (
+            "/usr/bin/file", "/usr/bin/sha256sum", "/usr/bin/strings", "/usr/bin/readelf",
+            "/usr/bin/nm", "/usr/bin/objdump", "/usr/bin/r2", "/usr/bin/upx",
+            "/usr/bin/yara", "/usr/bin/gdb", "/usr/bin/strace", "/usr/bin/ltrace",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, section)
+
+
 class CtfyKbContractTests(unittest.TestCase):
     def test_web_workflow_entries_are_searchable(self):
         module = ctfy_run.sapper._load_kb_module()
@@ -1469,6 +1746,355 @@ class CtfyKbContractTests(unittest.TestCase):
         for required in ("完整项目", "源码片段", "最小 PoC", "不得直接启动完整项目"):
             with self.subTest(required=required):
                 self.assertIn(required, entries["kb063"]["detail"])
+
+    def test_crypto_workflow_entries_are_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        cases = (
+            ("rsa wiener coppersmith", "kb071",
+             {"crypto", "rsa", "ecc", "lattice", "wiener", "coppersmith", "nonce", "fpylll"}),
+            ("cbc padding oracle ghash", "kb072",
+             {"crypto", "ecb", "cbc", "padding-oracle", "ctr", "ghash", "dh", "protocol"}),
+            ("mt19937 lcg xorshift", "kb073",
+             {"crypto", "prng", "mt19937", "lcg", "xorshift", "seed", "untemper"}),
+            ("timestamp", "kb073",
+             {"crypto", "prng", "mt19937", "lcg", "xorshift", "seed", "untemper"}),
+        )
+        for query, expected, expected_tags in cases:
+            with self.subTest(query=query):
+                results = base.search(query, tag="crypto", limit=3)
+                self.assertTrue(results, f"no crypto KB results for {query}")
+                if not results:
+                    continue
+                self.assertEqual(results[0]["id"], expected)
+                self.assertEqual(set(results[0]["tags"]), expected_tags)
+
+    def test_crypto_kb_enforces_oracles_budgets_and_negative_controls(self):
+        module = ctfy_run.sapper._load_kb_module()
+        required_text = {
+            "kb071": (
+                "Boneh-Durfee", "Coppersmith", "部分私钥泄露", "广播",
+                "invalid-curve", "small-subgroup", "nonce 复用", "独立验证",
+                "N = 2 + 1 = 3", "N = e + 1",
+            ),
+            "kb072": (
+                "ECB", "CBC bit-flip", "padding oracle", "CTR", "CFB/OFB",
+                "GHASH", "DH", "KDF", "协议状态机", "唯一候选", "hex/raw bytes",
+                "N = 257L", "N = 2 + 4096B", "4097 + 1 = 4098", "有界 D 项",
+            ),
+            "kb073": (
+                "624", "32-bit", "untemper", "部分输出", "LCG", "xorshift",
+                "时间/PID 窗口", "/dev/urandom", "禁止预测",
+                "N = 624 + 1 = 625", "60 × 1024 = 61440",
+            ),
+        }
+        for entry_id, required in required_text.items():
+            with self.subTest(entry_id=entry_id):
+                path = ROOT / "kb" / "entries" / f"{entry_id}.json"
+                if not path.is_file():
+                    self.fail(f"missing {path.name}")
+                data = json.loads(path.read_text(encoding="utf-8"))
+                detail = data.get("detail", "")
+                for token in (
+                    "前置", "本地已知答案 oracle", "对照", "负结果", "关闭", "观测数",
+                    "侦查 20 请求", "并发 1", "5 分钟", "恢复请求公式", "预算不足",
+                    *required,
+                ):
+                    with self.subTest(required=token):
+                        self.assertIn(token, detail)
+                commands = "\n".join(data.get("commands") or []).lower()
+                for forbidden in (
+                    "attack all", "factordb", "sendtofdb", "apt ", "pip ",
+                    "curl ", "wget ", "npm install", "git clone",
+                ):
+                    with self.subTest(forbidden=forbidden):
+                        self.assertNotIn(forbidden, commands)
+                datetime.strptime(data["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+                self.assertEqual(
+                    data.get("source"),
+                    "docs/superpowers/specs/2026-11-18-crypto-kb-expansion-design.md",
+                )
+                for tag in data["tags"]:
+                    with self.subTest(tag=tag):
+                        self.assertRegex(tag, module.VALID_TAGS_RE)
+
+        kb041 = json.loads(
+            (ROOT / "kb" / "entries" / "kb041.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(kb041["created_at"], "2026-10-15T14:14:39Z")
+        for entry_id in required_text:
+            with self.subTest(route=entry_id):
+                self.assertIn(entry_id, kb041["detail"])
+        kb041_commands = "\n".join(kb041.get("commands") or []).lower()
+        for forbidden in (
+            "attack all", "factordb", "sendtofdb", "apt ", "pip ",
+            "curl ", "wget ", "npm install", "git clone",
+        ):
+            with self.subTest(kb041_forbidden=forbidden):
+                self.assertNotIn(forbidden, kb041_commands)
+
+    def test_pwn_workflow_entries_are_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        cases = (
+            ("pwn local remote patchelf", "kb065",
+             {"pwn", "local-remote", "pwntools", "patchelf", "libc", "protocol"}),
+            ("stack ret2libc format string", "kb066",
+             {"pwn", "stack", "ret2libc", "rop", "stack-pivot", "srop", "format-string", "fsop"}),
+            ("heap tcache SafeLinking", "kb067",
+             {"pwn", "heap", "glibc", "tcache", "uaf", "double-free", "safelinking", "pointer-mangling"}),
+        )
+        for query, expected, expected_tags in cases:
+            with self.subTest(query=query):
+                results = base.search(query, tag="pwn", limit=3)
+                self.assertEqual(results[0]["id"], expected)
+                self.assertEqual(set(results[0]["tags"]), expected_tags)
+
+    def test_pwn_kb_enforces_bounded_evidence_and_versions(self):
+        module = ctfy_run.sapper._load_kb_module()
+        required_text = {
+            "kb065": (
+                "SHA256", "loader", "timeout", "reconnect", "env -i",
+                "socketcall", "同 UID",
+            ),
+            "kb066": ("ret2plt", "ret2libc", "SROP", "FSOP", "Canary"),
+            "kb067": ("2.31", "2.35+", "SafeLinking", "pointer guard", "double-free"),
+        }
+        for entry_id, required in required_text.items():
+            with self.subTest(entry_id=entry_id):
+                path = ROOT / "kb" / "entries" / f"{entry_id}.json"
+                self.assertTrue(path.is_file(), f"missing {path.name}")
+                data = json.loads(path.read_text(encoding="utf-8"))
+                detail = data.get("detail", "")
+                for token in (
+                    "前置", "预算", "对照", "负结果", "关闭", "20", "并发 1", "5 分钟",
+                    *required,
+                ):
+                    with self.subTest(required=token):
+                        self.assertIn(token, detail)
+                commands = "\n".join(data.get("commands") or []).lower()
+                for forbidden in ("apt ", "pip ", "curl ", "wget ", "angr", "ghidra", "sage"):
+                    with self.subTest(forbidden=forbidden):
+                        self.assertNotIn(forbidden, commands)
+                datetime.strptime(data["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+                self.assertTrue((data.get("source") or "").strip())
+                for tag in data["tags"]:
+                    with self.subTest(tag=tag):
+                        self.assertRegex(tag, module.VALID_TAGS_RE)
+
+        kb065_commands = json.loads(
+            (ROOT / "kb" / "entries" / "kb065.json").read_text(encoding="utf-8")
+        )["commands"]
+        patch_index = next(
+            index for index, command in enumerate(kb065_commands) if "pwninit " in command
+        )
+        run_index = next(
+            index for index, command in enumerate(kb065_commands) if "env -i" in command
+        )
+        self.assertLess(patch_index, run_index)
+        for token in (
+            "./work/pwn1_patched", "< work/input.txt", "env -i PATH=", "timeout 10s",
+            "prlimit", "--cpu=", "--as=", "--fsize=", "strace -f", "-o work/pwn1.strace",
+            "--inject=socket:error=EPERM", "--inject=socketcall:error=EPERM",
+        ):
+            with self.subTest(controlled_run=token):
+                self.assertIn(token, kb065_commands[run_index])
+        with self.subTest(controlled_run="staged-input"):
+            self.assertTrue(any(
+                "cp " in command and "input.txt" in command and "work/" in command
+                for command in kb065_commands[:patch_index]
+            ))
+        verification_commands = kb065_commands[patch_index:run_index]
+        for operation in ("patchelf --print-interpreter", "patchelf --print-rpath", "readelf -d"):
+            with self.subTest(patched_verification=operation):
+                self.assertTrue(any(
+                    operation in command and "work/pwn1_patched" in command
+                    for command in verification_commands
+                ))
+
+        kb042 = json.loads(
+            (ROOT / "kb" / "entries" / "kb042.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(kb042["created_at"], "2026-10-15T14:14:39Z")
+        for entry_id in required_text:
+            with self.subTest(route=entry_id):
+                self.assertIn(entry_id, kb042["detail"])
+
+    def test_pwn_kb066_dynamic_execution_uses_staged_controlled_copy(self):
+        commands = json.loads(
+            (ROOT / "kb" / "entries" / "kb066.json").read_text(encoding="utf-8")
+        )["commands"]
+        dynamic_commands = [
+            command for command in commands
+            if "pwn1" in command and (
+                "./pwn1" in command or "./work/pwn1" in command
+                or ("gdb " in command and "run" in command)
+            )
+        ]
+        self.assertTrue(dynamic_commands, "KB066 has no dynamic pwn1 command")
+        for command in dynamic_commands:
+            for required in (
+                "mkdir -p work", "cp ", "input.txt", "work/", "pwninit ",
+                "./work/pwn1_patched", "< work/input.txt", "env -i PATH=", "timeout ",
+                "prlimit", "--cpu=", "--as=", "--fsize=", "strace -f",
+                "--inject=socket:error=EPERM", "--inject=socketcall:error=EPERM",
+            ):
+                with self.subTest(dynamic_control=required):
+                    self.assertIn(required, command)
+            self.assertNotRegex(command, r"\./(?:work/)?pwn1(?:\s|$)")
+
+    def test_pwn_kb067_identifies_supplied_libc_from_its_own_metadata(self):
+        commands = json.loads(
+            (ROOT / "kb" / "entries" / "kb067.json").read_text(encoding="utf-8")
+        )["commands"]
+        libc_command = next(
+            (
+                command for command in commands
+                if "sha256sum" in command and "libc.so.6" in command and "readelf" in command
+            ),
+            "",
+        )
+        for required in (
+            "strings -a attachments/libc.so.6", "GNU C Library", "stable release version",
+            "sha256sum attachments/libc.so.6", "readelf -n -s attachments/libc.so.6",
+        ):
+            with self.subTest(libc_identification=required):
+                self.assertIn(required, libc_command)
+        self.assertNotIn("ldd --version", "\n".join(commands))
+
+    def test_reverse_workflow_entries_are_searchable(self):
+        module = ctfy_run.sapper._load_kb_module()
+        base = module.KnowledgeBase(module.KnowledgeBase.default_root())
+        cases = (
+            ("reverse static offsets xrefs", "kb068",
+             {"reverse", "static-analysis", "elf", "offsets", "xrefs", "objdump", "radare2"}),
+            ("dynamic strace ltrace validation", "kb069",
+             {"reverse", "dynamic-analysis", "gdb", "strace", "ltrace", "anti-debug", "validation"}),
+            ("custom VM opcode dispatcher", "kb070",
+             {"reverse", "packing", "upx", "obfuscation", "custom-vm", "opcode", "dispatcher"}),
+        )
+        for query, expected, expected_tags in cases:
+            with self.subTest(query=query):
+                results = base.search(query, tag="reverse", limit=3)
+                self.assertTrue(results, f"no reverse KB results for {query}")
+                self.assertEqual(results[0]["id"], expected)
+                self.assertEqual(set(results[0]["tags"]), expected_tags)
+
+        flattening_results = base.search("reverse flattening", tag="reverse", limit=3)
+        self.assertTrue(flattening_results, "no reverse KB results for reverse flattening")
+        self.assertEqual(flattening_results[0]["id"], "kb070")
+
+    def test_reverse_kb_enforces_evidence_budget_and_execution_boundaries(self):
+        module = ctfy_run.sapper._load_kb_module()
+        required_text = {
+            "kb068": (
+                "strings -a -t x", "readelf", "nm", "objdump", "radare2",
+                "VA", "文件偏移", "stripped", "间接跳转",
+            ),
+            "kb069": (
+                "env -i", "prlimit", "timeout", "strace -f", "ptrace",
+                "外部已验证", "--network none", "无凭证", "一次性容器", "blocker",
+            ),
+            "kb070": (
+                "upx -d -o", "原 hash", "opcode", "dispatcher", "独立解释器",
+                "未知 opcode", "z3", "sympy", "可用性检查",
+            ),
+        }
+        entries = {}
+        for entry_id, required in required_text.items():
+            with self.subTest(entry_id=entry_id):
+                path = ROOT / "kb" / "entries" / f"{entry_id}.json"
+                self.assertTrue(path.is_file(), f"missing {path.name}")
+                data = json.loads(path.read_text(encoding="utf-8"))
+                entries[entry_id] = data
+                detail = data.get("detail", "")
+                for token in (
+                    "前置", "最低成本证据", "对照", "负结果", "关闭", "有限本地轮次/时间",
+                    "20 次远程请求", "并发 1", "5 分钟", *required,
+                ):
+                    with self.subTest(required=token):
+                        self.assertIn(token, detail)
+                commands = "\n".join(data.get("commands") or []).lower()
+                for forbidden in ("apt ", "pip ", "curl ", "wget ", "angr", "ghidra", "sage"):
+                    with self.subTest(forbidden=forbidden):
+                        self.assertNotIn(forbidden, commands)
+                datetime.strptime(data["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+                self.assertEqual(
+                    data.get("source"),
+                    "docs/superpowers/specs/2026-11-18-reverse-kb-expansion-design.md",
+                )
+                for tag in data["tags"]:
+                    with self.subTest(tag=tag):
+                        self.assertRegex(tag, module.VALID_TAGS_RE)
+
+        if len(entries) != len(required_text):
+            return
+
+        dynamic_commands = [
+            command for command in entries["kb069"].get("commands") or []
+            if "./work/rev1" in command
+        ]
+        self.assertTrue(dynamic_commands, "KB069 has no controlled real-ELF command")
+        for command in dynamic_commands:
+            for required in (
+                "mkdir -p work", "cp ", "work/input.txt", "< work/input.txt",
+                "env -i PATH=", "timeout ", "prlimit", "--cpu=", "--as=", "--fsize=",
+                "strace -f", "--inject=socket:error=EPERM",
+                "--inject=socketcall:error=EPERM",
+            ):
+                with self.subTest(dynamic_control=required):
+                    self.assertIn(required, command)
+        for tool in ("gdb ", "ltrace "):
+            tracer_commands = [
+                command for command in entries["kb069"].get("commands") or []
+                if tool in command
+            ]
+            self.assertTrue(tracer_commands, f"KB069 has no {tool.strip()} fixture example")
+            for command in tracer_commands:
+                with self.subTest(tracer_command=command):
+                    self.assertIn("./work/self_fixture", command)
+                    self.assertNotIn("./work/rev1", command)
+                    self.assertNotIn("strace -f", command)
+
+        kb070_commands = "\n".join(entries["kb070"].get("commands") or [])
+        for required in ("command -v upx", "import z3", "import sympy"):
+            with self.subTest(availability_check=required):
+                self.assertIn(required, kb070_commands)
+
+        kb057 = json.loads(
+            (ROOT / "kb" / "entries" / "kb057.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(kb057["created_at"], "2026-11-11T00:00:00Z")
+        for entry_id in required_text:
+            with self.subTest(route=entry_id):
+                self.assertIn(entry_id, kb057["detail"])
+
+        kb057_item4 = kb057["detail"].split("4.", 1)[1].split("\n5.", 1)[0]
+        for required in (
+            "kb069", "工作目录副本", "非 root", "env -i", "prlimit",
+            "CPU/地址空间/文件大小", "timeout", "strace -f", "socket/socketcall",
+            "EPERM", "不得裸跑",
+        ):
+            with self.subTest(kb057_item4_control=required):
+                self.assertIn(required, kb057_item4)
+
+        kb057_dynamic_commands = [
+            command for command in kb057.get("commands") or []
+            if any(tool in command for tool in ("strace", "ltrace", "gdb"))
+        ]
+        self.assertTrue(kb057_dynamic_commands, "KB057 has no dynamic tracer command")
+        for command in kb057_dynamic_commands:
+            with self.subTest(kb057_dynamic_command=command):
+                self.assertNotIn("./binary", command)
+            for required in (
+                "mkdir -p work", "cp attachments/rev1 work/rev1",
+                "cp attachments/input.txt work/input.txt", "./work/rev1",
+                "< work/input.txt", "env -i PATH=", "timeout ", "prlimit",
+                "--cpu=", "--as=", "--fsize=", "strace -f",
+                "--inject=socket:error=EPERM", "--inject=socketcall:error=EPERM",
+            ):
+                with self.subTest(kb057_dynamic_control=required):
+                    self.assertIn(required, command)
 
     def test_reverse_and_ai_security_entries_are_searchable(self):
         module = ctfy_run.sapper._load_kb_module()
@@ -1587,6 +2213,73 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         ):
             self.assertIn(tool, combined)
 
+    def test_crypto_prompt_routes_construction_oracles_and_budgets(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        for delimiter in ("- Crypto:", "- Reverse:"):
+            self.assertIn(delimiter, reason)
+        for delimiter in ("For Crypto,", "For Web,"):
+            self.assertIn(delimiter, explore)
+        reason_crypto = reason.split("- Crypto:", 1)[1].split("- Reverse:", 1)[0]
+        explore_crypto = explore.split("For Crypto,", 1)[1].split("For Web,", 1)[0]
+
+        for required in (
+            "sapper kb search", "public-key", "kb071", "modes/protocol", "kb072",
+            "PRNG", "kb073", "本地已知答案 oracle", "请求公式：总请求数 =",
+            "观测请求数（含正常/异常对照）", "独立验证请求数", "消歧请求数 D",
+            "20 次远程请求", "并发 1", "5 分钟", "预算不足即关闭", "closed-vector",
+        ):
+            with self.subTest(reason_required=required):
+                self.assertIn(required, reason_crypto)
+        for required in (
+            "原始 bytes", "候选唯一", "独立恢复/预测验证", "逐字节 checkpoint",
+            "禁止 `attack all`/factordb/sendtofdb", "禁止 `/dev/urandom` 预测",
+            "负结果", "已覆盖", "20 次远程请求", "并发 1", "5 分钟",
+            "预算不足即关闭", "closed-vector",
+        ):
+            with self.subTest(explore_required=required):
+                self.assertIn(required, explore_crypto)
+
+    def test_reverse_prompt_routes_static_dynamic_and_vm(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        reason_reverse = reason.partition("- Reverse:")[2].partition("- Misc:")[0]
+        explore_reverse = explore.partition("For Reverse,")[2].partition(
+            "\nUse the shared graph",
+        )[0]
+        self.assertIn("For Reverse,", explore)
+        self.assertIn("\nUse the shared graph", explore)
+        self.assertNotIn("Use the shared graph", explore_reverse)
+        for required in (
+            "sapper kb search", "kb068", "kb069", "kb070",
+            "无静态目标", "不得全程序单步", "20 次远程请求", "并发 1", "5 分钟",
+            "closed-vector",
+        ):
+            with self.subTest(reason_required=required):
+                self.assertIn(required, reason_reverse)
+        for required in (
+            "真实文件偏移", "反汇编", "trace", "opcode", "独立解释器",
+            "真实题目 ELF", "独立可写副本", "非 root", "env -i", "资源/时间限制",
+            "strace -f", "--inject=socket:error=EPERM",
+            "--inject=socketcall:error=EPERM", "ltrace", "gdb", "自写可信样本",
+            "外部已验证", "--network none", "无凭证", "一次性容器",
+            "strings", "YARA", "单次动态异常", "都不是答案",
+            "无法满足", "blocker", "停止动态执行",
+        ):
+            with self.subTest(explore_required=required):
+                self.assertIn(required, explore_reverse)
+
+        external_tracer_clause = explore_reverse.partition("`ltrace`/`gdb`")[2].partition(
+            "详细 payload",
+        )[0]
+        self.assertTrue(external_tracer_clause)
+        for required in (
+            "非 root", "资源/时间限制", "--network none", "无凭证", "一次性容器",
+            "blocker", "停止动态执行",
+        ):
+            with self.subTest(external_tracer_required=required):
+                self.assertIn(required, external_tracer_clause)
+
     def test_web_prompt_routes_source_and_blackbox_without_project_execution(self):
         reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
         explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
@@ -1605,6 +2298,34 @@ class CtfyPromptIntegrationTests(unittest.TestCase):
         for required in ("保存审计清单", "会话/原始响应脚本", "不得只写抽象原则"):
             with self.subTest(explore_required=required):
                 self.assertIn(required, explore)
+
+    def test_pwn_prompt_routes_local_remote_stack_and_heap(self):
+        reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")
+        explore = (ROOT / "templates" / "ctfy" / "explore.md").read_text(encoding="utf-8")
+        reason_pwn = reason.split("- Pwn:", 1)[1].split("- AI security:", 1)[0]
+        explore_pwn = explore.split("For Pwn,", 1)[1].split("For Reverse,", 1)[0]
+        for required in (
+            "kb065", "kb066", "kb067", "本地已知答案",
+            "20 次远程连接", "并发 1", "5 分钟",
+        ):
+            with self.subTest(reason_required=required):
+                self.assertIn(required, reason_pwn)
+        for required in ("真实题目 ELF", "env -i", "socketcall", "同 UID", "远程重连计入预算"):
+            with self.subTest(explore_required=required):
+                self.assertIn(required, explore_pwn)
+        self.assertIn("sapper kb search", reason_pwn)
+        for section_name, section in (("reason", reason_pwn), ("explore", explore_pwn)):
+            with self.subTest(closed_vector_section=section_name):
+                self.assertIn("closed-vector", section)
+        self.assertIn("若上述任一条件无法满足，记录 blocker 并停止动态执行。", explore_pwn)
+
+        combined = reason + "\n" + explore
+        for required in (
+            "sapper kb search", "closed-vector",
+            "有源码：先审计，再定向在线验证", "无源码：先建立基线和会话",
+        ):
+            with self.subTest(combined_required=required):
+                self.assertIn(required, combined)
 
     def test_prompt_distinguishes_qa_verdict_from_instance_post(self):
         reason = (ROOT / "templates" / "ctfy" / "reason.md").read_text(encoding="utf-8")

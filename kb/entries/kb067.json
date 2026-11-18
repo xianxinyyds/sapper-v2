@@ -1,0 +1,24 @@
+{
+  "id": "kb067",
+  "title": "Pwn heap glibc 现代堆利用与版本分流",
+  "description": "Pwn heap、glibc、tcache、fastbin、unsorted bin、UAF、double-free、safe-unlink、SafeLinking、pointer mangling",
+  "detail": "1. 前置与最小模型：固定真实 libc 版本/hash，记录 chunk size、对齐、分配/释放顺序、UAF/double-free 的可读可写能力和 bin 状态；先用最小本地程序复现分配、释放和 crash，不用 House-of-* 名称代替原语证明。最低成本证据是 libc 版本与 hash、一次正常分配/释放及单一原语的堆状态对照，缺失版本或原语时标为未知。\n2. 版本闸门：tcache/fastbin/unsorted bin 的选择必须结合实际 glibc。2.31 与 2.35+ 只是分流检查点而非通用兼容承诺，分别核对 tcache key、double-free 检测、对齐、SafeLinking 和 pointer guard；具体行为由对应 libc 源码/符号和本地 PoC 复核，不仅按发行版名称推断，也不声称未实测版本已经验证。\n3. SafeLinking 与 mangling：只有版本和堆地址证据满足时才计算 PROTECT_PTR/REVEAL_PTR 关系；记录 storage position、next pointer、heap key 和解码对照，不把指向 heap 的泄露直接当作已绕过，也不跨版本复用编码常数。\n4. 利用路径与控制：tcache poisoning、fastbin/unsorted-bin、UAF、double-free 和 safe-unlink 只从已证明的分配原语出发；每次写后检查对齐、链表完整性和分配返回地址，hook/FSOP 等后续目标另做版本与写原语闸门。保存正常分配、单一原语和完整链三组对照结果（含正常控制组），逐组比较而非直接叠加完整 exploit。\n5. 预算、负结果与关闭：远程仅针对当前任务授权 endpoint，每个 intent 默认最多 20 次远程连接、并发 1、5 分钟 wall-clock，重连计入预算。负结果记录版本、chunk/bin、输入序列、断言/abort 文本、尝试预算及 closed-vector；版本未知、原语未证实、关键完整性检查未绕过、达到预算或连续两组对照无新增证据即停止并关闭该链，同一已证伪利用族不得无新证据重试。本条目不声称所有路径均在当前镜像完成过利用验证。",
+  "commands": [
+    "strings -a attachments/libc.so.6 | grep -E 'GNU C Library|stable release version' && sha256sum attachments/libc.so.6 && readelf -n -s attachments/libc.so.6",
+    "gdb -q -batch -ex 'set pagination off' -ex 'run < heap-input.txt' -ex 'bt' -ex 'info registers' ./heap-poc",
+    "python3 -I heap_probe.py",
+    "python3 -I exploit.py"
+  ],
+  "tags": [
+    "pwn",
+    "heap",
+    "glibc",
+    "tcache",
+    "uaf",
+    "double-free",
+    "safelinking",
+    "pointer-mangling"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-pwn-kb-expansion-design.md",
+  "created_at": "2026-11-18T09:25:43Z"
+}

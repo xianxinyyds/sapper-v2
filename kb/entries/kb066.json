@@ -1,0 +1,26 @@
+{
+  "id": "kb066",
+  "title": "Pwn stack format string 栈利用与格式化字符串",
+  "description": "Pwn stack、ret2plt/ret2libc、ROP、stack pivot、SROP、format string、FSOP 原语分流",
+  "detail": "1. 共同前置与预算：先由本地崩溃和反汇编确认返回地址偏移、栈对齐、可用泄露和可写区域；PIE/ASLR、Canary、seccomp 都需要独立证据，保护名称不直接等于不可解。最低成本证据是唯一模式的最小崩溃输入、对应反汇编和普通输入控制组，先复核这些再构造链。远程仅针对当前任务授权 endpoint，每个 intent 默认最多 20 次远程连接、并发 1、5 分钟 wall-clock，重连计入预算。\n2. 栈路径：只按已证明条件选择 ret2win、ret2plt/GOT、ret2libc、stack pivot 或 SROP。用 ROPgadget、ropper、pwntools ROP 与 objdump 交叉核对 gadget，每条链保存寄存器约束、栈布局和本地已知答案输出；普通短输入与已知答案成功输入作为对照，崩溃本身不是控制流已证明。\n3. 格式化字符串：先区分字面回显与真实格式解释，再用唯一 marker 定位参数偏移，分别证明地址泄露和写原语。使用 pwntools 生成写 payload 前核对架构、offset、目标地址和写宽度，保留普通字符串控制组及最小 marker 对照；%p 输出单独不代表利用完成。\n4. 目标选择：GOT overwrite 需要可写 GOT 与合适 RELRO 条件；FSOP 需要真实 libc、足够读写原语、vtable 校验和 pointer guard 分析。条件不足即关闭对应路径，不降级为盲写，也不把本地泄露直接外推到远程。\n5. 负结果与关闭：记录已测偏移、gadget、泄露格式、写目标、保护前提、实际预算和 closed-vector；前提证伪、达到预算或连续两组对照无新增证据即关闭，同一假设族无新证据不得重试。保存 payload、原始输出和本地/远程对照，区分原语未成立、链未成立与传输失败。",
+  "commands": [
+    "mkdir -p work && cp pwn1 libc.so.6 ld-linux-x86-64.so.2 input.txt work/ && pwninit --bin work/pwn1 --libc work/libc.so.6 --ld work/ld-linux-x86-64.so.2 && patchelf --print-interpreter work/pwn1_patched && env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 timeout 20s prlimit --cpu=20:20 --as=268435456:268435456 --fsize=1048576:1048576 strace -f -qq -o work/pwn1.crash.strace -e trace=socket,socketcall --inject=socket:error=EPERM --inject=socketcall:error=EPERM ./work/pwn1_patched < work/input.txt",
+    "ROPgadget --binary pwn1 --only 'pop|ret'",
+    "ropper --file pwn1 --nocolor --search 'pop rdi; ret'",
+    "python3 -I -c \"from pwn import *; e=ELF('pwn1', checksec=False); print(ROP(e).find_gadget(['ret']))\"",
+    "objdump -d -M intel pwn1",
+    "python3 -I fmt_probe.py"
+  ],
+  "tags": [
+    "pwn",
+    "stack",
+    "ret2libc",
+    "rop",
+    "stack-pivot",
+    "srop",
+    "format-string",
+    "fsop"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-pwn-kb-expansion-design.md",
+  "created_at": "2026-11-18T09:25:43Z"
+}

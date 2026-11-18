@@ -1,0 +1,25 @@
+{
+  "id": "kb071",
+  "title": "RSA ECC lattice Wiener Coppersmith nonce fpylll 公钥与格攻击",
+  "description": "RSA、ECC、Boneh-Durfee、部分私钥泄露、广播、invalid-curve、small-subgroup 的可证前置与独立验证",
+  "detail": "1. 前置、本地已知答案 oracle 与预算：识别 n/e/dp/dq、密文、签名、曲线、阶、生成元、编码和字节序，记录观测数；先用本地小参数已知密钥/签名构建本地已知答案 oracle，保存正常/异常对照和独立加解密、签名验证。远程仅访问当前任务授权 endpoint，每 intent 侦查 20 请求上限、并发 1、5 分钟；恢复请求公式与 wall-clock 必须先计算，服务预算不足即关闭。\n2. RSA 分流：e=1 或 m^e<n 才做直接开方；广播要求同一消息、e 个两两互素的不同模数及对应密文，CRT 后开 e 次根。共模要求同 n、同消息且 gcd(e1,e2)=1；近素数只在已证有界差时做 Fermat，共享因子用 gcd。Wiener 先核对 d < n^0.25/3 等连分数前置；Boneh-Durfee 仅在经典 d < n^0.292 渐近界和具体实现参数均有依据时使用，Coppersmith 必须先证明指数、多项式、根界和格规模，部分私钥泄露须明确已知 p/d 的位位置或 dp/dq 关系，不能混套攻击。\n3. 恢复请求公式与观测数：附件齐全时本地数学恢复的远程请求 N=0；若须由授权服务取得已证明同 key/nonce 的两条 ECDSA 签名并远程验证，观测数为 2，恢复请求公式 N = 2 + 1 = 3。广播观测数为 e，若须远程取密文并验证则 N = e + 1，e=3 时 N = 4；实际数值、逐观测上限和 wall-clock 超出事先声明的服务预算即关闭，不中途扩大。\n4. ECC：nonce 复用恢复须先证明同曲线、同密钥、同 nonce 和可逆分母，再由两条签名求 k/d，并用公钥与两条签名做独立验证，不能只凭 r 相同或工具输出接受私钥。先检查异常曲线、阶、生成元和点验证，再考虑 invalid-curve、small-subgroup 或有界离散日志；点/参数检查生效、子群规模无界或候选不唯一即关闭。\n5. 工具闸门、负结果与关闭：sympy/gmpy2 用于基础数论，ecdsa 只用于已知曲线，fpylll/z3 只用于构造和规模已证明的小模型；RsaCtfTool 仅运行一个明确选择的本地 attack，禁止默认 attack all、在线 factordb/sendtofdb 和运行时安装。保存参数、观测数、候选、工具原文、本地已知答案对照与独立验证；候选不唯一、模型前置不满足、独立验证失败、出现重复异常或预算不足即关闭并保留负结果。",
+  "commands": [
+    "python3 -I -c \"import sympy, gmpy2; print(sympy.factorint(10403)); print(gmpy2.is_prime(101))\"",
+    "python3 -I -c \"from fpylll import IntegerMatrix, LLL; A=IntegerMatrix.from_matrix([[1,1],[1,2]]); LLL.reduction(A); print(A)\"",
+    "python3 -I -c \"from ecdsa import SigningKey, SECP256k1; sk=SigningKey.generate(curve=SECP256k1); msg=b'known-answer'; print(sk.verifying_key.verify(sk.sign(msg), msg))\"",
+    "RsaCtfTool --publickey key.pub --private --attack wiener",
+    "python3 -I work/public_key_oracle.py --self-test --record work/public-key-oracle.json"
+  ],
+  "tags": [
+    "crypto",
+    "rsa",
+    "ecc",
+    "lattice",
+    "wiener",
+    "coppersmith",
+    "nonce",
+    "fpylll"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-crypto-kb-expansion-design.md",
+  "created_at": "2026-11-18T15:36:17Z"
+}

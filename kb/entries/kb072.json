@@ -1,0 +1,25 @@
+{
+  "id": "kb072",
+  "title": "ECB CBC padding oracle CTR GHASH DH protocol 模式与协议状态机",
+  "description": "CBC bit-flip、padding-oracle、CFB/OFB、KDF、唯一候选、hex/raw bytes 与有界请求恢复",
+  "detail": "1. 前置、本地已知答案 oracle 与预算：先证明模式、IV/nonce、block size、prefix/suffix、padding、编码与错误信道，记录观测数，保存 hex/raw bytes 对照及原始字节长度；以本地已知密钥/明文构建本地已知答案 oracle 和正常/异常对照。远程仅访问当前任务授权 endpoint，每 intent 侦查 20 请求上限、并发 1、5 分钟；恢复请求公式必须含逐字节/逐块上限和 wall-clock，服务预算不足即关闭。\n2. ECB secret-suffix：先确认同一 key/prefix 下的确定性、块大小和 prefix/suffix 长度，再逐字节恢复；每轮必须唯一候选并 checkpoint，全部命中、重复异常、连续异常字节或不可区分错误均是实现/前提问题，立即停止并保留负结果。已知长度 L 后每字节需 1 次基线和至多 256 次候选，恢复请求公式 N = 257L，L=16 时 N = 4112；先与剩余服务预算比较，不足即关闭，不把恢复硬塞进侦查额度。\n3. CBC：CBC bit-flip 只针对已知明文字节和已证目标状态做受控修改并独立验证，与 padding oracle 分开。padding oracle 必须证明 decrypt/unpad 接口和可区分的 unpad/padding 错误；B 个 16 字节块、每字节至多 256 请求，恢复计数为 1 + 4096B（含 1 次有效 padding 基线），另有 1 次独立 invalid-padding 观测；总请求公式 N = 2 + 4096B，B=1 时恢复计数 4097，加 1 次 invalid 观测为 4097 + 1 = 4098。该公式以每字节唯一候选且歧义立即关闭为前提；未来如增加消歧，必须单独声明有界 D 项并使用 N = 2 + 4096B + D，本条目不执行消歧。统一错误、超时不定、全部/零候选或服务预算不足即关闭，每恢复字节保留 checkpoint 和负结果。\n4. CTR、CFB/OFB 与 GHASH：先证明 keystream/nonce 复用和状态边界，再做密文 XOR 或状态恢复，nonce 未复用即关闭。GHASH 滥用须分别证明机密性与完整性前提、nonce 复用、认证密钥/多项式恢复条件和有限候选，并用独立 tag 往返验证；nonce 复用的密文 XOR 泄露不能直接宣称认证绕过。\n5. DH、KDF 与协议状态机：检查 p/q/g、子群、点/参数验证、KDF 输入与编码、会话状态、跨协议角色和重放；small-subgroup/离散日志只在已知有界阶内求解，非法参数检查已生效即关闭。每个恢复密钥必须唯一候选并独立完成加解密、MAC 或 KDF 往返，不能将理论可解当作预算内可解。\n6. 负结果与关闭：保存原始 bytes、模式证据、观测数、恢复请求公式、已用请求、wall-clock、候选唯一性和独立验证；前提证伪、错误不可区分、nonce 未复用、参数验证生效、候选不唯一或预算不足即关闭，记录覆盖范围和 closed-vector，不扩大请求、并发或时间。",
+  "commands": [
+    "python3 -I -c \"from Crypto.Cipher import AES; print(AES.block_size)\"",
+    "python3 -I -c \"from pathlib import Path; b=Path('work/cipher.bin').read_bytes(); print(len(b), b.hex())\"",
+    "openssl enc -aes-128-cbc -d -K HEX_KEY -iv HEX_IV -in work/cipher.bin -out work/plain.bin",
+    "python3 -I work/crypto_mode_oracle.py --self-test --record work/mode-oracle.json",
+    "python3 -I work/mode_recover.py --oracle work/mode-oracle.json --checkpoint work/mode-checkpoint.json"
+  ],
+  "tags": [
+    "crypto",
+    "ecb",
+    "cbc",
+    "padding-oracle",
+    "ctr",
+    "ghash",
+    "dh",
+    "protocol"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-crypto-kb-expansion-design.md",
+  "created_at": "2026-11-18T15:36:17Z"
+}

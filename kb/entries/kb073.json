@@ -1,0 +1,24 @@
+{
+  "id": "kb073",
+  "title": "PRNG MT19937 LCG xorshift seed timestamp untemper 弱随机恢复",
+  "description": "624 个 32-bit 输出、部分输出、时间/PID 窗口、有限候选与独立预测对照",
+  "detail": "1. 前置、本地已知答案 oracle 与预算：识别生成器、输出位宽、32-bit/64-bit、字节序、截断、观测数、状态来源与预测目标；固定已知种子和输出序列构建本地已知答案 oracle，保存预测正确/错误对照。远程仅访问当前任务授权 endpoint，每 intent 侦查 20 请求上限、并发 1、5 分钟；恢复请求公式必须列出观测数、有限候选数和 wall-clock，服务预算不足即关闭。\n2. MT19937：标准状态恢复需 624 个连续 32-bit 输出，按输出宽度和字节序做 untemper、state 对齐及 twist，再用第 625 个和后续输出独立验证；远程取得观测并验证时，观测数为 624，恢复请求公式 N = 624 + 1 = 625。部分输出、截断或不足 624 个输出须另证可逆约束和有界求解模型，不能直接当完整状态；观测不足、模型不唯一或预测不一致即关闭。\n3. LCG 与 xorshift：LCG 先确认模数、输出截断和连续关系；已知模数时至少用连续 3 个完整输出求 a/c，并以第 4 个及后续输出回放验证，差分不可逆或参数不唯一时只能增加有证据的有界观测或关闭。xorshift 先确定变体、字长、移位参数、状态字数、可逆差分和符号位，用连续输出恢复并回放完整状态，后续输出做对照，不与 MT/LCG 混用。\n4. 时间/PID 窗口：只枚举有证据的有限窗口，候选数 = |T| × |PID|；例如 60 秒 × 1024 PID 的本地候选数为 60 × 1024 = 61440，先本地重放筛成唯一候选，再按服务预算做至多 1 次预测验证。已知观测数时恢复请求公式 N = N_observe + 1，N_observe=1 时 N = 2；窗口无命中即关闭，不扩大为无界爆破。`/dev/urandom` 禁止预测；token、密钥和其他 CSPRNG 输出也不作为可预测 MT，Python random 与 OS CSPRNG 必须分开。\n5. 负结果与关闭：记录生成器假设、原始输出、位宽/字节序、观测数、候选数、恢复请求公式、预测对照和已用预算；生成器不明、观测不足、模型或参数不唯一、预测不一致、达到预算或服务预算不足即关闭并保留负结果，不输出猜测，不增加并发或请求上限。",
+  "commands": [
+    "python3 -I -c \"import random; r=random.Random(0); values=[r.getrandbits(32) for _ in range(624)]; print(len(values), values[0])\"",
+    "python3 -I work/prng_oracle.py --self-test --record work/prng-oracle.json",
+    "python3 -I work/mt19937_recover.py --outputs work/mt19937.txt --width 32 --count 624 --predict 1",
+    "python3 -I work/prng_recover.py --generator lcg --outputs work/lcg.txt --predict 1",
+    "python3 -I work/prng_recover.py --generator xorshift --outputs work/xorshift.txt --predict 1"
+  ],
+  "tags": [
+    "crypto",
+    "prng",
+    "mt19937",
+    "lcg",
+    "xorshift",
+    "seed",
+    "untemper"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-crypto-kb-expansion-design.md",
+  "created_at": "2026-11-18T15:36:17Z"
+}

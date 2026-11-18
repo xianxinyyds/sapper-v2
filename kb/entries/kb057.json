@@ -2,13 +2,13 @@
   "id": "kb057",
   "title": "Reverse 二进制静态优先工作流",
   "description": "用现有 binutils、gdb、checksec 和 Python 做可复核的逆向分析",
-  "detail": "1. 先确认输入：file、sha256sum、大小和权限；需要工具先 command -v，不在线安装。\n2. 字符串与偏移：strings -a -t x，区分普通输出、flag 形状、路径和隐藏标记；用 xxd 复核原始字节。\n3. ELF 静态画像：readelf -h/-S/-s/-r，nm 查符号，objdump -d 查函数、调用和常量引用；需要交叉引用时可用 radare2，先定位校验逻辑再下断点。\n4. 保护与利用衔接：checksec 判断 NX/PIE/RELRO/Canary；动态行为用 gdb batch、strace/ltrace，限制运行时间和输入。\n5. 加壳/混淆：先记录节区、熵和导入异常；UPX 只解到工作目录副本，yara 用于有界特征扫描。Ghidra、angr 未安装，不联网补。\n6. 每个结论保存精确文件偏移、符号、反汇编或寄存器证据，不能只凭 strings 的猜测提交复杂答案。",
+  "detail": "1. 先确认输入：file、sha256sum、大小和权限；需要工具先 command -v，不在线安装。\n2. 字符串与偏移：strings -a -t x，区分普通输出、flag 形状、路径和隐藏标记；用 xxd 复核原始字节。\n3. ELF 静态画像：readelf -h/-S/-s/-r，nm 查符号，objdump -d 查函数、调用和常量引用；需要交叉引用时可用 radare2，先定位校验逻辑再下断点。\n4. 保护与动态衔接：checksec 判断 NX/PIE/RELRO/Canary；真实 ELF 动态行为按 kb069 的完整 tracer 边界，在静态审查后的工作目录副本和输入上，以非 root、env -i、prlimit 的 CPU/地址空间/文件大小限制、timeout 及 strace -f 的 socket/socketcall EPERM 双注入执行，不得裸跑或删除任一控制。\n5. 加壳/混淆：先记录节区、熵和导入异常；UPX 只解到工作目录副本，yara 用于有界特征扫描。Ghidra、angr 未安装，不联网补。\n6. 每个结论保存精确文件偏移、符号、反汇编或寄存器证据，不能只凭 strings 的猜测提交复杂答案。\n7. 细分路由：静态画像、真实偏移、xrefs/调用图 → kb068；动态行为、比较/解码/密钥生成、反调试差异 → kb069；UPX/壳、混淆、自研 VM → kb070。",
   "commands": [
     "file binary && sha256sum binary && strings -a -t x binary",
     "readelf -h -S -s binary && nm -an binary",
     "r2 -q -c 'iI' binary",
     "upx -d -o unpacked.bin packed.bin",
-    "strace -f -e trace=openat,read,write -o trace.log ./binary"
+    "mkdir -p work && cp attachments/rev1 work/rev1 && cp attachments/input.txt work/input.txt && env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 timeout 10s prlimit --cpu=10:10 --as=268435456:268435456 --fsize=1048576:1048576 strace -f -qq -o work/rev1.strace -e trace=socket,socketcall --inject=socket:error=EPERM --inject=socketcall:error=EPERM ./work/rev1 < work/input.txt"
   ],
   "tags": [
     "reverse"

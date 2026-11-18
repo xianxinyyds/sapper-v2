@@ -1,0 +1,23 @@
+{
+  "id": "kb069",
+  "title": "Reverse dynamic strace ltrace validation 动态行为校验",
+  "description": "Reverse dynamic-analysis、gdb、strace、ltrace、anti-debug、self-modifying 的受控 validation 工作流",
+  "detail": "1. 前置与预算：先由 kb068 或源码定位比较、解码、密钥生成和可疑 anti-debug 函数，记录原始 hash、真实运行时与输入协议；真实题目独立 ELF 必须经静态审查，确认无需安装器、额外权限或外部依赖后才可在独立副本上动态运行。最低成本证据是目标函数静态位置、一次正常输入及对应退出状态。每个假设声明有限本地轮次/时间与 wall-clock（如两组对照、10 分钟），重试需要新证据；远程仅针对当前任务授权 endpoint，每个 intent 默认最多 20 次远程请求、并发 1、5 分钟。\n2. 最低成本对照：分别使用正常、错误、边界和空输入，一次只改一个变量，保存退出码、stdout/stderr、syscall/library call 与目标分支差异；原始输入和输出必须可复核，单次寄存器状态或异常不等于校验逻辑已证明。\n3. 真实 ELF 执行边界：普通 solver 的受控直接执行必须使用静态审查后的工作目录副本和输入，以非 root、env -i、prlimit 的 CPU/地址空间/文件大小限制、timeout，以及 strace -f 的 socket 与 socketcall EPERM 双注入完整包装；不得裸跑或为方便而删除任一控制。同 UID 不是强沙箱，仍可能访问同 UID 文件或进程；控制无法落实或出现异常文件、权限、进程、网络行为时记录 blocker 并停止动态执行。\n4. tracer 分流：strace 用于上述受控直接执行和 syscall 证据。live GDB/ltrace 仅限 Agent 审查后自写可信 fixture，或外部已验证的 --network none、无凭证、非 root、一次性容器，并保留其他资源限制与证据驱动断点；普通 solver 不得用 ltrace/gdb 替代真实 ELF 的 strace 禁网包装，不得假定 solver 容器内能再启动 Docker。live GDB 与 strace -f 存在 ptrace 冲突，ltrace 同样依赖 ptrace，不能借工具切换规避禁网；外部环境不可用或无法验证时记录 blocker，转为静态分析、完整 strace 受控直接执行或自写最小样本。\n5. anti-debug 与 self-modifying：先用 tracer/timing/页面写入的对照证据证明差异，再选择副本补丁或插桩；patch 只作用于副本并保留前后 hash，不把一次时序或断点异常直接认定为反调试。\n6. 负结果与关闭：记录输入、目标函数/断点、VA、trace、实际预算和 closed-vector；目标函数未出现、trace 不可达、两组对照无新增证据、前提证伪或达到预算即关闭该假设。负结果必须区分样本未到达、工具环境 blocker 与假设被证伪，不得无新证据重试。",
+  "commands": [
+    "sha256sum attachments/rev1 && file attachments/rev1",
+    "mkdir -p work && cp attachments/rev1 work/rev1 && cp attachments/input.txt work/input.txt && env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 timeout 10s prlimit --cpu=10:10 --as=268435456:268435456 --fsize=1048576:1048576 strace -f -qq -o work/rev1.strace -e trace=socket,socketcall --inject=socket:error=EPERM --inject=socketcall:error=EPERM ./work/rev1 < work/input.txt",
+    "timeout 10s gdb -q -batch -ex 'set pagination off' -ex 'break check_input' -ex 'run < work/self_input.txt' -ex 'info registers' -ex 'x/16bx &encoded' ./work/self_fixture",
+    "timeout 10s ltrace -f -o work/self_fixture.ltrace -e 'strcmp+memcmp+strlen' ./work/self_fixture < work/self_input.txt"
+  ],
+  "tags": [
+    "reverse",
+    "dynamic-analysis",
+    "gdb",
+    "strace",
+    "ltrace",
+    "anti-debug",
+    "validation"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-reverse-kb-expansion-design.md",
+  "created_at": "2026-11-18T13:19:49Z"
+}

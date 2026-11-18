@@ -178,6 +178,178 @@ archive comes from
 It contains the root `phpggc` executable and no `.git`, `.venv`, `vendor`, or
 `node_modules` tree.
 
+## Offline Pwn tooling
+
+The retained `sapper-ctfy-web-test:latest` image is reused without a Dockerfile
+change. `checksec`, `gdb`, `strace`, `patchelf`, `gcc`, `ROPgadget`, `ropper`,
+pwntools, `one_gadget`, `seccomp-tools`, and `pwninit` support local ELF
+inspection, minimal fixture compilation, gadget analysis, loader/libc matching,
+and bounded debugging. Runtime containers must not download packages, libc or
+loader files, gadgets, or other dependencies, and must not run package
+installers. Apply `patchelf` and `pwninit` only to copies in a separate work
+directory; supply the existing local `--libc` and `--ld` to `pwninit`, preserve
+the original attachment hash, and never fetch a missing runtime.
+
+Execute only a reviewed, real standalone ELF with staged input, a clean
+environment, CPU/address-space/file-size limits, new-socket rejection, and a hard
+timeout; do not start an untrusted attachment project. For example, after
+verifying the patched copy with `readelf` and `patchelf`:
+
+```bash
+env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm \
+  DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 \
+  timeout 5s prlimit --cpu=5:5 --as=268435456:268435456 \
+  --fsize=1048576:1048576 \
+  strace -f -qq -o work/pwn1.strace -e trace=socket,socketcall \
+  --inject=socket:error=EPERM --inject=socketcall:error=EPERM \
+  ./work/pwn1_patched < work/input.txt
+```
+
+These controls are not a strong sandbox. A process running with the same UID
+(同 UID) as the caller can still access that user's files and other permitted
+resources, so use a disposable unprivileged container without credentials or
+network access when execution isolation is required. The `strace`
+`socket`/`socketcall` EPERM injection blocks those new-socket syscalls; it does
+not prove that an arbitrary ELF is sandboxed.
+
+Run the offline known-answer smoke from the repository root:
+
+```bash
+docker run --rm --network none --user agent \
+  --entrypoint python3 -v "$PWD/tests:/tests:ro" -w /tmp \
+  sapper-ctfy-web-test:latest /tests/pwn_smoke.py
+```
+
+`tests/pwn_smoke.py` compiles only self-authored temporary fixtures and checks
+the toolchain, stack, loopback transport, format-string writes, and current-glibc
+SafeLinking/tcache behavior. A successful run has all five groups `PASS` and
+exits `0`; any failure or version skip is nonzero. These local known answers do
+not validate a real challenge target, older glibc versions, or solve rates.
+
+## Offline Reverse tooling
+
+The retained `sapper-ctfy-web-test:latest` image includes the Reverse tools at
+these existing paths: `/usr/bin/file`, `/usr/bin/sha256sum`, the binutils
+commands `/usr/bin/strings`, `/usr/bin/readelf`, `/usr/bin/nm`, and
+`/usr/bin/objdump`, `/usr/bin/r2` (radare2), `/usr/bin/upx` (the installed
+`upx-ucl` alternative), `/usr/bin/yara`, `/usr/bin/gdb`, `/usr/bin/strace`, and
+`/usr/bin/ltrace`. GCC and Python support self-authored fixtures and independent
+decoders; z3/sympy are used only after a local import availability check.
+Runtime containers must not download packages, rules, symbols, or other tools.
+
+Start with static evidence: preserve file/hash output, `strings -a -t x`,
+sections, symbols, relocations, disassembly, and targeted radare2 xrefs. Translate
+a target VA to a file offset through its file-backed ELF section before
+extracting bytes. Independently decode constants and validate normal, wrong, and
+boundary inputs; a flag-shaped `strings` hit or YARA match is only a lead. Record
+unknown stripped regions and unresolved indirect jumps rather than claiming
+coverage.
+
+For a reviewed, real standalone challenge ELF, use only a separate copy and
+staged input with the complete controlled wrapper:
+
+```bash
+env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm \
+  DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 \
+  timeout 10s prlimit --cpu=10:10 --as=268435456:268435456 \
+  --fsize=1048576:1048576 \
+  strace -f -qq -o work/rev1.strace -e trace=socket,socketcall \
+  --inject=socket:error=EPERM --inject=socketcall:error=EPERM \
+  ./work/rev1 < work/input.txt
+```
+
+This is not a strong sandbox: the same UID can still access that user's files and
+permitted processes. Use a disposable unprivileged container without credentials
+or network access when isolation is required. Live GDB and `strace -f` have a
+**ptrace conflict** and must not be combined; ltrace also depends on ptrace and
+is not a way to remove socket injection. Direct gdb/ltrace inspection is allowed
+for self-authored trusted fixtures inside the required `--network none`
+container. For any other ELF, live GDB or ltrace requires an externally verified,
+`--network none`, credential-free, non-root, disposable container while retaining
+resource/time limits. If that environment cannot be verified, record a blocker
+and retain static analysis or the complete strace wrapper; do not assume the
+solver container can start Docker.
+
+Run UPX only on copies with separate `upx -9 -o packed ...` and
+`upx -d -o unpacked ...` outputs. Preserve the original hash and compare
+sections, imports, entropy, and behavior; UPX does not identify every packer. For
+a custom VM, save the bytecode VA/file-offset mapping, dispatcher and handler
+disassembly, per-opcode stack/register transitions, and an independent
+interpreter's output. Unknown opcodes must fail explicitly rather than being
+skipped or converted into a success marker.
+
+Run the offline known-answer smoke from the repository root:
+
+```bash
+docker run --rm --network none --user agent \
+  --entrypoint python3 -v "$PWD/tests:/tests:ro" -w /tmp \
+  sapper-ctfy-web-test:latest /tests/reverse_smoke.py
+```
+
+`tests/reverse_smoke.py` creates only temporary self-authored C/Python fixtures
+and evidence. Success requires `PASS static`, `PASS dynamic`, and `PASS pack-vm`,
+with no `FAIL` or `SKIP`, and exit `0`. These known answers exercise the local
+x86-64 toolchain only; they do not establish real Reverse challenge A/B results,
+other platforms, official platform conformance, or solve rates.
+
+## Offline Crypto tooling
+
+The retained `sapper-ctfy-web-test:latest` image is reused without a Dockerfile
+change. Its actual offline Crypto dependencies are pycryptodome 4.4.0, ecdsa
+0.19.2, fpylll 0.6.4, sympy 1.14.0, RsaCtfTool 0.1.0, xortool 1.1.0, and
+OpenSSL 3.6.5. Runtime containers must not download packages, oracle data, or
+other dependencies and must not run package installers.
+
+Select an attack only after recording parameters, encoding, observations, and a
+local known-answer oracle. RsaCtfTool runs exactly one explicitly selected local
+attack, for example `RsaCtfTool --attack wiener --publickey work/key.pub
+--private`; preserve its raw output, parse the candidate key, and require
+独立验证 by known-ciphertext decryption rather than trusting its exit code.
+禁止 `--attack all`。禁止 `factordb`。禁止 `sendtofdb`。Lattice and ECDSA checks
+must similarly verify a known short vector or recovered private scalar, validate
+curve/order/generator parameters, and reject invalid inputs explicitly.
+
+Every oracle has a recorded query count and a predeclared 预算. After ECB mode,
+block size, and suffix length are established, secret-suffix recovery uses at
+most `257L` queries (`4112` for `L=16`), requires one unique candidate per byte,
+and checkpoints every byte. For one block, CBC padding recovery uses
+4097 recovery-counter queries (one valid-padding baseline plus 4096 candidate
+probes) and one separate invalid-padding observation: `4097 + 1 = 4098` total.
+The generic total is `2 + 4096B` only with unique candidates and immediate closure on
+ambiguity. Any future disambiguation requires a separately declared bounded `D`
+term (`2 + 4096B + D`); this smoke adds no disambiguation and closes its
+ambiguous-first-byte negative without selecting a candidate. Non-deterministic
+ECB and uniform CBC errors close recovery instead of producing candidates. CBC
+bit-flip is verified independently from padding recovery. CTR nonce reuse
+supports confidentiality recovery only: CTR
+ciphertext XOR is not a GHASH or other authentication bypass. The smoke checks
+GCM tamper rejection as an integrity boundary but does not claim GHASH key/tag
+recovery. DH uses validated parameters and a bounded 11-candidate subgroup.
+
+MT19937 recovery requires exactly 624 consecutive untruncated 32-bit outputs,
+with byte order, observation count, untemper, state alignment, and later-output
+prediction recorded; 623 outputs are a closed negative, not a complete state.
+LCG and xorshift checks replay later outputs. Time/PID seed recovery enumerates
+only the declared finite window and closes on no hit. OS CSPRNG output is never
+used as a prediction target.
+
+Run the offline known-answer smoke from the repository root:
+
+```bash
+docker run --rm --network none --user agent \
+  --entrypoint python3 -v "$PWD/tests:/tests:ro" -w /tmp \
+  sapper-ctfy-web-test:latest /tests/crypto_smoke.py
+```
+
+`tests/crypto_smoke.py` writes only temporary self-authored parameters, raw tool
+output, oracle logs, checkpoints, and independent verification evidence. Success
+requires `PASS public-key`, `PASS modes-protocol`, and `PASS prng`, with no
+`FAIL` or `SKIP`, and exit `0`. **限制:** these are small local known answers,
+not exhaustive attacks or real-service budget validation. Boneh-Durfee,
+Coppersmith, partial-key recovery, GHASH key recovery, unbounded discrete logs,
+and other platforms are not exercised. The run establishes no
+real Crypto challenge A/B results, official platform conformance, or solve rates.
+
 ## Result and exit semantics
 
 Answer facts have these states:

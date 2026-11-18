@@ -18,10 +18,21 @@ and `sapper doc <id>` to reuse prior evidence rather than duplicating work.
 # Category routing
 Use the platform category first, then question/attachment/endpoint evidence; choose
 one primary label and run `sapper kb search "<category keywords>"` for unfamiliar work.
-- Crypto: identify the construction before math; validate recovery on a known local
-  oracle and use fpylll/RsaCtfTool only for selected offline attacks.
-- Reverse: start with file/strings/readelf/nm/objdump; use upx/radare2/strace/ltrace/gdb
-  as evidence requires.
+- Crypto: 首轮识别构造、参数、编码与 oracle，并执行 `sapper kb search`；每个恢复先在
+  本地已知答案 oracle 上通过，再选择离线工具。
+  - public-key（RSA/ECC/格）按 `kb071`，modes/protocol（分组/流密码与协议）按 `kb072`，
+    PRNG/弱随机按 `kb073`；只使用前置已证明的攻击。
+  - 每个 intent 侦查默认最多 20 次远程请求、并发 1、5 分钟；恢复先计算请求公式：总请求数 =
+    侦查请求数 + 观测请求数（含正常/异常对照）+ 逐字节/逐块恢复单元数 × 每单元候选请求数 +
+    独立验证请求数 + 消歧请求数 D，并声明 wall-clock；无消歧时 D=0，候选不唯一立即关闭，
+    未来消歧须另声明有界 D，不得遗漏观测或独立验证/消歧请求；预算不足即关闭并记录
+    closed-vector，不得中途扩大。
+- Reverse: 首轮核对附件并执行 `sapper kb search`，按 `kb068` 完成静态分析；
+  无静态目标函数/协议时不得全程序单步。
+  - 有目标函数/协议后按 `kb069` 做受控动态验证；有壳、分派器或 VM 证据后按 `kb070`
+    分析壳、opcode 与分派语义。
+  - 每个 intent 默认最多 20 次远程请求、并发 1、5 分钟；达到关闭条件后记录
+    closed-vector 并停止。
 - Misc: inspect signatures, metadata and nested files with bounded extraction. For
   PCAP, start with capinfos/tshark summaries before bounded stream/object analysis;
   use pngcheck/zsteg/stegseek, ffprobe/ffmpeg/sox, or PDF/QR tools as indicated.
@@ -31,8 +42,12 @@ one primary label and run `sapper kb search "<category keywords>"` for unfamilia
     建立路由、输入源、Sink 与未知项清单。
   - 无源码：先建立基线和会话，按 `kb060` 映射授权路由、状态和差分证据，
     再按证据选择 `kb061`（框架路由）或 `kb062`（代理/协议差异）。
-- Pwn: verify real artifacts and checksec/protocol behavior before offsets or ROP;
-  use patchelf/pwntools/ROPgadget for local validation.
+- Pwn: 首轮核对附件、libc、loader、checksec 与协议，并执行对应的 `sapper kb search`；
+  先用本地已知答案或最小输入建立对照。
+  - 按假设选择 `kb065`（本地→远程）、`kb066`（栈/格式化字符串）或
+    `kb067`（堆/glibc），记录可复现证据。
+  - 本地证据不足时不直接远程 exploit；每个 intent 默认最多 20 次远程连接、并发 1、
+    5 分钟，达到假设关闭条件后记录 closed-vector 并停止。
 - AI security: inspect model inputs, artifacts, MCP/tool boundaries and data flows safely;
   use safetensors/onnx for metadata without heavyweight runtimes.
 

@@ -1,0 +1,25 @@
+{
+  "id": "kb065",
+  "title": "Pwn local remote exploit 本地到远程复现",
+  "description": "Pwn local remote、pwntools、patchelf、libc/loader、protocol、timeout/reconnect 证据工作流",
+  "detail": "1. 前置与固定事实：记录附件路径、SHA256、ELF 架构与 endian、NX/PIE/RELRO/Canary/CET、动态依赖、libc/loader hash、符号和实际输入输出 protocol；附件或运行时缺失就标为未知，不得补猜。最低成本证据是 file/checksec/readelf、全部相关文件 hash，以及一次正常输入的输出，先固定这些证据再计算偏移。\n2. 本地对照：只在可写副本目录用 patchelf/pwninit 固定题目实际提供的解释器和 libc，保存 patch 前后 hash、命令和 patchelf --print-interpreter 输出，禁止下载依赖。真实题目 ELF 须先经静态审查，确认是无需额外权限或外部依赖的单一 stdin/stdout 样本；以非 root、独立 cwd、env -i、timeout/资源限制和 strace 的 socket/socketcall EPERM 注入运行并保留跟踪。同 UID 隔离不是强沙箱，仍可能读取同 UID 文件或干扰进程；约束无法落实或出现异常文件、进程、权限、网络行为时立即停止。用正常、边界和崩溃输入建立控制组，保存最小输入、退出状态及 gdb 寄存器/栈证据；不满足边界时仅做静态分析和自写最小样本复现并记录 blocker。\n3. 迁移与预算：复用同一 pwntools exploit 状态机，仅替换 process/remote transport；显式设置 timeout，处理 banner、分帧、菜单同步和关闭，reconnect 必须计入连接数。仅连接当前任务授权的 endpoint，每个 intent 默认最多 20 次远程连接、并发 1、5 分钟 wall-clock，命令超时短于外层 dispatch。远程偏移、泄露和 libc 必须重新取证，不得把本地值当远程常量。\n4. 证据、负结果与关闭：保存 exploit 脚本、输入、崩溃/泄露证据和本地/远程结果矩阵。负结果写明已测保护、偏移来源、运行时、protocol 状态、连接预算及 closed-vector；前提证伪、达到预算或连续两组对照无新增证据即关闭该假设，同一已证伪利用族不得无新证据重试，纯传输失败不能掩盖 exploit 逻辑错误。",
+  "commands": [
+    "sha256sum pwn1 libc.so.6 ld-linux-x86-64.so.2 && file pwn1 && checksec --file=pwn1",
+    "readelf -h -l -d -s pwn1",
+    "mkdir -p work && cp pwn1 libc.so.6 ld-linux-x86-64.so.2 input.txt work/ && patchelf --print-interpreter work/pwn1",
+    "pwninit --bin work/pwn1 --libc work/libc.so.6 --ld work/ld-linux-x86-64.so.2",
+    "patchelf --print-interpreter work/pwn1_patched && patchelf --print-rpath work/pwn1_patched && readelf -d work/pwn1_patched",
+    "env -i PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm DEBUGINFOD_URLS= DEBUGINFOD_PROGRESS=0 timeout 10s prlimit --cpu=10:10 --as=268435456:268435456 --fsize=1048576:1048576 strace -f -qq -o work/pwn1.strace -e trace=socket,socketcall --inject=socket:error=EPERM --inject=socketcall:error=EPERM ./work/pwn1_patched < work/input.txt",
+    "python3 -I exploit.py"
+  ],
+  "tags": [
+    "pwn",
+    "local-remote",
+    "pwntools",
+    "patchelf",
+    "libc",
+    "protocol"
+  ],
+  "source": "docs/superpowers/specs/2026-11-18-pwn-kb-expansion-design.md",
+  "created_at": "2026-11-18T09:25:43Z"
+}
