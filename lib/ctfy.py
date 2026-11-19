@@ -131,6 +131,8 @@ class CtfyClient:
             if type(total) is not int or total < 0:
                 raise CtfyError("CTFY discovery response total must be a nonnegative integer")
             page = result["items"]
+            if offset > total or len(page) > total - offset:
+                raise CtfyError("CTFY discovery page exceeds its reported total")
             if not page and offset < total:
                 raise CtfyError("CTFY discovery returned an empty page before its reported total")
             for item in page:

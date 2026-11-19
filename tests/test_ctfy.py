@@ -828,6 +828,23 @@ class CtfyDiscoveryTests(unittest.TestCase):
             self.client.list_competitions(page_size=2)
         self.assertEqual(len(self.platform.seen), 1)
 
+    def test_over_total_page_fails(self):
+        self.platform.queue(200, {
+            "items": [{"id": "a"}, {"id": "b"}], "total": 1,
+        })
+        with self.assertRaises(ctfy.CtfyError):
+            self.client.list_competitions()
+        self.assertEqual(len(self.platform.seen), 1)
+
+    def test_reduced_total_fails(self):
+        self.platform.queue(200, {
+            "items": [{"id": "a"}, {"id": "b"}], "total": 3,
+        })
+        self.platform.queue(200, {"items": [], "total": 1})
+        with self.assertRaises(ctfy.CtfyError):
+            self.client.list_competitions(page_size=2)
+        self.assertEqual(len(self.platform.seen), 2)
+
     def test_malformed_page_and_duplicate_ids_fail(self):
         for payload in (
             {"items": [{"id": "competition-1"}, "invalid"], "total": 2},
