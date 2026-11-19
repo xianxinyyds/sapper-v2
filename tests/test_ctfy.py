@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -211,6 +212,16 @@ class CtfyModelConfigTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "platform-model")
         self.assertEqual(env["SAPPER_BIN"], "claude")
         self.assertNotIn("SAPPER_KEY_POOL", env)
+
+    def test_custom_sapper_bin_is_preserved(self):
+        engine = __import__("ctfy_engine")
+        env = {
+            "LLM_FLAVOR": "anthropic", "LLM_API_KEY": "platform-key",
+            "LLM_MODEL": "sonnet", "LLM_BASE_URL": "https://gateway.example",
+            "SAPPER_BIN": "/ctfy/work/claude-wrapper.py",
+        }
+        engine.configure_model(env)
+        self.assertEqual(env["SAPPER_BIN"], "/ctfy/work/claude-wrapper.py")
 
     def test_openai_config_selects_codex_adapter(self):
         engine = __import__("ctfy_engine")
@@ -764,6 +775,86 @@ class CtfyLocalClientTests(unittest.TestCase):
             self.platform.seen[0]["path"],
             "/api/v1/instances?limit=200&challenge_id=challenge-1",
         )
+
+
+class CtfyDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.platform = LocalPlatform()
+        self.client = ctfy.CtfyClient(self.platform.base_url, "tok-x")
+
+    def tearDown(self):
+        self.platform.close()
+
+    def test_list_competitions_paginates_with_phase(self):
+        self.platform.queue(200, {
+            "items": [{"id": "competition-1"}, {"id": "competition-2"}], "total": 3,
+        })
+        self.platform.queue(200, {"items": [{"id": "competition-3"}], "total": 3})
+
+        competitions = self.client.list_competitions(phase="running", page_size=2)
+
+        self.assertEqual([item["id"] for item in competitions], [
+            "competition-1", "competition-2", "competition-3",
+        ])
+        self.assertEqual(len(self.platform.seen), 2)
+        for call, offset in zip(self.platform.seen, ("0", "2")):
+            url = urllib.parse.urlsplit(call["path"])
+            self.assertEqual(url.path, "/api/v1/competitions")
+            self.assertEqual(urllib.parse.parse_qs(url.query), {
+                "phase": ["running"], "limit": ["2"], "offset": [offset],
+            })
+
+    def test_list_challenges_paginates_and_returns_objects(self):
+        first = challenge_payload(id="challenge-1", difficulty="easy", solves_count=12)
+        second = challenge_payload(id="challenge-2", difficulty="medium", solves_count=5)
+        third = challenge_payload(id="challenge-3", difficulty="hard", solves_count=0)
+        self.platform.queue(200, {"items": [first, second], "total": 3})
+        self.platform.queue(200, {"items": [third], "total": 3})
+
+        challenges = self.client.list_challenges("COMP-1", page_size=2)
+
+        self.assertEqual(challenges, [first, second, third])
+        self.assertEqual(len(self.platform.seen), 2)
+        for call, offset in zip(self.platform.seen, ("0", "2")):
+            url = urllib.parse.urlsplit(call["path"])
+            self.assertEqual(url.path, "/api/v1/competitions/COMP-1/challenges")
+            self.assertEqual(urllib.parse.parse_qs(url.query), {
+                "limit": ["2"], "offset": [offset],
+            })
+
+    def test_empty_page_before_reported_total_fails(self):
+        self.platform.queue(200, {"items": [], "total": 2})
+        with self.assertRaises(ctfy.CtfyError):
+            self.client.list_competitions(page_size=2)
+        self.assertEqual(len(self.platform.seen), 1)
+
+    def test_malformed_page_and_duplicate_ids_fail(self):
+        for payload in (
+            {"items": [{"id": "competition-1"}, "invalid"], "total": 2},
+            {"items": [{"id": ""}], "total": 1},
+        ):
+            with self.subTest(payload=payload):
+                self.platform.queue(200, payload)
+                with self.assertRaises(ctfy.CtfyError):
+                    self.client.list_competitions()
+
+        self.platform.queue(200, {"items": [{"id": "competition-1"}], "total": 2})
+        self.platform.queue(200, {"items": [{"id": "competition-1"}], "total": 2})
+        with self.subTest(kind="duplicate-across-pages"), self.assertRaises(ctfy.CtfyError):
+            self.client.list_competitions(page_size=1)
+
+    def test_require_id_rejects_path_traversal(self):
+        for value in ("AUTHORED-CDB35578", "550e8400-e29b-41d4-a716-446655440000"):
+            with self.subTest(value=value):
+                self.assertEqual(ctfy.require_id(value), value)
+
+        invalid = (
+            "", "   ", "../x", "a/b", "a\\b", ".", "..", "a\x00b", "a\nb",
+            "a" * 129, None, 123,
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ctfy.CtfyError):
+                ctfy.require_id(value)
 
 
 if __name__ == "__main__":

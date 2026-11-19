@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import tempfile
 import time
 import urllib.error
@@ -22,6 +23,16 @@ class CtfyError(Exception):
         self.code = code
         self.transport = transport
         super().__init__(message)
+
+
+_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def require_id(value: object, label: str = "id") -> str:
+    if not isinstance(value, str) or value in {".", ".."} \
+            or _ID_PATTERN.fullmatch(value) is None:
+        raise CtfyError(f"{label} must be a safe nonempty identifier")
+    return value
 
 
 class CtfyClient:
@@ -100,6 +111,53 @@ class CtfyClient:
             except json.JSONDecodeError as exc:
                 raise CtfyError(f"CTFY {method} {path} returned non-JSON") from exc
         raise AssertionError("unreachable")
+
+    def _list_objects(self, path: str, page_size: int,
+                      query: dict | None = None) -> list[dict]:
+        if type(page_size) is not int or page_size < 1:
+            raise CtfyError("page_size must be a positive integer")
+        items = []
+        seen_ids = set()
+        offset = 0
+        while True:
+            params = dict(query or {})
+            params.update({"limit": page_size, "offset": offset})
+            result = self._request(
+                "GET", path + "?" + urllib.parse.urlencode(params), retry=True,
+            )
+            if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+                raise CtfyError("CTFY discovery response must contain an items list")
+            total = result.get("total")
+            if type(total) is not int or total < 0:
+                raise CtfyError("CTFY discovery response total must be a nonnegative integer")
+            page = result["items"]
+            if not page and offset < total:
+                raise CtfyError("CTFY discovery returned an empty page before its reported total")
+            for item in page:
+                if not isinstance(item, dict):
+                    raise CtfyError("CTFY discovery list must contain objects")
+                item_id = require_id(item.get("id"), "object id")
+                if item_id in seen_ids:
+                    raise CtfyError(f"CTFY discovery returned duplicate id {item_id}")
+                seen_ids.add(item_id)
+            items.extend(page)
+            offset += len(page)
+            if offset >= total or len(page) < page_size:
+                return items
+
+    def list_competitions(self, *, phase: str | None = None,
+                          page_size: int = 100) -> list[dict]:
+        query = {"phase": phase} if phase is not None else None
+        return self._list_objects("/api/v1/competitions", page_size, query)
+
+    def list_challenges(self, competition_id: str, *,
+                        page_size: int = 100) -> list[dict]:
+        competition = self._segment(
+            require_id(competition_id, "competition_id"), "competition_id",
+        )
+        return self._list_objects(
+            f"/api/v1/competitions/{competition}/challenges", page_size,
+        )
 
     def get_challenge(self, challenge_id: str, competition_id: str = "") -> dict:
         segment = self._segment(challenge_id, "challenge_id")
