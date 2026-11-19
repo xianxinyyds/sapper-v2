@@ -1353,6 +1353,49 @@ class CleanupTests(PoolTestCase):
         }])
         self.assertEqual(self.client.stop_calls, [])
 
+    def test_cleanup_second_interrupt_preempts_graceful_wait_promptly(self):
+        self.start("challenge-1")
+        process = self.processes["challenge-1"]
+        process.wait_raises = True
+        pending = {"value": False}
+        sleeps = []
+
+        def interrupt_pending():
+            return pending["value"]
+
+        def fake_sleep(delay):
+            sleeps.append(delay)
+            pending["value"] = True
+
+        with mock.patch.object(ctfy_commander.time, "sleep", side_effect=fake_sleep):
+            result = self.pool.cleanup(
+                "interrupt", interrupt_pending=interrupt_pending,
+            )
+
+        self.assertTrue(process.terminated)
+        self.assertLessEqual(len(sleeps), 2)
+        self.assertLessEqual(sum(sleeps), 2.0)
+        self.assertEqual(self.client.stop_calls, [])
+        self.assertIn({"id": "instance-challenge-1-1", "expires_at": NOW + 3600},
+                      result["preserved"])
+
+    def test_cleanup_pre_recorded_second_interrupt_forces_immediately(self):
+        self.start("challenge-1")
+        process = self.processes["challenge-1"]
+        process.wait_raises = True
+        sleeps = []
+
+        with mock.patch.object(ctfy_commander.time, "sleep", side_effect=sleeps.append):
+            result = self.pool.cleanup(
+                "interrupt", interrupt_pending=lambda: True,
+            )
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.client.stop_calls, [])
+        self.assertIn({"id": "instance-challenge-1-1", "expires_at": NOW + 3600},
+                      result["preserved"])
+
 
 class WorkerSignalTests(PoolTestCase):
     def test_worker_signal_interrupt_cleans_docker_and_redacts_logs(self):
@@ -1466,7 +1509,7 @@ class FakePool:
         self.fires.append(target)
         return {"target": target, "status": "parked", "closed": [], "preserved": []}
 
-    def cleanup(self, reason):
+    def cleanup(self, reason, interrupt_pending=None):
         self.cleanups.append(reason)
         return {"reason": reason, "closed": [], "preserved": [], "workers": {}}
 

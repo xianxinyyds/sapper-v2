@@ -606,7 +606,9 @@ class Commander:
         handled = 0
         while self._interrupts > 0 and handled < 2:
             self._interrupts -= 1
-            self.pool.cleanup("interrupt")
+            self.pool.cleanup(
+                "interrupt", interrupt_pending=lambda: self._interrupts > 0,
+            )
             handled += 1
         return 130
 
@@ -1448,7 +1450,29 @@ class WorkerPool:
             })
         return preserved
 
-    def cleanup(self, reason: str) -> dict:
+    def _wait_worker(self, target, process, worker, interrupt_pending):
+        """Wait for one worker to finish its slice, escalating on a 2nd interrupt.
+
+        Without an interrupt predicate this is the original single bounded wait.
+        With one, the wait polls in short slices and force-terminates as soon as
+        a second interrupt is recorded, so a signal sent only to the commander
+        PID still reaches the bounded forced-exit path promptly.
+        """
+        if interrupt_pending is None:
+            try:
+                process.wait(timeout=self._remaining_slice(worker))
+            except subprocess.TimeoutExpired:
+                pass
+            return False
+        deadline = time.time() + self._remaining_slice(worker)
+        while process.poll() is None and time.time() < deadline:
+            if interrupt_pending():
+                self._force_process(target, process, worker)
+                return True
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
+        return False
+
+    def cleanup(self, reason: str, *, interrupt_pending=None) -> dict:
         if reason not in _CLEANUP_REASONS:
             raise ValueError(f"unsupported cleanup reason {reason!r}")
         self._accepting = False
@@ -1472,10 +1496,8 @@ class WorkerPool:
             if force:
                 self._force_process(target, process, worker)
             elif process is not None and process.poll() is None:
-                try:
-                    process.wait(timeout=self._remaining_slice(worker))
-                except subprocess.TimeoutExpired:
-                    pass
+                if self._wait_worker(target, process, worker, interrupt_pending):
+                    force = True
         closed.extend(
             instance_id for item in self.reap() for instance_id in item["closed"]
         )
