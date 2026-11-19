@@ -1587,6 +1587,65 @@ class CampaignLoopTests(unittest.TestCase):
         self.assertEqual(client.list_instances_calls, 0)
         self.assertEqual(len(sleeps), 2)
 
+    def test_interrupt_records_without_cleanup_or_io(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+        before = (self.store.root / "campaign.json").read_text(encoding="utf-8")
+        commander.interrupt()
+        commander.interrupt()
+        self.assertEqual(pool.cleanups, [])
+        self.assertEqual(client.list_challenges_calls, 0)
+        self.assertEqual(client.list_instances_calls, 0)
+        self.assertEqual(
+            (self.store.root / "campaign.json").read_text(encoding="utf-8"),
+            before,
+        )
+        self.assertEqual(commander._interrupts, 2)
+
+    def test_campaign_loop_interrupt_during_refresh_skips_model(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+        original = client.list_challenges
+
+        def interrupting(competition_id):
+            result = original(competition_id)
+            commander.interrupt()
+            return result
+
+        client.list_challenges = interrupting
+        with mock.patch.object(ctfy_commander, "request_decision") as decision_mock:
+            self.assertEqual(commander.run(), 130)
+        decision_mock.assert_not_called()
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["interrupt"])
+
+    def test_campaign_loop_interrupt_during_decision_does_not_execute(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+
+        def deciding(*a, **k):
+            commander.interrupt()
+            return ctfy_commander.Decision("work", "challenge-1", 10, "lead")
+
+        with mock.patch.object(ctfy_commander, "request_decision",
+                               side_effect=deciding):
+            self.assertEqual(commander.run(), 130)
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["interrupt"])
+
+    def test_campaign_loop_second_interrupt_forces_bounded_exit(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+        commander.interrupt()
+        commander.interrupt()
+        self.assertEqual(pool.cleanups, [])
+        self.assertEqual(commander.run(), 130)
+        self.assertEqual(pool.cleanups, ["interrupt", "interrupt"])
+
 
 if __name__ == "__main__":
     unittest.main()

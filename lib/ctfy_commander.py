@@ -590,11 +590,25 @@ class Commander:
         self.pool = pool if pool is not None else WorkerPool(
             store, client, competition, run_args,
         )
-        self._interrupted = False
+        self._interrupts = 0
 
     def interrupt(self) -> None:
-        self._interrupted = True
-        self.pool.cleanup("interrupt")
+        """Record an interrupt request; the main loop performs the cleanup."""
+        self._interrupts += 1
+
+    def _cleanup_interrupts(self) -> int:
+        """Drain pending interrupts in the main flow, never in a handler.
+
+        One cleanup per recorded interrupt (capped at two) preserves the pool's
+        contract: the first interrupt waits gracefully and preserves instances,
+        while a second interrupt follows the bounded forced-exit path.
+        """
+        handled = 0
+        while self._interrupts > 0 and handled < 2:
+            self._interrupts -= 1
+            self.pool.cleanup("interrupt")
+            handled += 1
+        return 130
 
     def _deadline(self) -> float:
         deadline = _timestamp(self.store.load().get("deadline"))
@@ -684,8 +698,8 @@ class Commander:
         consecutive_model = 0
         consecutive_infra = 0
         while True:
-            if self._interrupted:
-                return 130
+            if self._interrupts:
+                return self._cleanup_interrupts()
             now = time.time()
             if now >= deadline:
                 self.pool.cleanup("deadline")
@@ -695,12 +709,16 @@ class Commander:
             except Exception:  # noqa: BLE001 - platform unavailability backoff
                 consecutive_infra += 1
                 consecutive_model = 0
+                if self._interrupts:
+                    return self._cleanup_interrupts()
                 if consecutive_infra >= _INFRA_ERROR_RETRIES:
                     self.pool.cleanup("infra_error")
                     return 2
                 self._backoff(deadline - now, consecutive_infra)
                 continue
             consecutive_infra = 0
+            if self._interrupts:
+                return self._cleanup_interrupts()
             self.pool.reap()
             state = self.store.load()
             rows = build_board(challenges, instances, state, now=now)
@@ -716,12 +734,16 @@ class Commander:
                 )
             except Exception:  # noqa: BLE001 - model unavailability backoff
                 consecutive_model += 1
+                if self._interrupts:
+                    return self._cleanup_interrupts()
                 if consecutive_model >= _MODEL_ERROR_RETRIES:
                     self.pool.cleanup("model_error")
                     return 2
                 self._backoff(deadline - now, consecutive_model)
                 continue
             consecutive_model = 0
+            if self._interrupts:
+                return self._cleanup_interrupts()
             outcome, error = self._execute(decision, challenges)
             self._record_decision(decision, now, outcome, error)
             if decision.action == "stop":
