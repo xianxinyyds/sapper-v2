@@ -271,7 +271,7 @@ class CtfyLocalRunTests(unittest.TestCase):
         self.assertIn(("stop", "instance-1"), client.events)
 
     def test_cleanup_failure_is_not_silent_or_allowed_to_replace_the_primary_error(self):
-        client = FakeClient(challenge(is_qa_only=False), instance())
+        client = FakeClient(challenge(is_qa_only=False), instance(status="starting"))
         client.stop_instance = mock.Mock(side_effect=ctfy.CtfyError("stop failed"))
         with mock.patch.dict("os.environ", {"CTFY_TOKEN": "secret-token"}, clear=True), \
                 mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=client), \
@@ -333,16 +333,17 @@ class CtfyLocalRunTests(unittest.TestCase):
         client.list_challenges.assert_not_called()
 
     def test_structured_prepare_only_reports_ownership_and_keeps_instances(self):
-        for created in (True, False):
-            with self.subTest(created=created):
+        for created, keep in ((True, True), (False, True), (False, False)):
+            with self.subTest(created=created, keep=keep):
                 client = FakeClient(
                     challenge(is_qa_only=False),
                     instance(status="starting" if created else "ready"),
                 )
                 events = []
+                extra = ["--prepare-only"] + (["--keep-instance"] if keep else [])
 
                 outcome = ctfy_local.run_challenge(
-                    self.args("--prepare-only", "--keep-instance"),
+                    self.args(*extra),
                     client=client, on_event=lambda name, data: events.append((name, data)),
                 )
 
@@ -393,6 +394,19 @@ class CtfyLocalRunTests(unittest.TestCase):
             "created_instance": True,
         })
         self.assertEqual(events[1][1], {"name": container_names[0]})
+        self.assertNotIn("stop", [event[0] for event in client.events])
+
+    def test_reused_instance_is_preserved_on_worker_error_without_keep(self):
+        client = FakeClient(challenge(is_qa_only=False), instance())
+
+        with mock.patch(
+                "ctfy_local.subprocess.run",
+                return_value=subprocess.CompletedProcess(["docker"], 1),
+        ):
+            with self.assertRaisesRegex(ctfy.CtfyError, "valid result"):
+                ctfy_local.run_challenge(self.args(), client=client)
+
+        self.assertFalse(self.args().keep_instance)
         self.assertNotIn("stop", [event[0] for event in client.events])
 
     def test_structured_run_local_prints_outcome_and_returns_container_code(self):
@@ -455,6 +469,30 @@ class CtfyLocalRunTests(unittest.TestCase):
         self.assertNotIn(str(engine), captured["command"])
         self.assertNotIn("secret-token", captured["command"])
         self.assertIn("SAPPER_BIN", ctfy_local._FORWARDED_ENV)
+
+    def test_engine_replaces_existing_symlink_without_touching_target(self):
+        engine = Path(self.tmp.name) / "engine"
+        engine.write_bytes(b"new engine")
+        engine.chmod(0o755)
+        sentinel = Path(self.tmp.name) / "external-sentinel"
+        sentinel.write_bytes(b"do not overwrite")
+        (self.work / ".ctfy-engine").symlink_to(sentinel)
+
+        def container(command, env=None, timeout=None, **kwargs):
+            (self.work / "result.json").write_text(json.dumps({
+                "schema_version": 3, "answers": {}, "solved": [],
+                "fully_solved": False, "stop_reason": "incomplete",
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch("ctfy_local.subprocess.run", side_effect=container):
+            ctfy_local.run_challenge(
+                self.args("--engine", str(engine)), client=FakeClient(),
+            )
+
+        self.assertEqual(sentinel.read_bytes(), b"do not overwrite")
+        self.assertFalse((self.work / ".ctfy-engine").is_symlink())
+        self.assertEqual((self.work / ".ctfy-engine").read_bytes(), b"new engine")
 
     def test_add_host_and_read_only_source_lib_mount_reach_docker(self):
         args = self.args(

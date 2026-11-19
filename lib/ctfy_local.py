@@ -303,6 +303,7 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
     instance = None
     pending_instance_id = None
     created_instance = False
+    owns_instance = False
     try:
         if challenge.get("is_qa_only") is not True:
             instance = _find_instance(client, challenge_id, competition_id)
@@ -311,6 +312,7 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
                     nonlocal pending_instance_id
                     pending_instance_id = ctfy.require_id(instance_id, "instance_id")
 
+                owns_instance = True
                 instance = client.start_instance(
                     challenge_id, competition_id, ttl=args.ttl,
                     timeout=args.startup_timeout, on_created=track_instance,
@@ -326,13 +328,23 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
         prepare_work_dir(client, work_dir, task)
         engine = args.engine
         if engine is not None:
+            temporary_engine = None
             try:
-                shutil.copy2(engine, work_dir / ".ctfy-engine")
-                (work_dir / ".ctfy-engine").chmod(
-                    (work_dir / ".ctfy-engine").stat().st_mode | 0o111
-                )
+                with engine.open("rb") as source, tempfile.NamedTemporaryFile(
+                        mode="wb", dir=work_dir, prefix=".ctfy-engine.",
+                        suffix=".tmp", delete=False,
+                ) as fh:
+                    temporary_engine = Path(fh.name)
+                    shutil.copyfileobj(source, fh)
+                    os.fchmod(fh.fileno(), os.fstat(source.fileno()).st_mode | 0o111)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temporary_engine, work_dir / ".ctfy-engine")
             except OSError as exc:
                 raise ctfy.CtfyError(f"cannot prepare custom engine: {exc}") from exc
+            finally:
+                if temporary_engine is not None:
+                    temporary_engine.unlink(missing_ok=True)
         outcome = {
             "work_dir": str(work_dir), "instance_id": task["target_instance"],
             "created_instance": created_instance, "prepare_only": args.prepare_only,
@@ -391,7 +403,8 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_id = instance.get("id") if instance else pending_instance_id
-        if cleanup_id and not args.keep_instance and not (instance or {}).get("shared"):
+        if cleanup_id and owns_instance and not args.keep_instance \
+                and not (instance or {}).get("shared"):
             try:
                 client.stop_instance(cleanup_id)
             except ctfy.CtfyError as exc:
