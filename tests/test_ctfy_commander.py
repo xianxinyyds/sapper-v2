@@ -1517,6 +1517,32 @@ class SelectCompetitionTests(unittest.TestCase):
         with self.assertRaisesRegex(ctfy.CtfyError, "a"):
             ctfy_commander.select_competition(competitions)
 
+    def test_select_competition_explicit_accepts_null_challenge_count(self):
+        selected = ctfy_commander.select_competition(
+            [self.competition("qualifier", challenge_count=None)], "qualifier")
+        self.assertEqual(selected["id"], "qualifier")
+
+    def test_select_competition_explicit_accepts_zero_challenge_count(self):
+        selected = ctfy_commander.select_competition(
+            [self.competition("qualifier", challenge_count=0)], "qualifier")
+        self.assertEqual(selected["id"], "qualifier")
+
+    def test_select_competition_explicit_rejects_non_running_with_null_count(self):
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(
+                [self.competition("qualifier", phase="upcoming",
+                                  challenge_count=None)],
+                "qualifier",
+            )
+
+    def test_select_competition_auto_still_ignores_null_and_zero_counts(self):
+        competitions = [
+            self.competition("a", challenge_count=None),
+            self.competition("b", challenge_count=0),
+        ]
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(competitions)
+
 
 class FakePool:
     def __init__(self):

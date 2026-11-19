@@ -67,6 +67,23 @@ def select_competition(competitions: list[dict], competition_id: str = "") -> di
     """
     if not isinstance(competitions, list):
         raise ctfy.CtfyError("competition list must be a list")
+    if competition_id:
+        competition_id = ctfy.require_id(competition_id, "competition_id")
+        running = [
+            competition for competition in competitions
+            if isinstance(competition, dict)
+            and competition.get("phase") == "running"
+        ]
+        matches = [
+            competition for competition in running
+            if competition.get("id") == competition_id
+        ]
+        if len(matches) != 1:
+            raise ctfy.CtfyError(
+                f"competition {competition_id!r} is not a unique running "
+                "competition with visible challenges"
+            )
+        return matches[0]
     eligible = []
     for competition in competitions:
         if not isinstance(competition, dict):
@@ -78,18 +95,6 @@ def select_competition(competitions: list[dict], competition_id: str = "") -> di
                 or challenge_count <= 0:
             continue
         eligible.append(competition)
-    if competition_id:
-        competition_id = ctfy.require_id(competition_id, "competition_id")
-        matches = [
-            competition for competition in eligible
-            if competition.get("id") == competition_id
-        ]
-        if len(matches) != 1:
-            raise ctfy.CtfyError(
-                f"competition {competition_id!r} is not a unique running "
-                "competition with visible challenges"
-            )
-        return matches[0]
     registered = [
         competition for competition in eligible
         if competition.get("is_registered") is True
