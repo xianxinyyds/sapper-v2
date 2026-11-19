@@ -11,6 +11,31 @@ The container does not list challenges, start instances, or sweep multiple
 challenges. The legacy `sapper arena` and `sapper bench` commands are not part of
 this run path.
 
+## Two run modes
+
+This document describes **hosted single-challenge mode**: the platform starts one
+instance (or supplies a QA task), invokes the container for that single challenge,
+and scores `result.json`. The container itself never discovers, lists, starts, or
+stops anything.
+
+A separate host-side **AI-commanded campaign mode** wraps that same
+single-challenge runner for local play:
+
+- `python3 lib/ctfy_local.py play` discovers running competitions and paginated
+  challenges, lets the AI commander choose targets and stop/park/fire Workers,
+  starts or reuses instances within platform capacity, and records decisions,
+  results, and handoff evidence under `runs/`.
+- It is a scheduler and lifecycle driver around the existing image, not a second
+  solver, and it does not change the container entrypoint contract above.
+- Install the one-prompt operator skill with `bash install.sh` and trigger it with
+  “打比赛” (the `/ctfy-play` skill). Operators do not read challenges for the
+  Workers or hand-write payloads.
+- `python3 lib/ctfy_local.py cleanup --competition <ID>` stops only
+  campaign-created leftovers.
+- See `ctfy-play/SKILL.md` for the launcher, options (`--minutes`,
+  `--stall-minutes`, `--max-workers`), result categories, and resume behavior.
+  The single-challenge `run` command remains available as described below.
+
 ## Files and environment
 
 The container starts as an unprivileged user with cwd `/ctfy/work`.

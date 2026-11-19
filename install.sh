@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — install the `sapper` CLI + the `sapper-setup` project skill.
+# install.sh — install the `sapper` CLI + the `sapper-setup` and `ctfy-play` skills.
 #
 # This installer does NOT touch ~/.claude/settings.json and does NOT register
 # any global hooks. The fact-graph is strictly per-project opt-in: you opt a
@@ -7,9 +7,9 @@
 # project, which writes ./.claude/settings.json + .sapper/ there.
 #
 # Usage:
-#   bash install.sh              # install CLI + project skill (recommended)
-#   bash install.sh --cli-only   # just symlink sapper, skip the skill
-#   bash install.sh --uninstall  # remove the symlink + the skill
+#   bash install.sh              # install CLI + skills (recommended)
+#   bash install.sh --cli-only   # just symlink sapper, skip the skills
+#   bash install.sh --uninstall  # remove the symlink + the skills
 #
 set -euo pipefail
 
@@ -29,6 +29,10 @@ if [[ "$mode" == "--uninstall" ]]; then
   if [[ -e "${HOME}/.claude/skills/sapper-setup" || -L "${HOME}/.claude/skills/sapper-setup" ]]; then
     rm -f "${HOME}/.claude/skills/sapper-setup"
     echo "removed ~/.claude/skills/sapper-setup"
+  fi
+  if [[ -e "${HOME}/.claude/skills/ctfy-play" || -L "${HOME}/.claude/skills/ctfy-play" ]]; then
+    rm -f "${HOME}/.claude/skills/ctfy-play"
+    echo "removed ~/.claude/skills/ctfy-play"
   fi
   echo "uninstalled."
   echo "(Project-level .sapper/ graphs and ./.claude/settings.json in your projects are untouched."
@@ -59,11 +63,11 @@ esac
 "$DEST_DIR/sapper" --version >/dev/null && echo "  (sapper works)"
 
 if [[ "$mode" == "--cli-only" ]]; then
-  echo "(--cli-only: skipping the /sapper-setup skill)"
+  echo "(--cli-only: skipping the /sapper-setup and /ctfy-play skills)"
   exit 0
 fi
 
-# --- install the project skill --------------------------------------------
+# --- install the skills ----------------------------------------------------
 SKILLS_DIR="${HOME}/.claude/skills"
 mkdir -p "$SKILLS_DIR"
 SKILL_LINK="$SKILLS_DIR/sapper-setup"
@@ -72,6 +76,13 @@ if [[ -e "$SKILL_LINK" || -L "$SKILL_LINK" ]]; then
 fi
 ln -s "${SCRIPT_DIR}/skill" "$SKILL_LINK"
 echo "installed: /sapper-setup skill -> $SKILL_LINK"
+
+PLAY_SKILL_LINK="$SKILLS_DIR/ctfy-play"
+if [[ -e "$PLAY_SKILL_LINK" || -L "$PLAY_SKILL_LINK" ]]; then
+  rm -f "$PLAY_SKILL_LINK"
+fi
+ln -s "${SCRIPT_DIR}/ctfy-play" "$PLAY_SKILL_LINK"
+echo "installed: /ctfy-play skill -> $PLAY_SKILL_LINK"
 
 cat <<'NOTE'
 
@@ -83,6 +94,10 @@ To opt a project IN (run inside the project dir):
 
 Or just invoke the skill from inside Claude Code:
   /sapper-setup <your goal>
+
+To play a running CTFY competition autonomously, say “打比赛” in Claude Code
+(the /ctfy-play skill) or run:
+  python3 lib/ctfy_local.py play
 
 After that, every turn in that project auto-injects the current graph state,
 and you can drive it with `sapper dispatch reason` / `sapper auto`.

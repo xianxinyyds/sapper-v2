@@ -63,6 +63,21 @@ up. The container entrypoint has no instance-management logic; a local player to
 may still be broader than a hosted scoped token and must be temporary and minimal.
 See `docker/CTFY.md` for its commands, build, dry-run, result, and local verification.
 
+### AI-commanded local campaign mode
+
+`python3 lib/ctfy_local.py play` is the one-command host companion for an entire
+competition. It discovers running competitions and challenges, lets the AI
+commander choose targets (stall advice is soft, not a fixed priority table), runs
+one single-challenge Worker per target, records decisions and results, and
+resumes from `runs/<competition>/campaign.json`. It is a **host scheduler around
+the existing single-challenge image**, not a second solver. Unlike the hosted
+single-challenge mode above, this local campaign mode does start and stop
+instances; `python3 lib/ctfy_local.py cleanup --competition <ID>` stops only
+campaign-created leftovers. Install the `ctfy-play` skill with `bash install.sh`
+and trigger it with “打比赛”; the operator must not read challenges for the
+Workers or hand-write payloads. See `ctfy-play/SKILL.md` for the launcher,
+options, result categories, and resume behavior.
+
 ## Scope — strictly per-project (IMPORTANT)
 
 The fact graph lives **only** in the working directory, under `.sapper/`. There is
@@ -121,7 +136,7 @@ fact-graph/
 │   ├── reason.md                 # commander prompt: "what's next?"
 │   ├── explore.md                # executor prompt: "do this intent"
 │   └── verify.md                 # verify an executor's claimed result
-├── install.sh                    # symlinks `sapper` + installs /sapper-setup skill
+├── install.sh                    # symlinks `sapper`, installs /sapper-setup + /ctfy-play
 └── examples/
     └── README.md                 # a worked example
 ```
