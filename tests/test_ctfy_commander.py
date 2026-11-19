@@ -1,5 +1,12 @@
+import argparse
+import contextlib
+import copy
 import datetime
+import io
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +18,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 import ctfy_commander  # noqa: E402
 import ctfy  # noqa: E402
+import ctfy_campaign  # noqa: E402
 import sapper  # noqa: E402
 
 
@@ -818,6 +826,549 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["model"], "fake-model")
         self.assertEqual(captured["kwargs"]["timeout"], 37)
         self.assertIs(captured["kwargs"]["skip_permissions"], False)
+
+
+class FakeProcess:
+    def __init__(self, pid, returncode=None, *, wait_raises=False):
+        self.pid = pid
+        self.returncode = returncode
+        self.wait_raises = wait_raises
+        self.waits = []
+        self.signals = []
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.wait_raises:
+            raise subprocess.TimeoutExpired(["worker"], timeout)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def send_signal(self, signum):
+        self.signals.append(signum)
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -signal.SIGTERM
+        self.wait_raises = False
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -signal.SIGKILL
+        self.wait_raises = False
+
+
+class PoolClient:
+    def __init__(self, challenges, instances=()):
+        self.challenges = {item["id"]: copy.deepcopy(item) for item in challenges}
+        self.instances = copy.deepcopy(list(instances))
+        self.events = []
+        self.start_calls = []
+        self.stop_calls = []
+        self.submission_calls = []
+
+    def list_instances(self, challenge_id=""):
+        self.events.append(("refresh", "instances"))
+        return copy.deepcopy([
+            item for item in self.instances
+            if not challenge_id or item.get("challenge_id") == challenge_id
+        ])
+
+    def get_challenge(self, challenge_id, competition_id=""):
+        self.events.append(("refresh", "challenge"))
+        return copy.deepcopy(self.challenges[challenge_id])
+
+    def start_instance(self, challenge_id, competition_id, **kwargs):
+        self.start_calls.append((challenge_id, competition_id, kwargs))
+        raise AssertionError("the mocked parent must not start an instance")
+
+    def stop_instance(self, instance_id):
+        self.events.append(("close", instance_id))
+        self.stop_calls.append(instance_id)
+        for item in self.instances:
+            if item.get("id") == instance_id:
+                item["status"] = "stopped"
+
+    def submit_qa_answer(self, challenge_id, competition_id, question_id, answer):
+        self.events.append(("handoff", question_id))
+        self.submission_calls.append((challenge_id, question_id, answer))
+        return {"correct": True}
+
+    def submit_answer(self, instance_id, question_id, answer):
+        self.events.append(("handoff", question_id))
+        self.submission_calls.append((instance_id, question_id, answer))
+        return {"correct": True}
+
+
+class PoolTestCase(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "campaign"
+        self.complete_on_launch = False
+        self.prepare_on_launch = True
+        self.processes = {}
+        self.popen_calls = []
+        self.challenge_map = {}
+        self.make_pool()
+
+    def make_pool(self, *, capacity=2, max_workers=3, instances=(), challenges=None):
+        if challenges is None:
+            challenges = [
+                challenge(f"challenge-{number}", is_qa_only=False)
+                for number in range(1, 5)
+            ]
+        self.challenge_map = {item["id"]: item for item in challenges}
+        self.client = PoolClient(challenges, instances)
+        self.store = ctfy_campaign.CampaignStore(self.root)
+        self.store.save({
+            "schema_version": 1,
+            "competition_id": "competition-1",
+            "deadline": NOW + 3600,
+            "max_workers": max_workers,
+            "stall_minutes": 30,
+            "challenges": {},
+            "workers": {},
+            "instances": {},
+        })
+        competition = {"id": "competition-1"}
+        if capacity is not None:
+            competition["max_instances_per_team_effective"] = capacity
+        self.run_args = argparse.Namespace(
+            platform_url="https://ctfy.example", image="sapper-ctfy:test",
+            engine=None, add_host=[], max_turns=12, dispatch_timeout=300,
+            startup_timeout=300, ttl=None, prepare_only=False,
+        )
+        self.pool = ctfy_commander.WorkerPool(
+            self.store, self.client, competition, self.run_args,
+        )
+        return self.pool
+
+    def decision(self, target, action="hire", minutes=10):
+        return ctfy_commander.Decision(action, target, minutes, "test lead")
+
+    def _popen(self, argv, **kwargs):
+        target = argv[argv.index("--challenge-id") + 1]
+        attempt = Path(argv[argv.index("--attempt") + 1])
+        process = FakeProcess(1000 + len(self.popen_calls),
+                              0 if self.complete_on_launch else None)
+        self.popen_calls.append((argv, kwargs))
+        self.processes[target] = process
+        current = self.challenge_map[target]
+        matching = [
+            item for item in self.client.instances
+            if item.get("challenge_id") == target
+            and item.get("status", "ready") in {"ready", "running"}
+        ]
+        live = matching[0] if matching else None
+        if self.prepare_on_launch:
+            if current.get("is_qa_only") is True:
+                instance_id = None
+                created = False
+            else:
+                if live is None:
+                    live = instance(target, id=f"instance-{target}-{len(self.popen_calls)}")
+                    self.client.instances.append(live)
+                    created = True
+                else:
+                    created = False
+                instance_id = live["id"]
+            write_json(attempt / "prepared.json", {
+                "work_dir": str(attempt), "instance_id": instance_id,
+                "created_instance": created,
+            })
+        if self.complete_on_launch:
+            result = {
+                "schema_version": 3, "answers": {}, "solved": [],
+                "fully_solved": False, "stop_reason": "incomplete",
+            }
+            write_json(attempt / "result.json", result)
+            write_json(attempt / "handoff.json", {"submissions": []})
+            write_json(attempt / "outcome.json", {
+                "status": "completed", "work_dir": str(attempt),
+                "instance_id": None if current.get("is_qa_only") is True else live["id"],
+                "created_instance": False, "prepare_only": False,
+                "container_exit_code": 0, "result": result, "handoff": [],
+            })
+        return process
+
+    def start(self, target, *, background=True, action=None):
+        with mock.patch.object(
+                ctfy_commander.subprocess, "Popen", side_effect=self._popen):
+            return self.pool.start(
+                self.decision(target, action or ("hire" if background else "work")),
+                self.challenge_map[target], background=background,
+            )
+
+    def finish(self, target, *, result=None, handoff=None, status="completed"):
+        worker = self.store.load()["workers"][target]
+        attempt = Path(worker["attempt_dir"])
+        prepared = json.loads((attempt / "prepared.json").read_text(encoding="utf-8"))
+        write_json(attempt / "task.json", {
+            "schema_version": 3,
+            "run_mode": "qa" if self.challenge_map[target].get("is_qa_only") is True else "instance",
+            "target_instance": prepared.get("instance_id"),
+            "challenge": {"id": target}, "competition_id": "competition-1",
+            "questions": [{"id": "q1", "prompt": "question"}],
+        })
+        if result is None:
+            result = {
+                "schema_version": 3, "answers": {}, "solved": [],
+                "fully_solved": False, "stop_reason": "incomplete",
+            }
+        if handoff is None:
+            handoff = []
+        write_json(attempt / "result.json", result)
+        write_json(attempt / "handoff.json", {"submissions": handoff})
+        write_json(attempt / "outcome.json", {
+            "status": status, "work_dir": str(attempt),
+            "instance_id": prepared.get("instance_id"),
+            "created_instance": prepared.get("created_instance", False),
+            "prepare_only": False, "container_exit_code": 0,
+            "result": result, "handoff": handoff,
+        })
+        self.processes[target].returncode = 0 if status == "completed" else 1
+
+
+class PoolTests(PoolTestCase):
+    def test_pool_same_challenge_is_locked_and_distinct_hire_is_allowed(self):
+        first = self.start("challenge-1")
+        self.assertEqual(first["status"], "starting")
+        self.assertIsNone(self.processes["challenge-1"].poll())
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-1")
+        second = self.start("challenge-2")
+        self.assertEqual(second["status"], "starting")
+        self.assertEqual(len(self.popen_calls), 2)
+
+    def test_pool_duplicate_ready_instances_fail_before_launch(self):
+        self.make_pool(instances=[instance("challenge-1", id="one"),
+                                  instance("challenge-1", id="two")])
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-1")
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(self.client.start_calls, [])
+
+    def test_pool_work_waits_and_hire_fire_preserve_active_slice(self):
+        self.complete_on_launch = True
+        completed = self.start("challenge-1", background=False)
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(self.processes["challenge-1"].waits)
+
+        self.complete_on_launch = False
+        self.start("challenge-2")
+        fired = self.pool.fire("challenge-2")
+        self.assertTrue(fired["cancel_after_slice"])
+        self.assertFalse(self.processes["challenge-2"].terminated)
+        self.assertFalse(self.processes["challenge-2"].killed)
+        worker = self.store.load()["workers"]["challenge-2"]
+        self.assertTrue(worker["cancel_after_slice"])
+
+        idle = self.pool.fire("challenge-3")
+        self.assertEqual(idle["status"], "parked")
+        self.assertTrue(self.store.load()["challenges"]["challenge-3"]["parked"])
+
+    def test_pool_reap_orders_handoff_refresh_manifest_and_owned_close(self):
+        self.start("challenge-1")
+        self.pool.reap()
+        self.pool.fire("challenge-1")
+        attempt = Path(self.store.load()["workers"]["challenge-1"]["attempt_dir"])
+        result = {
+            "schema_version": 3, "answers": {"q1": "flag{attempt-only-secret}"},
+            "solved": [], "fully_solved": False, "stop_reason": "incomplete",
+        }
+        self.client.events.append(("result", "saved"))
+        self.finish("challenge-1", result=result)
+        original_save = self.store.save
+
+        def recording_save(state):
+            if state.get("workers", {}).get("challenge-1", {}).get("status") == "completed":
+                self.client.events.append(("manifest", "completed"))
+            original_save(state)
+
+        self.store.save = recording_save
+        reaped = self.pool.reap()
+
+        self.assertEqual(reaped[0]["status"], "completed")
+        names = [event[0] for event in self.client.events]
+        self.assertLess(names.index("result"), names.index("handoff"))
+        self.assertLess(names.index("handoff"), names.index("refresh", names.index("handoff")))
+        self.assertLess(names.index("refresh", names.index("handoff")), names.index("manifest"))
+        self.assertLess(names.index("manifest"), names.index("close"))
+        state = self.store.load()
+        record = state["challenges"]["challenge-1"]
+        self.assertEqual(record["work_dir"], str(attempt))
+        self.assertEqual(record["handoff_summary"]["accepted"], 1)
+        self.assertGreaterEqual(record["total_minutes"], 0)
+        self.assertNotIn("flag{attempt-only-secret}", json.dumps(state))
+        self.assertEqual(len(self.client.stop_calls), 1)
+
+    def test_pool_normal_reap_keeps_idle_instance(self):
+        self.start("challenge-1")
+        self.finish("challenge-1")
+        self.pool.reap()
+        self.assertEqual(self.client.stop_calls, [])
+
+    def test_pool_start_rejects_an_expired_campaign_budget(self):
+        state = self.store.load()
+        state["deadline"] = NOW - 1
+        self.store.save(state)
+        with mock.patch.object(ctfy_commander.time, "time", return_value=NOW):
+            with self.assertRaises(ctfy.CtfyError):
+                self.start("challenge-1")
+        self.assertEqual(self.popen_calls, [])
+
+
+class CapacityTests(PoolTestCase):
+    def test_capacity_two_permits_two_and_rejects_third_without_start_post(self):
+        self.make_pool(capacity=2, max_workers=3)
+        self.start("challenge-1")
+        self.start("challenge-2")
+        refreshes = len(self.client.events)
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-3")
+        self.assertEqual(len(self.popen_calls), 2)
+        self.assertEqual(self.client.start_calls, [])
+        self.assertEqual(len(self.client.events), refreshes + 1)
+
+    def test_capacity_missing_falls_back_to_serial_instance_work(self):
+        self.make_pool(capacity=None, max_workers=3)
+        self.start("challenge-1")
+        refreshes = len(self.client.events)
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-2")
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(len(self.client.events), refreshes + 1)
+
+    def test_capacity_worker_limit_is_enforced_before_launch(self):
+        self.make_pool(capacity=4, max_workers=1)
+        self.start("challenge-1")
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-2")
+        self.assertEqual(len(self.popen_calls), 1)
+
+    def test_capacity_platform_rejection_refreshes_without_retry(self):
+        self.start("challenge-1")
+        self.finish("challenge-1", status="failed")
+        attempt = Path(self.store.load()["workers"]["challenge-1"]["attempt_dir"])
+        outcome = json.loads((attempt / "outcome.json").read_text(encoding="utf-8"))
+        outcome["error"] = {
+            "code": "max_instances_per_team_exceeded", "message": "instance capacity",
+        }
+        write_json(attempt / "outcome.json", outcome)
+        self.pool.reap()
+        refreshes = len(self.client.events)
+        with self.assertRaises(ctfy.CtfyError):
+            self.start("challenge-2")
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(len(self.client.events), refreshes + 1)
+
+
+class RecoveryTests(PoolTestCase):
+    def seed_recovery(self, *, with_instance=True):
+        attempt = self.root / "challenge-1" / "attempt-old"
+        write_json(attempt / "task.json", {
+            "run_mode": "instance", "target_instance": "instance-challenge-1",
+            "challenge": {"id": "challenge-1"}, "competition_id": "competition-1",
+        })
+        write_json(attempt / "result.json", {
+            "schema_version": 3, "answers": {}, "solved": [],
+            "fully_solved": False, "stop_reason": "incomplete",
+        })
+        write_json(attempt / "handoff.json", {"submissions": []})
+        state = self.store.load()
+        state["challenges"]["challenge-1"] = {"work_dir": str(attempt)}
+        state["workers"]["challenge-1"] = {
+            "status": "running", "pid": 4242, "attempt_dir": str(attempt),
+            "started_at": NOW - 60, "minutes": 10, "cancel_after_slice": False,
+        }
+        self.store.save(state)
+        if with_instance:
+            self.client.instances = [instance("challenge-1")]
+        return attempt
+
+    def test_recovery_adopts_live_verified_worker_without_start_post(self):
+        attempt = self.seed_recovery()
+        write_json(attempt / "prepared.json", {
+            "work_dir": str(attempt), "instance_id": "instance-challenge-1",
+            "created_instance": True,
+        })
+        with mock.patch.object(ctfy_commander, "_pid_matches", return_value=True):
+            recovered = self.pool.recover()
+        self.assertIn("challenge-1", recovered["adopted"])
+        self.assertEqual(self.store.load()["workers"]["challenge-1"]["status"], "running")
+        self.assertFalse(self.store.load()["instances"]["instance-challenge-1"]["created_by_campaign"])
+        self.assertEqual(self.client.start_calls, [])
+
+    def test_recovery_stale_pid_uses_attempt_and_platform_without_start_post(self):
+        attempt = self.seed_recovery()
+        with mock.patch.object(ctfy_commander, "_pid_matches", return_value=False):
+            recovered = self.pool.recover()
+        self.assertIn("challenge-1", recovered["reconciled"])
+        state = self.store.load()
+        self.assertEqual(state["workers"]["challenge-1"]["status"], "interrupted")
+        self.assertEqual(state["challenges"]["challenge-1"]["work_dir"], str(attempt))
+        self.assertFalse(state["instances"]["instance-challenge-1"]["created_by_campaign"])
+        self.assertEqual(self.client.start_calls, [])
+
+    def test_pool_replacement_instance_gets_fresh_attempt_without_old_flags(self):
+        old = self.root / "challenge-1" / "instance-old"
+        write_json(old / "task.json", {
+            "run_mode": "instance", "target_instance": "instance-old",
+            "challenge": {"id": "challenge-1"}, "competition_id": "competition-1",
+        })
+        write_json(old / "result.json", {
+            "schema_version": 3, "answers": {"q1": "flag{old-dynamic-instance}"},
+        })
+        write_json(old / "handoff.json", {"submissions": [{
+            "question_id": "q1", "answer": "flag{old-dynamic-instance}",
+            "correct": None, "status": "unresolved", "transport_uncertain": True,
+        }]})
+        state = self.store.load()
+        state["challenges"]["challenge-1"] = {"work_dir": str(old)}
+        self.store.save(state)
+
+        self.start("challenge-1")
+        new = Path(self.store.load()["challenges"]["challenge-1"]["work_dir"])
+        self.assertNotEqual(new, old)
+        self.assertFalse((new / "result.json").exists())
+        self.assertFalse((new / "handoff.json").exists())
+        self.assertNotIn("flag{old-dynamic-instance}", json.dumps(self.store.load()))
+        self.assertEqual(self.client.submission_calls, [])
+
+
+class CleanupTests(PoolTestCase):
+    def seed_idle_instance(self, *, owned, unresolved=False):
+        attempt = self.root / "challenge-1" / "attempt-idle"
+        answer = "flag{unresolved-attempt-only}"
+        write_json(attempt / "task.json", {
+            "schema_version": 3, "run_mode": "instance",
+            "target_instance": "instance-challenge-1",
+            "challenge": {"id": "challenge-1"}, "competition_id": "competition-1",
+            "questions": [{"id": "q1", "prompt": "question"}],
+        })
+        write_json(attempt / "result.json", {
+            "schema_version": 3, "answers": {"q1": answer} if unresolved else {},
+            "solved": [], "fully_solved": False, "stop_reason": "incomplete",
+        })
+        write_json(attempt / "handoff.json", {"submissions": [{
+            "question_id": "q1", "answer": answer, "correct": None,
+            "status": "unresolved", "transport_uncertain": True,
+        }] if unresolved else []})
+        state = self.store.load()
+        state["challenges"]["challenge-1"] = {"work_dir": str(attempt)}
+        state["instances"]["instance-challenge-1"] = {
+            "challenge_id": "challenge-1", "created_by_campaign": owned,
+        }
+        self.store.save(state)
+        self.client.instances = [instance("challenge-1")]
+        return attempt
+
+    def test_cleanup_exit_policies_close_only_owned_and_report_preserved(self):
+        for owned in (True, False):
+            for reason in ("stop", "deadline", "interrupt", "model_error", "infra_error"):
+                with self.subTest(owned=owned, reason=reason), tempfile.TemporaryDirectory() as tmp:
+                    self.root = Path(tmp) / "campaign"
+                    self.make_pool()
+                    self.seed_idle_instance(owned=owned)
+                    result = self.pool.cleanup(reason)
+                    should_close = owned and reason in {"stop", "deadline"}
+                    self.assertEqual(bool(self.client.stop_calls), should_close)
+                    if should_close:
+                        self.assertEqual(result["closed"], ["instance-challenge-1"])
+                    else:
+                        self.assertEqual(self.client.stop_calls, [])
+                        self.assertEqual(result["preserved"], [{
+                            "id": "instance-challenge-1", "expires_at": NOW + 3600,
+                        }])
+
+    def test_cleanup_repeated_unresolved_handoff_is_not_submitted_twice(self):
+        self.seed_idle_instance(owned=True, unresolved=True)
+        first = self.pool.cleanup("stop")
+        second = self.pool.cleanup("stop")
+        self.assertEqual(self.client.submission_calls, [])
+        self.assertEqual(self.client.stop_calls, ["instance-challenge-1"])
+        self.assertEqual(second["closed"], [])
+
+    def test_cleanup_stale_ready_response_does_not_repeat_close(self):
+        self.seed_idle_instance(owned=True)
+
+        def stale_stop(instance_id):
+            self.client.events.append(("close", instance_id))
+            self.client.stop_calls.append(instance_id)
+
+        self.client.stop_instance = stale_stop
+        self.pool.cleanup("stop")
+        self.pool.cleanup("stop")
+        self.assertEqual(self.client.stop_calls, ["instance-challenge-1"])
+
+    def test_cleanup_second_interrupt_forces_bounded_worker_exit(self):
+        self.start("challenge-1")
+        process = self.processes["challenge-1"]
+        process.wait_raises = True
+        self.pool.cleanup("interrupt")
+        self.assertFalse(process.terminated)
+        self.pool.cleanup("interrupt")
+        self.assertTrue(process.terminated)
+        self.assertLessEqual(len(process.waits), 4)
+
+    def test_cleanup_active_interrupt_reports_instance_expiry(self):
+        self.start("challenge-1")
+        self.processes["challenge-1"].wait_raises = True
+        result = self.pool.cleanup("interrupt")
+        self.assertEqual(result["preserved"], [{
+            "id": "instance-challenge-1-1", "expires_at": NOW + 3600,
+        }])
+        self.assertEqual(self.client.stop_calls, [])
+
+
+class WorkerSignalTests(PoolTestCase):
+    def test_worker_signal_interrupt_cleans_docker_and_redacts_logs(self):
+        attempt = self.root / "challenge-1" / "attempt-signal"
+        write_json(attempt / "worker.json", {
+            "platform_url": "https://ctfy.example", "competition": "competition-1",
+            "challenge_id": "challenge-1", "work_dir": str(attempt),
+            "image": "sapper-ctfy:test", "engine": None, "add_host": [],
+            "minutes": 10, "max_turns": 12, "dispatch_timeout": 300,
+            "startup_timeout": 300, "ttl": None, "prepare_only": False,
+        })
+
+        def interrupted_run(args, *, client, on_event):
+            on_event("prepared", {
+                "work_dir": str(attempt), "instance_id": "instance-challenge-1",
+                "created_instance": True,
+            })
+            on_event("container", {"name": "sapper-local-test"})
+            raise KeyboardInterrupt()
+
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {
+                "CTFY_TOKEN": "token-secret", "LLM_API_KEY": "sk-proj-fakeSecret123"}), \
+                mock.patch.object(ctfy_commander.ctfy, "CtfyClient", return_value=self.client), \
+                mock.patch.object(ctfy_commander.ctfy_local, "run_challenge",
+                                  side_effect=interrupted_run), \
+                mock.patch.object(ctfy_commander.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0)) as docker, \
+                contextlib.redirect_stderr(stderr):
+            returncode = ctfy_commander.worker_main([
+                "--store", str(self.root), "--challenge-id", "challenge-1",
+                "--attempt", str(attempt),
+            ])
+
+        self.assertEqual(returncode, 130)
+        outcome = json.loads((attempt / "outcome.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["status"], "interrupted")
+        docker.assert_called_once_with(
+            ["docker", "rm", "-f", "sapper-local-test"],
+            capture_output=True, timeout=10, check=False,
+        )
+        self.assertNotIn("token-secret", stderr.getvalue())
+        self.assertNotIn("sk-proj-fakeSecret123", stderr.getvalue())
 
 
 if __name__ == "__main__":
