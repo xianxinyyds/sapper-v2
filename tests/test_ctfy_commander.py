@@ -80,7 +80,10 @@ def write_json(path, value):
 
 
 def write_fact(work_dir, fact_id, kind, created_at, *, creator="solver",
-               source_intent=None, value="not-an-answer"):
+               source_intent=None, value="not-an-answer", status=None):
+    data = {"value": value}
+    if status is not None:
+        data["status"] = status
     write_json(work_dir / ".sapper" / "facts" / f"{fact_id}.json", {
         "id": fact_id,
         "description": f"confirmed {kind}: {value}",
@@ -88,7 +91,7 @@ def write_fact(work_dir, fact_id, kind, created_at, *, creator="solver",
         "creator": creator,
         "source_intent": source_intent,
         "kind": kind,
-        "data": {"value": value},
+        "data": data,
     })
 
 
@@ -177,6 +180,61 @@ class BoardTests(unittest.TestCase):
         self.assertEqual([question["id"] for question in row["questions"]], ["q1"])
         self.assertEqual(row["gated_questions"], 1)
         self.assertEqual(row["status"], "idle")
+
+    def test_task_gates_prevent_visible_only_completion_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            write_json(work_dir / "task.json", {
+                "run_mode": "instance", "gated_questions": 1,
+            })
+            current = challenge(
+                is_qa_only=False,
+                questions=[{
+                    "id": "q1", "prompt": "one", "unlocked": True,
+                    "answered_correctly": True,
+                }],
+            )
+            live = instance(questions=[{
+                "id": "q1", "prompt": "one", "unlocked": True,
+                "answered_correctly": True,
+            }])
+            state = campaign_state()
+            state["challenges"]["challenge-1"] = {"work_dir": str(work_dir)}
+
+            row = ctfy_commander.build_board(
+                [current], [live], state, now=NOW,
+            )[0]
+
+            self.assertEqual(row["gated_questions"], 1)
+            self.assertFalse(row["my_team_fully_solved"])
+            self.assertEqual(row["status"], "idle")
+
+    def test_task_gate_clears_when_the_question_becomes_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            write_json(work_dir / "task.json", {
+                "run_mode": "instance",
+                "questions": [{"id": "q1", "prompt": "one"}],
+                "gated_questions": 1,
+            })
+            answered = [
+                {"id": "q1", "prompt": "one", "unlocked": True,
+                 "answered_correctly": True},
+                {"id": "q2", "prompt": "two", "unlocked": True,
+                 "answered_correctly": True},
+            ]
+            current = challenge(is_qa_only=False, questions=answered)
+            live = instance(questions=answered)
+            state = campaign_state()
+            state["challenges"]["challenge-1"] = {"work_dir": str(work_dir)}
+
+            row = ctfy_commander.build_board(
+                [current], [live], state, now=NOW,
+            )[0]
+
+            self.assertEqual(row["gated_questions"], 0)
+            self.assertTrue(row["my_team_fully_solved"])
+            self.assertEqual(row["status"], "solved")
 
     def test_solved_closed_and_unsupported_statuses(self):
         challenges = [
@@ -274,6 +332,36 @@ class BoardTests(unittest.TestCase):
             ctfy_commander.build_board([challenge()], [], state, now=NOW + 120)
             self.assertEqual(record["last_progress_at"], NOW - 1500)
 
+    def test_marked_and_equivalent_duplicate_facts_are_not_new_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            write_fact(work_dir, "f001", "vuln", NOW - 3000, value="same")
+            state = campaign_state()
+            state["challenges"]["challenge-1"] = {
+                "first_seen_at": NOW - 5000,
+                "last_progress_at": NOW - 3000,
+                "stalled_decisions": 3,
+                "work_dir": str(work_dir),
+            }
+            record = state["challenges"]["challenge-1"]
+
+            write_fact(
+                work_dir, "f002", "vuln", NOW - 2000,
+                value="same", status="duplicate",
+            )
+            row = ctfy_commander.build_board(
+                [challenge()], [], state, now=NOW,
+            )[0]
+            self.assertEqual(row["last_progress_at"], NOW - 3000)
+            self.assertEqual(row["stalled_decisions"], 4)
+
+            write_fact(work_dir, "f003", "vuln", NOW - 1000, value="same")
+            row = ctfy_commander.build_board(
+                [challenge()], [], state, now=NOW + 60,
+            )[0]
+            self.assertEqual(row["last_progress_at"], NOW - 3000)
+            self.assertEqual(row["stalled_decisions"], 5)
+
     def test_existing_latest_progress_never_decreases(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = Path(tmp)
@@ -316,6 +404,44 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(
             record["platform_solved_question_ids"], ["q1", "q2", "team-q3"],
         )
+
+    def test_hidden_solved_id_reappearance_is_not_a_second_progress_event(self):
+        current = challenge(questions=[
+            {"id": "q1", "answered_correctly": True, "unlocked": True},
+            {"id": "q2", "answered_correctly": True, "unlocked": True},
+        ])
+        state = campaign_state()
+        state["challenges"]["challenge-1"] = {
+            "first_seen_at": NOW - 5000,
+            "last_progress_at": NOW - 4000,
+            "platform_solved_question_ids": [],
+        }
+        record = state["challenges"]["challenge-1"]
+
+        ctfy_commander.build_board([current], [], state, now=NOW)
+        self.assertEqual(record["last_progress_at"], NOW)
+        self.assertEqual(record["platform_solved_question_ids"], ["q1", "q2"])
+
+        current["questions"] = [
+            {"id": "q1", "answered_correctly": True, "unlocked": True},
+        ]
+        row = ctfy_commander.build_board(
+            [current], [], state, now=NOW + 60,
+        )[0]
+        self.assertEqual(row["platform_solved_question_ids"], ["q1"])
+        self.assertEqual(record["platform_solved_question_ids"], ["q1", "q2"])
+        self.assertEqual(row["last_progress_at"], NOW)
+
+        current["questions"] = [
+            {"id": "q1", "answered_correctly": True, "unlocked": True},
+            {"id": "q2", "answered_correctly": True, "unlocked": True},
+        ]
+        row = ctfy_commander.build_board(
+            [current], [], state, now=NOW + 120,
+        )[0]
+        self.assertEqual(row["platform_solved_question_ids"], ["q1", "q2"])
+        self.assertEqual(record["platform_solved_question_ids"], ["q1", "q2"])
+        self.assertEqual(row["last_progress_at"], NOW)
 
     def test_stall_boundaries_decisions_and_progress_reset(self):
         current = challenge()

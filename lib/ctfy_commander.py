@@ -127,7 +127,7 @@ def _unsupported(challenge: dict, instance: dict | None, task: dict) -> str | No
 
 
 def _latest_fact_progress(work_dir: Path) -> float | None:
-    latest = None
+    progress_by_fact = {}
     facts_dir = work_dir / ".sapper" / "facts"
     try:
         paths = sorted(facts_dir.glob("*.json"))[:10000]
@@ -137,10 +137,24 @@ def _latest_fact_progress(work_dir: Path) -> float | None:
         fact = _read_object(path, limit=_FACT_LIMIT)
         if fact.get("creator") in (None, "ctfy", "system"):
             continue
+        data = fact.get("data")
+        if isinstance(data, dict) and data.get("status") == "duplicate":
+            continue
         created_at = _timestamp(fact.get("created_at"))
-        if created_at is not None and (latest is None or created_at > latest):
-            latest = created_at
-    return latest
+        if created_at is None:
+            continue
+        semantic_data = {
+            key: value for key, value in data.items()
+            if key not in {"status", "result"}
+        } if isinstance(data, dict) else data
+        identity = json.dumps(
+            [fact.get("kind"), fact.get("description"), semantic_data],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        previous = progress_by_fact.get(identity)
+        if previous is None or created_at < previous:
+            progress_by_fact[identity] = created_at
+    return max(progress_by_fact.values(), default=None)
 
 
 def _result_summary(work_dir: Path) -> dict:
@@ -199,7 +213,7 @@ def _worker_summary(worker: dict, record: dict, *, now: float) -> tuple[dict, fl
 
 
 def _platform_progress(challenge: dict, instance: dict | None,
-                       questions: list[dict]) -> tuple[list[str], list[str], bool]:
+                       questions: list[dict], *, gated_questions: int) -> tuple[list[str], list[str], bool]:
     team_ids = _strings(challenge.get("my_team_solved_question_ids"))
     platform_ids = list(team_ids)
     if challenge.get("is_qa_only") is True:
@@ -218,7 +232,8 @@ def _platform_progress(challenge: dict, instance: dict | None,
         and (question["answered_correctly"] or question["id"] in platform_ids)
         for question in questions
     )
-    if all_visible_answered and len(source_questions) >= len(challenge.get("questions", [])):
+    if all_visible_answered and gated_questions == 0 \
+            and len(source_questions) >= len(challenge.get("questions", [])):
         fully_solved = True
     return team_ids, platform_ids, fully_solved
 
@@ -251,18 +266,36 @@ def build_board(challenges: list[dict], instances: list[dict], state: dict, *,
         instance = _instance_for(challenge, instances)
         source = instance or challenge
         questions = _questions(source)
-        team_ids, platform_ids, fully_solved = _platform_progress(
-            challenge, instance, questions,
-        )
         work_dir_value = record.get("work_dir")
         work_dir = Path(work_dir_value) if isinstance(work_dir_value, str) and work_dir_value else None
         task = _read_object(work_dir / "task.json") if work_dir is not None else {}
+        task_gated_questions = task.get("gated_questions", 0)
+        if type(task_gated_questions) is not int or task_gated_questions < 0:
+            task_gated_questions = 0
+        task_questions = task.get("questions")
+        if isinstance(task_questions, list):
+            task_gated_questions = max(
+                0, len(task_questions) + task_gated_questions - len(questions),
+            )
+        gated_questions = max(
+            sum(not question["unlocked"] for question in questions),
+            len(challenge.get("questions", []))
+            - sum(question["unlocked"] for question in questions),
+            task_gated_questions,
+        )
+        team_ids, platform_ids, fully_solved = _platform_progress(
+            challenge, instance, questions, gated_questions=gated_questions,
+        )
         unsupported = _unsupported(challenge, instance, task)
 
         old_progress = _timestamp(record.get("last_progress_at"))
         fact_progress = _latest_fact_progress(work_dir) if work_dir is not None else None
-        old_platform_ids = set(_strings(record.get("platform_solved_question_ids")))
-        platform_changed = any(qid not in old_platform_ids for qid in platform_ids)
+        old_platform_ids = _strings(record.get("platform_solved_question_ids"))
+        old_platform_id_set = set(old_platform_ids)
+        new_platform_ids = [
+            qid for qid in platform_ids if qid not in old_platform_id_set
+        ]
+        platform_changed = bool(new_platform_ids)
         fact_changed = fact_progress is not None \
             and (old_progress is None or fact_progress > old_progress)
         meaningful_progress = platform_changed or fact_changed
@@ -271,7 +304,7 @@ def build_board(challenges: list[dict], instances: list[dict], state: dict, *,
             if candidate is not None and (latest_progress is None or candidate > latest_progress):
                 latest_progress = candidate
         record["last_progress_at"] = latest_progress
-        record["platform_solved_question_ids"] = platform_ids
+        record["platform_solved_question_ids"] = old_platform_ids + new_platform_ids
 
         if fully_solved:
             status = "solved"
@@ -324,11 +357,7 @@ def build_board(challenges: list[dict], instances: list[dict], state: dict, *,
             "my_team_solved_question_ids": team_ids,
             "platform_solved_question_ids": platform_ids,
             "questions": questions,
-            "gated_questions": max(
-                sum(not question["unlocked"] for question in questions),
-                len(challenge.get("questions", []))
-                - sum(question["unlocked"] for question in questions),
-            ),
+            "gated_questions": gated_questions,
             "instance_id": instance_id,
             "instance_status": instance.get("status") if instance is not None else None,
             "instance_expires_at": instance.get("expires_at") if instance is not None else None,
