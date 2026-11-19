@@ -1317,6 +1317,33 @@ class CleanupTests(PoolTestCase):
         self.assertTrue(process.terminated)
         self.assertLessEqual(len(process.waits), 4)
 
+    def test_cleanup_interrupt_forced_exit_preserves_owned_instance(self):
+        self.start("challenge-1")
+        process = self.processes["challenge-1"]
+        process.wait_raises = True
+        self.pool.cleanup("interrupt")
+        self.assertFalse(process.terminated)
+        result = self.pool.cleanup("interrupt")
+        self.assertTrue(process.terminated)
+        self.assertEqual(self.client.stop_calls, [])
+        self.assertIn({"id": "instance-challenge-1-1", "expires_at": NOW + 3600},
+                      result["preserved"])
+
+    def test_cleanup_stop_instance_failure_records_error_and_preserves(self):
+        self.seed_idle_instance(owned=True)
+
+        def failing_stop(instance_id):
+            raise ctfy.CtfyError("stop refused", transport=True)
+
+        self.client.stop_instance = failing_stop
+        result = self.pool.cleanup("stop")
+        self.assertEqual(result["closed"], [])
+        self.assertIn({"id": "instance-challenge-1", "expires_at": NOW + 3600},
+                      result["preserved"])
+        record = self.store.load()["instances"]["instance-challenge-1"]
+        self.assertTrue(record["close_requested"])
+        self.assertIn("error", record)
+
     def test_cleanup_active_interrupt_reports_instance_expiry(self):
         self.start("challenge-1")
         self.processes["challenge-1"].wait_raises = True

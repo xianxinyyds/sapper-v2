@@ -869,8 +869,17 @@ class WorkerPool:
             self.client, task, result, attempt,
         )
 
-    def _close_instance(self, instance_id):
-        self.client.stop_instance(instance_id)
+    def _close_instance(self, instance_id) -> bool:
+        try:
+            self.client.stop_instance(instance_id)
+        except (ctfy.CtfyError, OSError) as exc:
+            state = self.store.load()
+            record = state.setdefault("instances", {}).setdefault(instance_id, {
+                "created_by_campaign": True,
+            })
+            record["error"] = _error_record(exc)
+            self.store.save(state)
+            return False
         state = self.store.load()
         record = state.setdefault("instances", {}).setdefault(instance_id, {
             "created_by_campaign": True,
@@ -878,6 +887,7 @@ class WorkerPool:
         record["closed"] = True
         record["status"] = "stopped"
         self.store.save(state)
+        return True
 
     def _finalize(self, target, *, outcome=None, recovery=False, error=None):
         state = self.store.load()
@@ -972,7 +982,8 @@ class WorkerPool:
         owned = isinstance(instance_id, str) and instance_id \
             and state.get("instances", {}).get(instance_id, {}).get(
                 "created_by_campaign") is True
-        close = bool(owned and not errors and (
+        preserving = self._cleanup_reason in {"interrupt", "model_error", "infra_error"}
+        close = bool(owned and not errors and not preserving and (
             worker.get("cancel_after_slice") is True
             or self._cleanup_reason in {"stop", "deadline"}
         ))
@@ -980,8 +991,7 @@ class WorkerPool:
             state["instances"][instance_id]["close_requested"] = True
         self.store.save(state)
         closed = []
-        if close:
-            self._close_instance(instance_id)
+        if close and self._close_instance(instance_id):
             closed.append(instance_id)
         self._processes.pop(target, None)
         self._adopted.discard(target)
@@ -1149,8 +1159,8 @@ class WorkerPool:
         closed = []
         if close and not errors:
             for instance_id in candidates:
-                self._close_instance(instance_id)
-                closed.append(instance_id)
+                if self._close_instance(instance_id):
+                    closed.append(instance_id)
         return {"closed": closed, "preserved": []}
 
     @staticmethod
