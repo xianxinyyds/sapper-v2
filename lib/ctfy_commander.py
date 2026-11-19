@@ -7,7 +7,11 @@ import json
 import math
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
+
+import ctfy
+import sapper
 
 
 _ACTIVE_WORKERS = {"starting", "prepared", "running", "working", "stopping"}
@@ -403,3 +407,90 @@ def render_ctfy_board(rows: list[dict]) -> str:
         _redact(safe_rows), ensure_ascii=False, separators=(",", ":"),
         allow_nan=False,
     )
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str
+    target: str
+    minutes: int
+    note: str
+
+
+def _decision_target(rows: list[dict], target: str) -> dict:
+    matches = [row for row in rows if row.get("id") == target]
+    if len(matches) != 1:
+        raise ctfy.CtfyError(f"decision target {target!r} is not a unique board id")
+    return matches[0]
+
+
+def _target_finished(row: dict) -> bool:
+    return row.get("status") in {"solved", "closed", "unsupported"} \
+        or row.get("closed") is True \
+        or row.get("my_team_fully_solved") is True \
+        or bool(row.get("unsupported"))
+
+
+def _target_active(row: dict) -> bool:
+    worker = row.get("worker", {})
+    worker_status = worker.get("status") if isinstance(worker, dict) else None
+    return row.get("status") == "active" \
+        or row.get("worker_status", worker_status) in _ACTIVE_WORKERS
+
+
+def parse_decision(
+        payload: dict, rows: list[dict], *, now: float, deadline: float,
+        default_minutes: int = 10, max_minutes: int = 30) -> Decision:
+    """Validate one Sapper command against the authoritative CTFY board."""
+    action, target, minutes, note = sapper._parse_command_payload(payload)
+    if action in {"stop", "reject"}:
+        return Decision(action, target, minutes, note)
+
+    row = _decision_target(rows, target)
+    if _target_finished(row):
+        raise ctfy.CtfyError(f"cannot {action} finished or unsupported target {target!r}")
+    if action == "fire":
+        return Decision(action, target, 0, note)
+    if _target_active(row):
+        raise ctfy.CtfyError(f"cannot {action} already-active target {target!r}")
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if "minutes" not in data:
+        minutes = default_minutes
+    now = _number(now, float("nan"))
+    deadline = _number(deadline, float("nan"))
+    if not math.isfinite(now) or not math.isfinite(deadline):
+        raise ctfy.CtfyError("decision time and deadline must be finite")
+
+    usable_seconds = deadline - now
+    expires_at = _timestamp(row.get("instance_expires_at"))
+    if expires_at is not None:
+        usable_seconds = min(usable_seconds, expires_at - now)
+    if usable_seconds < 5 * 60:
+        raise ctfy.CtfyError(f"target {target!r} has fewer than five usable minutes")
+
+    if row.get("stalled") is True and not note.strip():
+        raise ctfy.CtfyError(f"stalled target {target!r} needs a concrete decision note")
+    minutes = max(5, min(int(minutes), int(max_minutes)))
+    minutes = min(minutes, int(usable_seconds // 60))
+    if minutes < 5:
+        raise ctfy.CtfyError("decision slice must allow at least five minutes")
+    return Decision(action, target, minutes, note)
+
+
+def request_decision(
+        rows: list[dict], *, deadline: float, model: str, timeout: int,
+        template: Path, now: float) -> Decision:
+    """Ask the commander model for one decision; never invent a fallback target."""
+    prompt = Path(template).read_text(encoding="utf-8")
+    remaining_minutes = max(0.0, (deadline - now) / 60)
+    prompt = prompt.replace(
+        "{time_budget}",
+        f"{remaining_minutes:.1f} minutes remain; deadline is Unix {deadline:.3f}.",
+    ).replace("{board}", render_ctfy_board(rows))
+    envelope = sapper.run_claude(
+        prompt, model=model, timeout=timeout, skip_permissions=False,
+        append_system=None, cwd=Path.cwd(),
+    )
+    payload = sapper.extract_json_object(envelope.get("result", ""))
+    return parse_decision(payload, rows, now=now, deadline=deadline)

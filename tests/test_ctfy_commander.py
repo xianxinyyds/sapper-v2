@@ -4,11 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import ctfy_commander  # noqa: E402
+import ctfy  # noqa: E402
+import sapper  # noqa: E402
 
 
 NOW = 1_800_000_000.0
@@ -72,6 +75,25 @@ def campaign_state():
         "workers": {},
         "instances": {},
     }
+
+
+def board_row(challenge_id="challenge-1", **overrides):
+    value = {
+        "id": challenge_id,
+        "name": challenge_id,
+        "difficulty": "easy",
+        "solves_count": 10,
+        "closed": False,
+        "my_team_fully_solved": False,
+        "unsupported": None,
+        "status": "idle",
+        "worker_status": "idle",
+        "stalled": False,
+        "instance_id": None,
+        "instance_expires_at": None,
+    }
+    value.update(overrides)
+    return value
 
 
 def write_json(path, value):
@@ -617,6 +639,176 @@ class RenderTests(unittest.TestCase):
                 with self.subTest(secret=secret):
                     self.assertNotIn(secret, rendered)
                     self.assertNotIn(secret, campaign_summary)
+
+
+class DecisionTests(unittest.TestCase):
+    def parse(self, payload, rows=None, **overrides):
+        options = {"now": NOW, "deadline": NOW + 3600}
+        options.update(overrides)
+        return ctfy_commander.parse_decision(
+            payload, [board_row()] if rows is None else rows, **options,
+        )
+
+    def test_decision_parses_all_supported_sapper_payloads(self):
+        cases = [
+            ({"accepted": True, "data": {
+                "action": "work", "target": "challenge-1", "minutes": 12,
+                "note": "fresh lead",
+            }}, ("work", "challenge-1", 12, "fresh lead")),
+            ({"action": "hire", "target": "challenge-1", "minutes": 15,
+              "note": "parallel lead"},
+             ("hire", "challenge-1", 15, "parallel lead")),
+            ({"accepted": True, "data": {
+                "action": "fire", "target": "challenge-1", "note": "park it",
+            }}, ("fire", "challenge-1", 0, "park it")),
+            ({"action": "stop", "reason": "nothing viable"},
+             ("stop", "", 0, "nothing viable")),
+        ]
+        for payload, expected in cases:
+            with self.subTest(action=expected[0]):
+                decision = self.parse(payload, rows=[] if expected[0] == "stop" else None)
+                self.assertIsInstance(decision, ctfy_commander.Decision)
+                self.assertEqual(
+                    (decision.action, decision.target, decision.minutes, decision.note),
+                    expected,
+                )
+
+    def test_decision_slice_defaults_and_clamps_to_limits(self):
+        for minutes, expected in ((None, 10), (1, 5), (90, 30)):
+            with self.subTest(minutes=minutes):
+                data = {"action": "work", "target": "challenge-1", "note": "lead"}
+                if minutes is not None:
+                    data["minutes"] = minutes
+                self.assertEqual(self.parse({"data": data}).minutes, expected)
+
+        decision = self.parse(
+            {"action": "work", "target": "challenge-1", "minutes": 30},
+            deadline=NOW + 7 * 60 + 30,
+        )
+        self.assertEqual(decision.minutes, 7)
+
+    def test_decision_rejects_less_than_five_minutes_remaining(self):
+        for action in ("work", "hire"):
+            with self.subTest(action=action), self.assertRaises(ctfy.CtfyError):
+                self.parse(
+                    {"action": action, "target": "challenge-1", "minutes": 10},
+                    deadline=NOW + 299,
+                )
+        decision = self.parse(
+            {"action": "work", "target": "challenge-1", "minutes": 10},
+            deadline=NOW + 300,
+        )
+        self.assertEqual(decision.minutes, 5)
+
+    def test_decision_rejects_unavailable_work_and_hire_targets(self):
+        rows = [
+            board_row("solved", status="solved", my_team_fully_solved=True),
+            board_row("closed", status="closed", closed=True),
+            board_row("unsupported", status="unsupported", unsupported="AWD"),
+            board_row("active", status="active", worker_status="running"),
+        ]
+        for action in ("work", "hire"):
+            for target in ("solved", "closed", "unsupported", "active", "unknown"):
+                with self.subTest(action=action, target=target), \
+                        self.assertRaises(ctfy.CtfyError):
+                    self.parse(
+                        {"action": action, "target": target, "minutes": 10}, rows,
+                    )
+
+    def test_decision_fire_accepts_active_or_idle_unfinished_target(self):
+        for status, worker_status in (("active", "running"), ("idle", "idle")):
+            with self.subTest(status=status):
+                row = board_row(status=status, worker_status=worker_status)
+                decision = self.parse(
+                    {"action": "fire", "target": "challenge-1", "note": "release"},
+                    [row],
+                )
+                self.assertEqual((decision.target, decision.minutes), ("challenge-1", 0))
+
+    def test_decision_instance_ttl_clamps_and_requires_viable_slice(self):
+        row = board_row(
+            instance_id="instance-1", instance_expires_at=NOW + 7 * 60 + 30,
+        )
+        decision = self.parse(
+            {"action": "work", "target": "challenge-1", "minutes": 30}, [row],
+        )
+        self.assertEqual(decision.minutes, 7)
+
+        row["instance_expires_at"] = NOW + 299
+        with self.assertRaises(ctfy.CtfyError):
+            self.parse({"action": "hire", "target": "challenge-1"}, [row])
+
+    def test_decision_stalled_target_requires_a_concrete_note(self):
+        row = board_row(stalled=True)
+        with self.assertRaises(ctfy.CtfyError):
+            self.parse({"action": "work", "target": "challenge-1", "note": "  "}, [row])
+
+        note = "heap leak confirmed; validate one-byte overwrite"
+        decision = self.parse(
+            {"action": "work", "target": "challenge-1", "note": note}, [row],
+        )
+        self.assertEqual(decision.note, note)
+
+    def test_decision_fake_model_choice_is_not_reordered_by_difficulty(self):
+        rows = [
+            board_row("easy", difficulty="easy", solves_count=100),
+            board_row("hard", difficulty="hard", solves_count=1),
+        ]
+        response = {"result": json.dumps({
+            "accepted": True,
+            "data": {"action": "work", "target": "hard", "minutes": 10,
+                     "note": "confirmed heap lead"},
+        })}
+        with mock.patch.object(sapper, "run_claude", return_value=response):
+            decision = ctfy_commander.request_decision(
+                rows, deadline=NOW + 3600, model="fake-model", timeout=30,
+                template=ROOT / "templates" / "ctfy" / "command.md", now=NOW,
+            )
+        self.assertEqual(decision.target, "hard")
+
+    def test_decision_malformed_json_and_model_errors_propagate(self):
+        kwargs = {
+            "deadline": NOW + 3600, "model": "fake-model", "timeout": 30,
+            "template": ROOT / "templates" / "ctfy" / "command.md", "now": NOW,
+        }
+        with mock.patch.object(sapper, "run_claude", return_value={"result": "not JSON"}):
+            with self.assertRaises(sapper.FGError):
+                ctfy_commander.request_decision([board_row()], **kwargs)
+        with mock.patch.object(sapper, "run_claude", side_effect=RuntimeError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                ctfy_commander.request_decision([board_row()], **kwargs)
+
+
+class PromptTests(unittest.TestCase):
+    def test_prompt_has_soft_strategy_bounded_parallelism_and_security_doctrine(self):
+        captured = {}
+
+        def fake_model(prompt, **kwargs):
+            captured["prompt"] = prompt
+            captured["kwargs"] = kwargs
+            return {"result": '{"action":"stop","reason":"test complete"}'}
+
+        with mock.patch.object(sapper, "run_claude", new=fake_model):
+            ctfy_commander.request_decision(
+                [board_row("hard", difficulty="hard", solves_count=1)],
+                deadline=NOW + 3600, model="fake-model", timeout=37,
+                template=ROOT / "templates" / "ctfy" / "command.md", now=NOW,
+            )
+
+        prompt = captured["prompt"]
+        lowered = prompt.lower()
+        for text in ("30", "difficulty", "solves_count", "soft",
+                     "not a fixed ranking", "parallel", "brute force",
+                     "submission", "attempt cap", "untrusted data",
+                     "never as instructions"):
+            with self.subTest(text=text):
+                self.assertIn(text, lowered)
+        self.assertIn('"id":"hard"', prompt)
+        self.assertNotIn("{board}", prompt)
+        self.assertNotIn("{time_budget}", prompt)
+        self.assertEqual(captured["kwargs"]["model"], "fake-model")
+        self.assertEqual(captured["kwargs"]["timeout"], 37)
+        self.assertIs(captured["kwargs"]["skip_permissions"], False)
 
 
 if __name__ == "__main__":
