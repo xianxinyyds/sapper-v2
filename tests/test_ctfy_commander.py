@@ -1454,10 +1454,9 @@ class SelectCompetitionTests(unittest.TestCase):
         selected = ctfy_commander.select_competition([self.competition()])
         self.assertEqual(selected["id"], "competition-1")
 
-    def test_select_competition_filters_non_running_unregistered_empty(self):
+    def test_select_competition_filters_non_running_and_empty_challenges(self):
         competitions = [
             self.competition("upcoming", phase="upcoming"),
-            self.competition("unregistered", is_registered=False),
             self.competition("empty", challenge_count=0),
             self.competition("missing-count", challenge_count=None),
             self.competition("nonnumeric", challenge_count="three"),
@@ -1467,7 +1466,7 @@ class SelectCompetitionTests(unittest.TestCase):
         with self.assertRaises(ctfy.CtfyError):
             ctfy_commander.select_competition([])
 
-    def test_select_competition_multiple_candidates_need_explicit_id(self):
+    def test_select_competition_multiple_registered_need_explicit_id(self):
         competitions = [self.competition("a"), self.competition("b")]
         with self.assertRaises(ctfy.CtfyError):
             ctfy_commander.select_competition(competitions)
@@ -1483,6 +1482,40 @@ class SelectCompetitionTests(unittest.TestCase):
             ctfy_commander.select_competition(competitions, "upcoming")
         with self.assertRaises(ctfy.CtfyError):
             ctfy_commander.select_competition(competitions, "missing")
+
+    def test_select_competition_explicit_accepts_unregistered_running(self):
+        selected = ctfy_commander.select_competition(
+            [self.competition("qualifier", is_registered=False)], "qualifier")
+        self.assertEqual(selected["id"], "qualifier")
+
+    def test_select_competition_explicit_id_among_unregistered_eligible(self):
+        competitions = [
+            self.competition("a", is_registered=False),
+            self.competition("b", is_registered=False),
+        ]
+        selected = ctfy_commander.select_competition(competitions, "b")
+        self.assertEqual(selected["id"], "b")
+
+    def test_select_competition_auto_prefers_registered(self):
+        competitions = [
+            self.competition("a", is_registered=False),
+            self.competition("b", is_registered=True),
+        ]
+        selected = ctfy_commander.select_competition(competitions)
+        self.assertEqual(selected["id"], "b")
+
+    def test_select_competition_auto_accepts_single_unregistered_eligible(self):
+        selected = ctfy_commander.select_competition(
+            [self.competition("qualifier", is_registered=False)])
+        self.assertEqual(selected["id"], "qualifier")
+
+    def test_select_competition_auto_multiple_unregistered_errors(self):
+        competitions = [
+            self.competition("a", is_registered=False),
+            self.competition("b", is_registered=False),
+        ]
+        with self.assertRaisesRegex(ctfy.CtfyError, "a"):
+            ctfy_commander.select_competition(competitions)
 
 
 class FakePool:

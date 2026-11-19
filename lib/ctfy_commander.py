@@ -60,47 +60,55 @@ _DECISION_RESULT_FIELDS = (
 
 
 def select_competition(competitions: list[dict], competition_id: str = "") -> dict:
-    """Choose the one running, registered competition with visible challenges."""
+    """Choose the one running competition with visible challenges.
+
+    ``is_registered`` only prefers a candidate during auto-selection; an
+    explicit competition id accepts any uniquely eligible competition.
+    """
     if not isinstance(competitions, list):
         raise ctfy.CtfyError("competition list must be a list")
-    candidates = []
+    eligible = []
     for competition in competitions:
         if not isinstance(competition, dict):
             continue
         if competition.get("phase") != "running":
             continue
-        if competition.get("is_registered") is not True:
-            continue
         challenge_count = competition.get("challenge_count")
         if type(challenge_count) is not int or isinstance(challenge_count, bool) \
                 or challenge_count <= 0:
             continue
-        candidates.append(competition)
+        eligible.append(competition)
     if competition_id:
         competition_id = ctfy.require_id(competition_id, "competition_id")
         matches = [
-            competition for competition in candidates
+            competition for competition in eligible
             if competition.get("id") == competition_id
         ]
         if len(matches) != 1:
             raise ctfy.CtfyError(
-                f"competition {competition_id!r} is not a unique running, "
-                "registered competition with visible challenges"
+                f"competition {competition_id!r} is not a unique running "
+                "competition with visible challenges"
             )
         return matches[0]
-    if len(candidates) != 1:
-        names = ", ".join(
-            f"{competition.get('id', '')} "
-            f"({competition.get('title') or competition.get('name', '')})"
-            for competition in candidates
-        )
-        raise ctfy.CtfyError(
-            f"expected exactly one running registered competition with visible "
-            f"challenges, found {len(candidates)}"
-            + (f": {names}" if names else "")
-            + ("; pass --competition to choose one" if candidates else "")
-        )
-    return candidates[0]
+    registered = [
+        competition for competition in eligible
+        if competition.get("is_registered") is True
+    ]
+    if len(registered) == 1:
+        return registered[0]
+    if len(eligible) == 1:
+        return eligible[0]
+    names = ", ".join(
+        f"{competition.get('id', '')} "
+        f"({competition.get('title') or competition.get('name', '')})"
+        for competition in eligible
+    )
+    raise ctfy.CtfyError(
+        f"expected exactly one running registered competition with visible "
+        f"challenges, found {len(eligible)}"
+        + (f": {names}" if names else "")
+        + ("; pass --competition to choose one" if eligible else "")
+    )
 
 
 def _number(value, default=0.0):
