@@ -7,6 +7,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -75,6 +76,44 @@ def make_campaign(
     }
 
 
+_SENSITIVE_KEY_MARKERS = (
+    "token", "apikey", "password", "passwd", "privatekey", "credential",
+    "secret", "answer", "modelkey", "llmkey", "accesskey", "authorization",
+    "cookie",
+)
+_SECRET_VALUE_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:flag|ctfy?)\{[^{}\r\n]*\}"
+    r"|-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----"
+    r"|(?<![A-Za-z0-9])(?:"
+    r"sk-|sk_(?:live|test)_|rk_(?:live|test)_|gh[pousr]_|github_pat_|"
+    r"glpat-|xox[baprs]-|AIza|AKIA|ASIA|hf_"
+    r")[A-Za-z0-9_+=/-]{4,}"
+    r"|(?<![A-Za-z0-9])Bearer\s+[A-Za-z0-9._~+/-]{4,}={0,2}"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _require_safe_record(value: object, label: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if any(marker in normalized for marker in _SENSITIVE_KEY_MARKERS):
+                raise ctfy.CtfyError(f"{label} contains a sensitive field")
+            _require_safe_record(item, label)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _require_safe_record(item, label)
+    elif isinstance(value, str):
+        if _SECRET_VALUE_PATTERN.search(value):
+            raise ctfy.CtfyError(f"{label} contains a secret or answer value")
+        for name in ("CTFY_TOKEN", "LLM_API_KEY"):
+            secret = os.environ.get(name)
+            if secret and secret in value:
+                raise ctfy.CtfyError(f"{label} contains an environment secret")
+
+
 @contextmanager
 def _file_lock(path: Path, *, blocking: bool, label: str):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +152,7 @@ class CampaignStore:
         return state
 
     def save(self, state: dict) -> None:
+        _require_safe_record(state, "campaign state")
         path = self.root / "campaign.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -132,6 +172,7 @@ class CampaignStore:
                 temporary.unlink(missing_ok=True)
 
     def append_decision(self, record: dict) -> None:
+        _require_safe_record(record, "decision record")
         self.root.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(record, ensure_ascii=False)
         with (self.root / "decisions.jsonl").open("a", encoding="utf-8") as fh:

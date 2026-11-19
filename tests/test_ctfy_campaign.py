@@ -99,6 +99,18 @@ class CampaignStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _assert_rejected_without_persisting(
+            self, method_name, record, root, filename):
+        store = ctfy_campaign.CampaignStore(root)
+        root.mkdir(parents=True)
+        destination = root / filename
+        destination.write_text("original\n", encoding="utf-8")
+
+        with self.assertRaises(ctfy.CtfyError):
+            getattr(store, method_name)(record)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "original\n")
+        self.assertEqual(list(root.glob(".*.tmp")), [])
+
     def test_save_and_reopen_preserve_the_original_deadline_atomically(self):
         self.assertEqual(self.store.load(), {})
         state = ctfy_campaign.make_campaign(
@@ -185,6 +197,74 @@ class CampaignStoreTests(unittest.TestCase):
         for content in contents:
             for secret in values.values():
                 self.assertNotIn(secret, content)
+
+    def test_write_boundaries_reject_nested_sensitive_keys(self):
+        payloads = {
+            "token": {"token": "token-secret-value"},
+            "api-key": {"LLM_API_KEY": "llm-secret-value"},
+            "password": {"password": "password-secret-value"},
+            "private-key": {"private_key": "private-key-secret-value"},
+            "credentials": {
+                "credentials": {"username": "user", "password": "secret"},
+            },
+            "answer": {"answer": "flag{answer-secret-value}"},
+            "answers": {
+                "answers": {"question-1": "flag{answers-secret-value}"},
+            },
+        }
+        writers = (
+            ("save", "campaign.json"),
+            ("append_decision", "decisions.jsonl"),
+        )
+        for method_name, filename in writers:
+            for label, payload in payloads.items():
+                record = {"outer": [{"inner": payload}]}
+                with self.subTest(method=method_name, kind=label):
+                    self._assert_rejected_without_persisting(
+                        method_name, record,
+                        self.root / method_name / label, filename,
+                    )
+
+    def test_write_boundaries_reject_secret_formats_in_free_text(self):
+        values = {
+            "flag": "found flag{free-text-secret} in a note",
+            "openai": "key sk-proj-fakeSecret123 must not persist",
+            "github": "key ghp_fakeSecret123 must not persist",
+            "slack": "key xoxb-fakeSecret123 must not persist",
+            "aws": "key AKIAFAKESECRET123 must not persist",
+            "private-key": "-----BEGIN PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----",
+        }
+        writers = (
+            ("save", "campaign.json"),
+            ("append_decision", "decisions.jsonl"),
+        )
+        for method_name, filename in writers:
+            for label, value in values.items():
+                record = {"action": "work", "result": {"note": value}}
+                with self.subTest(method=method_name, kind=label):
+                    self._assert_rejected_without_persisting(
+                        method_name, record,
+                        self.root / method_name / label, filename,
+                    )
+
+    def test_write_boundaries_reject_current_environment_secret_values(self):
+        values = {
+            "CTFY_TOKEN": "current-ctfy-environment-secret",
+            "LLM_API_KEY": "current-llm-environment-secret",
+        }
+        writers = (
+            ("save", "campaign.json"),
+            ("append_decision", "decisions.jsonl"),
+        )
+        with mock.patch.dict(os.environ, values):
+            for method_name, filename in writers:
+                for label, secret in values.items():
+                    record = {"note": f"prefix {secret} suffix"}
+                    with self.subTest(method=method_name, kind=label):
+                        self._assert_rejected_without_persisting(
+                            method_name, record,
+                            self.root / method_name / label, filename,
+                        )
 
 
 if __name__ == "__main__":
