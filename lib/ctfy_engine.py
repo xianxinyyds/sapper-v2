@@ -43,7 +43,7 @@ def configure_model(environ: MutableMapping[str, str] | None = None) -> str:
             env.pop("ANTHROPIC_BASE_URL", None)
         for slot in _ANTHROPIC_MODEL_SLOTS:
             env[slot] = model
-        env["SAPPER_BIN"] = "claude"
+        env["SAPPER_BIN"] = env.get("SAPPER_BIN") or "claude"
     else:
         env["OPENAI_API_KEY"] = key
         env["OPENAI_MODEL"] = model

@@ -166,11 +166,23 @@ def run(work_dir: Path) -> int:
     try:
         client = ctfy.CtfyClient.from_env()
         competition_id = task.get("competition_id", "") if task["run_mode"] == "qa" else ""
-        challenge = client.get_challenge(
-            task["challenge"]["id"], competition_id=competition_id,
-        )
-        progress = challenge
-        if task["run_mode"] == "instance":
+        challenge = None
+        progress = None
+        try:
+            challenge = client.get_challenge(
+                task["challenge"]["id"], competition_id=competition_id,
+            )
+        except ctfy.CtfyError as exc:
+            if exc.code != "go_unsupported_feature":
+                raise
+            progress = client.get_instance(
+                task["target_instance"], retry=True, require_questions=True,
+            )
+            challenge = dict(progress)
+            challenge["close_at"] = datetime.fromtimestamp(
+                progress["expires_at"],
+            ).isoformat()
+        if task["run_mode"] == "instance" and progress is None:
             progress = client.get_instance(
                 task["target_instance"], retry=True, require_questions=True,
             )

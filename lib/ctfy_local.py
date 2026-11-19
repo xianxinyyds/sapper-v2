@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import ctfy
 _FORWARDED_ENV = (
     "CTFY_TOKEN", "LLM_FLAVOR", "LLM_API_KEY", "LLM_MODEL", "LLM_BASE_URL",
     "SAPPER_MAX_STEPS", "SAPPER_MAX_EXPLORE", "SAPPER_TIMEOUT", "SAPPER_RETRY_MODEL",
+    "SAPPER_BIN",
 )
 
 
@@ -199,6 +202,10 @@ def _docker_command(args, work_dir: Path) -> list[str]:
     command = [
         "docker", "run", "--rm", "--name", name,
         "--mount", f"type=bind,src={work_dir.resolve()},dst=/ctfy/work",
+        "--mount", (
+            f"type=bind,src={Path(__file__).resolve().parent},"
+            "dst=/opt/sapper/lib,readonly"
+        ),
         "--env", "CTFY_WORK_DIR=/ctfy/work",
         "--env", "CTFY_PLATFORM_URL",
         "--env", "CTFY_EVAL_MAX_TURNS",
@@ -207,6 +214,8 @@ def _docker_command(args, work_dir: Path) -> list[str]:
     ]
     for variable in _FORWARDED_ENV:
         command += ["--env", variable]
+    for mapping in args.add_host:
+        command += ["--add-host", mapping]
     command.append(args.image)
     return command
 
@@ -216,11 +225,31 @@ def submit_handed_off_answers(client: ctfy.CtfyClient, task: dict,
     answers = result.get("answers")
     if not isinstance(answers, dict) or not answers:
         return []
-    outcomes = []
+    handoff_path = work_dir / "handoff.json"
+    try:
+        previous = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        previous = {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ctfy.CtfyError(f"cannot read previous answer handoff: {exc}") from exc
+    if not isinstance(previous, dict) or not isinstance(previous.get("submissions", []), list):
+        raise ctfy.CtfyError("previous answer handoff has an unsupported schema")
+    outcomes = previous.get("submissions", [])
+    if not all(isinstance(outcome, dict) for outcome in outcomes):
+        raise ctfy.CtfyError("previous answer handoff submissions must be objects")
+    seen = {
+        (outcome.get("question_id"), outcome.get("answer")) for outcome in outcomes
+        if isinstance(outcome.get("question_id"), str)
+        and isinstance(outcome.get("answer"), str)
+    }
     for question_id, answer in answers.items():
         if not isinstance(question_id, str) or not isinstance(answer, str):
             outcomes.append({"question_id": str(question_id), "error": "invalid answer shape"})
             continue
+        candidate = (question_id, answer)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             if task["run_mode"] == "qa":
                 response = client.submit_qa_answer(
@@ -229,44 +258,93 @@ def submit_handed_off_answers(client: ctfy.CtfyClient, task: dict,
             else:
                 response = client.submit_answer(task["target_instance"], question_id, answer)
             outcomes.append({
-                "question_id": question_id, "correct": response["correct"], "response": response,
+                "question_id": question_id, "answer": answer,
+                "correct": response["correct"], "response": response,
             })
         except ctfy.CtfyError as exc:
-            outcomes.append({"question_id": question_id, "error": str(exc)})
-    _write_json(work_dir / "handoff.json", {"submissions": outcomes})
+            outcomes.append({
+                "question_id": question_id, "answer": answer, "correct": None,
+                "status": "unresolved" if exc.transport else "submission_failed",
+                "transport_uncertain": exc.transport, "error": str(exc),
+            })
+    _write_json(handoff_path, {"submissions": outcomes})
     return outcomes
 
 
-def run_local(args) -> int:
-    client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
-    challenge = client.get_challenge(args.challenge_id, competition_id=args.competition)
+def get_challenge_for_run(client: ctfy.CtfyClient, challenge_id: str,
+                          competition_id: str) -> dict:
+    challenge_id = ctfy.require_id(challenge_id, "challenge_id")
+    competition_id = ctfy.require_id(competition_id, "competition_id")
+    try:
+        return client.get_challenge(challenge_id, competition_id=competition_id)
+    except ctfy.CtfyError as exc:
+        if exc.code != "go_unsupported_feature":
+            raise
+    matches = [
+        item for item in client.list_challenges(competition_id)
+        if item.get("id") == challenge_id
+    ]
+    if len(matches) != 1:
+        raise ctfy.CtfyError(
+            f"challenge {challenge_id} was not found exactly once in {competition_id}"
+        )
+    return matches[0]
+
+
+def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = None,
+                  challenge: dict | None = None,
+                  on_event: Callable[[str, dict], None] | None = None) -> dict:
+    challenge_id = ctfy.require_id(args.challenge_id, "challenge_id")
+    competition_id = ctfy.require_id(args.competition, "competition_id")
+    if client is None:
+        client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
+    if challenge is None:
+        challenge = get_challenge_for_run(client, challenge_id, competition_id)
     instance = None
     pending_instance_id = None
+    created_instance = False
     try:
         if challenge.get("is_qa_only") is not True:
-            instance = _find_instance(client, args.challenge_id, args.competition)
+            instance = _find_instance(client, challenge_id, competition_id)
             if instance is None:
                 def track_instance(instance_id):
                     nonlocal pending_instance_id
-                    pending_instance_id = instance_id
+                    pending_instance_id = ctfy.require_id(instance_id, "instance_id")
 
                 instance = client.start_instance(
-                    args.challenge_id, args.competition, ttl=args.ttl,
+                    challenge_id, competition_id, ttl=args.ttl,
                     timeout=args.startup_timeout, on_created=track_instance,
                 )
                 pending_instance_id = None
+                created_instance = True
+            ctfy.require_id(instance.get("id"), "instance_id")
         task = build_task(
-            challenge, instance, args.competition, args.platform_url, args.max_turns,
+            challenge, instance, competition_id, args.platform_url, args.max_turns,
         )
-        work_dir = args.work_dir or Path.cwd() / "runs" / args.competition \
-            / args.challenge_id / (instance["id"] if instance else "qa")
+        work_dir = args.work_dir or Path.cwd() / "runs" / competition_id \
+            / challenge_id / (instance["id"] if instance else "qa")
         prepare_work_dir(client, work_dir, task)
-        if args.prepare_only:
-            print(json.dumps({
+        engine = args.engine
+        if engine is not None:
+            try:
+                shutil.copy2(engine, work_dir / ".ctfy-engine")
+                (work_dir / ".ctfy-engine").chmod(
+                    (work_dir / ".ctfy-engine").stat().st_mode | 0o111
+                )
+            except OSError as exc:
+                raise ctfy.CtfyError(f"cannot prepare custom engine: {exc}") from exc
+        outcome = {
+            "work_dir": str(work_dir), "instance_id": task["target_instance"],
+            "created_instance": created_instance, "prepare_only": args.prepare_only,
+            "container_exit_code": None, "result": None, "handoff": [],
+        }
+        if on_event is not None:
+            on_event("prepared", {
                 "work_dir": str(work_dir), "instance_id": task["target_instance"],
-                "prepare_only": True,
-            }, ensure_ascii=False))
-            return 0
+                "created_instance": created_instance,
+            })
+        if args.prepare_only:
+            return outcome
         result_path = work_dir / "result.json"
         try:
             if result_path.exists() or result_path.is_symlink():
@@ -280,13 +358,17 @@ def run_local(args) -> int:
             "SAPPER_ROUND_MINUTES": str(args.minutes),
             "CTFY_DISPATCH_TIMEOUT": str(args.dispatch_timeout),
         })
+        if engine is not None:
+            env["SAPPER_BIN"] = "/ctfy/work/.ctfy-engine"
         command = _docker_command(args, work_dir)
+        container_name = command[command.index("--name") + 1]
+        if on_event is not None:
+            on_event("container", {"name": container_name})
         try:
             completed = subprocess.run(
                 command, env=env, timeout=args.minutes * 60 + 30,
             )
         except BaseException:
-            container_name = command[command.index("--name") + 1]
             try:
                 subprocess.run(
                     ["docker", "rm", "-f", container_name],
@@ -302,12 +384,10 @@ def run_local(args) -> int:
         if not isinstance(result, dict) or result.get("schema_version") != 3:
             raise ctfy.CtfyError("container result.json has an unsupported schema")
         handoff = submit_handed_off_answers(client, task, result, work_dir)
-        print(json.dumps({
-            "work_dir": str(work_dir), "instance_id": task["target_instance"],
-            "container_exit_code": completed.returncode, "result": result,
-            "handoff": handoff,
-        }, ensure_ascii=False))
-        return completed.returncode
+        outcome.update({
+            "container_exit_code": completed.returncode, "result": result, "handoff": handoff,
+        })
+        return outcome
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_id = instance.get("id") if instance else pending_instance_id
@@ -318,6 +398,13 @@ def run_local(args) -> int:
                 if not active_error:
                     raise
                 sys.stderr.write(f"ctfy-local: instance cleanup failed: {exc}\n")
+
+
+def run_local(args) -> int:
+    client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
+    outcome = run_challenge(args, client=client)
+    print(json.dumps(outcome, ensure_ascii=False))
+    return outcome["container_exit_code"] if outcome["container_exit_code"] is not None else 0
 
 
 def _list_challenges(args) -> int:
@@ -367,6 +454,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--competition", required=True)
     run.add_argument("--work-dir", type=Path)
     run.add_argument("--image", default="sapper-ctfy:local-test")
+    run.add_argument("--engine", type=Path)
+    run.add_argument("--add-host", action="append", default=[], metavar="HOST:IP")
     run.add_argument("--minutes", type=_positive, default=165)
     run.add_argument("--max-turns", type=_positive, default=12)
     run.add_argument("--dispatch-timeout", type=_positive, default=300)

@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -217,6 +218,39 @@ class CtfyRunTests(unittest.TestCase):
         result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["answers"], {})
         self.assertEqual(result["stop_reason"], "incomplete")
+
+    def test_go_unsupported_feature_falls_back_to_instance_state(self):
+        self.client.get_challenge.side_effect = ctfy_run.ctfy.CtfyError(
+            "catalog unsupported", code="go_unsupported_feature",
+        )
+        self.client.get_instance.return_value = instance_payload(
+            name="Engagement reverse", category="reverse", expires_at=int(time.time()) + 600,
+        )
+
+        rc, _, _, auto = self.run_with_mocks()
+
+        self.assertEqual(rc, 0)
+        auto.assert_called_once()
+        self.client.get_instance.assert_called_once_with(
+            "instance-1", retry=True, require_questions=True,
+        )
+        argv = auto.call_args.args[0]
+        actual = datetime.fromisoformat(argv[argv.index("--deadline") + 1]).timestamp()
+        self.assertAlmostEqual(actual, self.client.get_instance.return_value["expires_at"], delta=5)
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["stop_reason"], "incomplete")
+
+    def test_other_challenge_errors_do_not_fall_back(self):
+        self.client.get_challenge.side_effect = ctfy_run.ctfy.CtfyError(
+            "missing", code="challenge_not_found",
+        )
+
+        rc, _, _, auto = self.run_with_mocks()
+
+        self.assertNotEqual(rc, 0)
+        auto.assert_not_called()
+        result = json.loads((self.work / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["stop_reason"], "config_error")
 
     def test_default_steps_and_auto_failure_still_write_result(self):
         self.task["max_turns"] = None

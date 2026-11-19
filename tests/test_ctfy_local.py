@@ -167,13 +167,14 @@ class CtfyLocalTaskTests(unittest.TestCase):
                     "competition-1", "http://platform", 3,
                 )
                 client = FakeClient()
+                mode_work = self.work / mode
                 outcomes = ctfy_local.submit_handed_off_answers(
-                    client, task, {"answers": {"flag": "candidate"}}, self.work,
+                    client, task, {"answers": {"flag": "candidate"}}, mode_work,
                 )
                 self.assertEqual(outcomes[0]["correct"], True)
                 kinds = [event[0] for event in client.events]
                 self.assertEqual(kinds, ["qa-submit" if mode == "qa" else "submit"])
-                self.assertTrue((self.work / "handoff.json").is_file())
+                self.assertTrue((mode_work / "handoff.json").is_file())
 
 
 class CtfyLocalRunTests(unittest.TestCase):
@@ -303,6 +304,223 @@ class CtfyLocalRunTests(unittest.TestCase):
                 container.assert_not_called()
                 self.assertNotIn("start", [event[0] for event in client.events])
                 self.assertNotIn("stop", [event[0] for event in client.events])
+
+    def test_fallback_selects_exact_listed_challenge_for_unsupported_catalog(self):
+        client = mock.Mock()
+        client.get_challenge.side_effect = ctfy.CtfyError(
+            "catalog unsupported", code="go_unsupported_feature",
+        )
+        client.list_challenges.return_value = [
+            challenge(id="challenge-2"), challenge(id="challenge-1", name="Listed"),
+        ]
+
+        selected = ctfy_local.get_challenge_for_run(
+            client, "challenge-1", "competition-1",
+        )
+
+        self.assertEqual(selected["name"], "Listed")
+        client.list_challenges.assert_called_once_with("competition-1")
+
+    def test_fallback_does_not_hide_other_challenge_errors(self):
+        client = mock.Mock()
+        client.get_challenge.side_effect = ctfy.CtfyError(
+            "missing", code="challenge_not_found",
+        )
+
+        with self.assertRaisesRegex(ctfy.CtfyError, "missing"):
+            ctfy_local.get_challenge_for_run(client, "challenge-1", "competition-1")
+
+        client.list_challenges.assert_not_called()
+
+    def test_structured_prepare_only_reports_ownership_and_keeps_instances(self):
+        for created in (True, False):
+            with self.subTest(created=created):
+                client = FakeClient(
+                    challenge(is_qa_only=False),
+                    instance(status="starting" if created else "ready"),
+                )
+                events = []
+
+                outcome = ctfy_local.run_challenge(
+                    self.args("--prepare-only", "--keep-instance"),
+                    client=client, on_event=lambda name, data: events.append((name, data)),
+                )
+
+                self.assertEqual(outcome, {
+                    "work_dir": str(self.work), "instance_id": "instance-1",
+                    "created_instance": created, "prepare_only": True,
+                    "container_exit_code": None, "result": None, "handoff": [],
+                })
+                self.assertEqual(events, [("prepared", {
+                    "work_dir": str(self.work), "instance_id": "instance-1",
+                    "created_instance": created,
+                })])
+                self.assertNotIn("stop", [event[0] for event in client.events])
+
+    def test_structured_run_challenge_returns_result_handoff_and_events(self):
+        client = FakeClient(challenge(is_qa_only=False), instance(status="starting"))
+        events = []
+        container_names = []
+
+        def container(command, env=None, timeout=None, **kwargs):
+            container_names.append(command[command.index("--name") + 1])
+            (self.work / "result.json").write_text(json.dumps({
+                "schema_version": 3, "answers": {"flag": "candidate"},
+                "solved": [], "fully_solved": False, "stop_reason": "incomplete",
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 7)
+
+        with mock.patch("ctfy_local.subprocess.run", side_effect=container):
+            outcome = ctfy_local.run_challenge(
+                self.args("--keep-instance"), client=client, challenge=client.challenge,
+                on_event=lambda name, data: events.append((name, data)),
+            )
+
+        self.assertEqual(set(outcome), {
+            "work_dir", "instance_id", "created_instance", "prepare_only",
+            "container_exit_code", "result", "handoff",
+        })
+        self.assertEqual(outcome["work_dir"], str(self.work))
+        self.assertEqual(outcome["instance_id"], "instance-1")
+        self.assertTrue(outcome["created_instance"])
+        self.assertFalse(outcome["prepare_only"])
+        self.assertEqual(outcome["container_exit_code"], 7)
+        self.assertEqual(outcome["result"]["answers"], {"flag": "candidate"})
+        self.assertEqual(outcome["handoff"][0]["correct"], True)
+        self.assertEqual([name for name, _ in events], ["prepared", "container"])
+        self.assertEqual(events[0][1], {
+            "work_dir": str(self.work), "instance_id": "instance-1",
+            "created_instance": True,
+        })
+        self.assertEqual(events[1][1], {"name": container_names[0]})
+        self.assertNotIn("stop", [event[0] for event in client.events])
+
+    def test_structured_run_local_prints_outcome_and_returns_container_code(self):
+        outcome = {
+            "work_dir": str(self.work), "instance_id": "instance-1",
+            "created_instance": False, "prepare_only": False,
+            "container_exit_code": 9, "result": {"schema_version": 3}, "handoff": [],
+        }
+        client = FakeClient()
+        with mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=client), \
+                mock.patch.object(ctfy_local, "run_challenge", return_value=outcome), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            rc = ctfy_local.run_local(self.args())
+
+        self.assertEqual(rc, 9)
+        self.assertEqual(json.loads(stdout.getvalue()), outcome)
+
+    def test_structured_path_bound_ids_are_validated_before_platform_calls(self):
+        for challenge_id, competition_id in (
+            ("../challenge", "competition-1"), ("challenge-1", "../competition"),
+        ):
+            with self.subTest(challenge_id=challenge_id, competition_id=competition_id):
+                args = ctfy_local.build_parser().parse_args([
+                    "run", challenge_id, "--competition", competition_id,
+                    "--work-dir", str(self.work),
+                ])
+                client = mock.Mock()
+                with self.assertRaisesRegex(ctfy.CtfyError, "safe nonempty identifier"):
+                    ctfy_local.run_challenge(args, client=client)
+                client.get_challenge.assert_not_called()
+
+    def test_engine_is_copied_executable_and_forwarded_only_to_container(self):
+        engine = Path(self.tmp.name) / "engine"
+        engine.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        engine.chmod(0o755)
+        captured = {}
+
+        def container(command, env=None, timeout=None, **kwargs):
+            captured["command"] = command
+            captured["env"] = env
+            (self.work / "result.json").write_text(json.dumps({
+                "schema_version": 3, "answers": {}, "solved": [],
+                "fully_solved": False, "stop_reason": "incomplete",
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.dict("os.environ", {
+                "CTFY_TOKEN": "secret-token", "SAPPER_BIN": "host-engine",
+        }, clear=True), mock.patch("ctfy_local.subprocess.run", side_effect=container):
+            outcome = ctfy_local.run_challenge(
+                self.args("--engine", str(engine)), client=FakeClient(),
+            )
+
+        copied = self.work / ".ctfy-engine"
+        self.assertEqual(outcome["container_exit_code"], 0)
+        self.assertEqual(copied.read_bytes(), engine.read_bytes())
+        self.assertTrue(copied.stat().st_mode & 0o111)
+        self.assertEqual(captured["env"]["SAPPER_BIN"], "/ctfy/work/.ctfy-engine")
+        self.assertEqual(captured["env"]["CTFY_TOKEN"], "secret-token")
+        self.assertNotIn(str(engine), captured["command"])
+        self.assertNotIn("secret-token", captured["command"])
+        self.assertIn("SAPPER_BIN", ctfy_local._FORWARDED_ENV)
+
+    def test_add_host_and_read_only_source_lib_mount_reach_docker(self):
+        args = self.args(
+            "--add-host", "gateway.internal:192.0.2.10",
+            "--add-host", "model.internal:192.0.2.20",
+        )
+
+        command = ctfy_local._docker_command(args, self.work)
+
+        self.assertIn(
+            f"type=bind,src={(ROOT / 'lib').resolve()},dst=/opt/sapper/lib,readonly",
+            command,
+        )
+        for mapping in (
+            "gateway.internal:192.0.2.10", "model.internal:192.0.2.20",
+        ):
+            index = command.index(mapping)
+            self.assertEqual(command[index - 1], "--add-host")
+
+    def test_handoff_replay_is_idempotent_and_transport_uncertainty_is_not_retried(self):
+        task = ctfy_local.build_task(
+            challenge(), None, "competition-1", "http://platform", 3,
+        )
+        client = FakeClient()
+        calls = []
+
+        def submit(challenge_id, competition_id, question_id, answer):
+            calls.append((challenge_id, competition_id, question_id, answer))
+            if answer == "uncertain":
+                raise ctfy.CtfyError("submission timed out", transport=True)
+            return {"correct": answer == "new-answer", "question_id": question_id}
+
+        client.submit_qa_answer = submit
+
+        first = ctfy_local.submit_handed_off_answers(
+            client, task, {"answers": {"flag": "candidate"}}, self.work,
+        )
+        self.assertFalse(first[0]["correct"])
+        ctfy_local.submit_handed_off_answers(
+            client, task, {"answers": {"flag": "candidate"}}, self.work,
+        )
+        self.assertEqual(len(calls), 1)
+
+        uncertain = ctfy_local.submit_handed_off_answers(
+            client, task, {"answers": {"flag": "uncertain"}}, self.work,
+        )
+        unresolved = next(item for item in uncertain if item["answer"] == "uncertain")
+        self.assertIsNone(unresolved["correct"])
+        self.assertEqual(unresolved["status"], "unresolved")
+        self.assertTrue(unresolved["transport_uncertain"])
+        ctfy_local.submit_handed_off_answers(
+            client, task, {"answers": {"flag": "uncertain"}}, self.work,
+        )
+        self.assertEqual(len(calls), 2)
+
+        merged = ctfy_local.submit_handed_off_answers(
+            client, task, {"answers": {"flag": "new-answer"}}, self.work,
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1][-1], "new-answer")
+        self.assertEqual(
+            {(item["question_id"], item["answer"]) for item in merged},
+            {("flag", "candidate"), ("flag", "uncertain"), ("flag", "new-answer")},
+        )
+        saved = json.loads((self.work / "handoff.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["submissions"], merged)
 
 
 if __name__ == "__main__":
