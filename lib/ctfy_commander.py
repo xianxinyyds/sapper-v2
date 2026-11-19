@@ -450,6 +450,8 @@ def parse_decision(
     if _target_finished(row):
         raise ctfy.CtfyError(f"cannot {action} finished or unsupported target {target!r}")
     if action == "fire":
+        if not _target_active(row) and row.get("status") != "idle":
+            raise ctfy.CtfyError(f"cannot fire non-active, non-idle target {target!r}")
         return Decision(action, target, 0, note)
     if _target_active(row):
         raise ctfy.CtfyError(f"cannot {action} already-active target {target!r}")

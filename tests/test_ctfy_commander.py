@@ -725,6 +725,15 @@ class DecisionTests(unittest.TestCase):
                 )
                 self.assertEqual((decision.target, decision.minutes), ("challenge-1", 0))
 
+    def test_decision_fire_rejects_non_active_non_idle_target(self):
+        for status in ("failed", "pending"):
+            with self.subTest(status=status), self.assertRaises(ctfy.CtfyError):
+                row = board_row(status=status, worker_status="idle")
+                self.parse(
+                    {"action": "fire", "target": "challenge-1", "note": "release"},
+                    [row],
+                )
+
     def test_decision_instance_ttl_clamps_and_requires_viable_slice(self):
         row = board_row(
             instance_id="instance-1", instance_expires_at=NOW + 7 * 60 + 30,
