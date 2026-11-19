@@ -120,6 +120,39 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("campaign.json", self.text)
         self.assertIn("do not ask", self.plain)
 
+    def test_env_mapping_and_launch_share_one_fenced_block(self):
+        blocks = re.findall(r"```(?:bash|sh)\n(.*?)```", self.text, re.DOTALL)
+        matches = [
+            block for block in blocks
+            if 'LLM_API_KEY="${LLM_API_KEY:-${OPENAI_API_KEY:-}}"' in block
+            and "python3 lib/ctfy_local.py" in block
+        ]
+        self.assertEqual(
+            len(matches), 1,
+            "env mapping and play invocation must share one fenced shell block",
+        )
+        block = matches[0]
+        self.assertIn('LLM_MODEL="${LLM_MODEL:-${OPENAI_MODEL:-deepseek-v4-pro}}"', block)
+        self.assertIn('LLM_BASE_URL="${LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"', block)
+        self.assertIn("getent ahostsv4", block)
+        self.assertIn("python3 lib/ctfy_local.py \"${PLAY_ARGS[@]}\"", block)
+        self.assertIn("one shell command", self.plain)
+
+    def test_documents_background_launch_polling_and_signals(self):
+        self.assertIn("run_in_background", self.text)
+        self.assertIn("tmux", self.text)
+        self.assertIn("campaign.json", self.text)
+        self.assertIn("decisions.jsonl", self.text)
+        self.assertIn("SIGINT", self.text)
+        self.assertIn("SIGTERM", self.text)
+        self.assertIn("pgrep -af", self.text)
+        self.assertIn("kill -INT", self.text)
+        self.assertIn("kill -TERM", self.text)
+        self.assertRegex(
+            self.plain,
+            r"foreground.*(?:timeout|cap|limit)|(?:timeout|cap|limit).*foreground",
+        )
+
 
 class DocumentationTests(unittest.TestCase):
     def test_root_skill_distinguishes_hosted_and_campaign_modes(self):

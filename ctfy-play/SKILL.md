@@ -35,11 +35,15 @@ that scheduler here or drive challenges one by one with `run`.
 Run from the repository root (the directory containing `lib/ctfy_local.py`) on a
 host that can reach the platform and whose Docker daemon is available.
 
-First load the optional host-only environment and map the existing model session
-variables onto the CTFY names. The file is sourced only when it exists; absent
-variables keep their current values.
+Run the whole setup and launch **as one shell command** (one Claude Code Bash
+call). Each Bash call is a fresh shell, so environment exported in an earlier
+call would be lost before `play` starts, and a missing `LLM_BASE_URL` would also
+skip the gateway `--add-host` derivation. The single block below loads the
+optional env file, maps the model session variables to `LLM_*`, derives the
+gateway hosts entries, and launches `play`:
 
 ```bash
+# ONE shell command: env -> LLM_* -> gateway --add-host -> play.
 # Optional host-only credentials; loaded only when present.
 ENV_FILE="${CTFY_ENV_FILE:-$HOME/.config/ctfy/env}"
 if [[ -f "$ENV_FILE" ]]; then
@@ -54,13 +58,7 @@ export LLM_API_KEY="${LLM_API_KEY:-${OPENAI_API_KEY:-}}"
 export LLM_BASE_URL="${LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
 # deepseek-v4-pro is only the current test default; export LLM_MODEL to change it.
 export LLM_MODEL="${LLM_MODEL:-${OPENAI_MODEL:-deepseek-v4-pro}}"
-```
 
-Then launch the campaign. The minimal form is
-`python3 lib/ctfy_local.py play`. The launcher below only forwards options; it
-does not schedule anything itself.
-
-```bash
 # Forward an existing custom HTTP engine when present; never rebuild the image.
 ENGINE="${CTFY_ENGINE:-$HOME/.config/ctfy/openai_http_engine.py}"
 ENGINE_ARGS=()
@@ -100,6 +98,45 @@ python3 lib/ctfy_local.py "${PLAY_ARGS[@]}"
 If the engine file is absent, `play` uses the image's configured engine. If
 `getent` finds no address, Docker uses its normal DNS path. In both cases the
 image is reused as-is; this skill never builds or rebuilds it.
+
+## Run it in the background
+
+`play` blocks until the campaign deadline or until it is stopped. That is longer
+than a foreground Bash call's timeout/cap, so launch the one shell command above
+with the Bash tool's `run_in_background: true`, or detach it in tmux:
+
+```bash
+# Claude Code Bash tool: start the ONE shell command above with run_in_background: true.
+# tmux alternative, from the repository root:
+tmux new-session -d -s ctfy-play 'bash -lc "<the one shell command above>"'
+```
+
+Poll campaign state and recent AI decisions without waiting inline:
+
+```bash
+# Campaign manifest: status, deadline, rows, and owned instances.
+python3 -m json.tool runs/<competition>/campaign.json
+
+# One JSON decision record per line; the tail shows the latest AI choices.
+tail -n 20 runs/<competition>/decisions.jsonl
+
+# tmux only: read the latest terminal output.
+tmux capture-pane -pt ctfy-play -S -40
+```
+
+Interrupt by signalling the `play` process itself, not its Docker children:
+
+```bash
+pgrep -af 'lib/ctfy_local.py.*play'
+kill -INT <pid>    # first SIGINT: graceful Worker stop, instances preserved
+kill -INT <pid>    # second SIGINT: bounded forced cleanup
+# or
+kill -TERM <pid>   # SIGTERM follows the same interrupt path
+```
+
+The first signal asks Workers to stop gracefully and preserves their instances;
+a second signal follows the bounded forced path. If any campaign-created
+instance remains afterwards, stop it with the cleanup command below.
 
 ## Options (all optional)
 
