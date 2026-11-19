@@ -33,7 +33,7 @@ def resolve_deadline(
         except ValueError as exc:
             raise ctfy.CtfyError("competition ends_at must be an ISO timestamp") from exc
         if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ctfy.CtfyError("competition ends_at must include a timezone")
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
         timestamp = parsed.timestamp()
         if not math.isfinite(timestamp):
             raise ctfy.CtfyError("competition ends_at must be finite")

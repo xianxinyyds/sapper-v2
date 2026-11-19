@@ -428,8 +428,27 @@ def _runs_root() -> Path:
     return Path.cwd() / "runs"
 
 
-def _scan_campaigns(runs: Path) -> dict[str, Path]:
-    """Map competition_id to campaign root for resumable manifests."""
+def _resumable_campaign(manifest: dict, *, now: float) -> tuple[str, float] | None:
+    """Return (competition_id, deadline) for a live, resumable manifest.
+
+    A manifest is resumable only when it is a schema-1 campaign with a finite
+    deadline strictly in the future; an expired campaign is replaced rather
+    than silently resumed into an immediate deadline cleanup.
+    """
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        return None
+    competition_id = manifest.get("competition_id")
+    if not isinstance(competition_id, str) or not competition_id.strip():
+        return None
+    deadline = manifest.get("deadline")
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+            or not math.isfinite(deadline) or deadline <= now:
+        return None
+    return competition_id, float(deadline)
+
+
+def _scan_campaigns(runs: Path, *, now: float) -> dict[str, Path]:
+    """Map competition_id to campaign root for live, resumable manifests."""
     result = {}
     try:
         paths = sorted(runs.glob("*/campaign.json"))
@@ -440,15 +459,10 @@ def _scan_campaigns(runs: Path) -> dict[str, Path]:
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        live = _resumable_campaign(manifest, now=now)
+        if live is None:
             continue
-        competition_id = manifest.get("competition_id")
-        if not isinstance(competition_id, str) or not competition_id.strip():
-            continue
-        deadline = manifest.get("deadline")
-        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
-                or not math.isfinite(deadline):
-            continue
+        competition_id, _ = live
         result[competition_id] = path.parent
     return result
 
@@ -467,7 +481,7 @@ def _competition_by_id(client, competition_id: str) -> dict:
 def _resolve_campaign(client, args, runs: Path, *, now: float):
     import ctfy_commander
 
-    manifests = _scan_campaigns(runs)
+    manifests = _scan_campaigns(runs, now=now)
     competition_id = args.competition
     if competition_id:
         competition_id = ctfy.require_id(competition_id, "competition_id")
@@ -488,7 +502,7 @@ def _resolve_campaign(client, args, runs: Path, *, now: float):
     store = ctfy_campaign.CampaignStore(runs / competition_id)
     with store.lock():
         manifest = store.load()
-        if manifest:
+        if manifest and _resumable_campaign(manifest, now=now) is not None:
             return store, manifest, _competition_by_id(client, competition_id)
         deadline = ctfy_campaign.resolve_deadline(
             competition.get("ends_at"), args.minutes, now=now,

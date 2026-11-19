@@ -742,6 +742,17 @@ class DecisionTests(unittest.TestCase):
                     [row],
                 )
 
+    def test_decision_fire_accepts_parked_target_as_idempotent_noop(self):
+        row = board_row(status="parked", worker_status="parked")
+        decision = self.parse(
+            {"action": "fire", "target": "challenge-1", "note": "already parked"},
+            [row],
+        )
+        self.assertEqual(
+            (decision.action, decision.target, decision.minutes),
+            ("fire", "challenge-1", 0),
+        )
+
     def test_decision_instance_ttl_clamps_and_requires_viable_slice(self):
         row = board_row(
             instance_id="instance-1", instance_expires_at=NOW + 7 * 60 + 30,
@@ -861,6 +872,34 @@ class FakeProcess:
         self.killed = True
         self.returncode = -signal.SIGKILL
         self.wait_raises = False
+
+
+class _StubbornProcess:
+    """A worker process that ignores SIGTERM and only dies on SIGKILL."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+        self.waits = []
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(["worker"], timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -signal.SIGKILL
 
 
 class PoolClient:
@@ -997,12 +1036,13 @@ class PoolTestCase(unittest.TestCase):
             })
         return process
 
-    def start(self, target, *, background=True, action=None):
+    def start(self, target, *, background=True, action=None, interrupt_pending=None):
         with mock.patch.object(
                 ctfy_commander.subprocess, "Popen", side_effect=self._popen):
             return self.pool.start(
                 self.decision(target, action or ("hire" if background else "work")),
                 self.challenge_map[target], background=background,
+                interrupt_pending=interrupt_pending,
             )
 
     def finish(self, target, *, result=None, handoff=None, status="completed"):
@@ -1122,6 +1162,57 @@ class PoolTests(PoolTestCase):
             with self.assertRaises(ctfy.CtfyError):
                 self.start("challenge-1")
         self.assertEqual(self.popen_calls, [])
+
+
+class ForegroundWorkTests(PoolTestCase):
+    def test_pool_foreground_work_interrupt_terminates_and_preserves_instance(self):
+        result = self.start(
+            "challenge-1", background=False, interrupt_pending=lambda: True,
+        )
+        process = self.processes["challenge-1"]
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.killed)
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(self.client.stop_calls, [])
+        state = self.store.load()
+        instance_record = state["instances"]["instance-challenge-1-1"]
+        self.assertTrue(instance_record["created_by_campaign"])
+        self.assertNotIn("closed", instance_record)
+
+    def test_pool_foreground_work_second_interrupt_forces_kill(self):
+        stubborn = _StubbornProcess()
+
+        def popen(argv, **kwargs):
+            target = argv[argv.index("--challenge-id") + 1]
+            attempt = Path(argv[argv.index("--attempt") + 1])
+            self.popen_calls.append((argv, kwargs))
+            self.processes[target] = stubborn
+            live = instance(target, id=f"instance-{target}-stubborn")
+            self.client.instances.append(live)
+            write_json(attempt / "prepared.json", {
+                "work_dir": str(attempt), "instance_id": live["id"],
+                "created_instance": True,
+            })
+            return stubborn
+
+        with mock.patch.object(ctfy_commander.subprocess, "Popen", side_effect=popen):
+            self.pool.start(
+                self.decision("challenge-1", "work"),
+                self.challenge_map["challenge-1"],
+                background=False, interrupt_pending=lambda: True,
+            )
+        self.assertTrue(stubborn.terminated)
+        self.assertTrue(stubborn.killed)
+
+    def test_pool_foreground_work_waits_for_normal_completion(self):
+        self.complete_on_launch = True
+        result = self.start(
+            "challenge-1", background=False, interrupt_pending=lambda: False,
+        )
+        process = self.processes["challenge-1"]
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(process.terminated)
+        self.assertFalse(process.killed)
 
 
 class CapacityTests(PoolTestCase):
@@ -1560,7 +1651,7 @@ class FakePool:
         self.reaps += 1
         return []
 
-    def start(self, decision, challenge, background=False):
+    def start(self, decision, challenge, background=False, interrupt_pending=None):
         self.starts.append((decision.action, decision.target, background))
         return dict(self.outcome)
 

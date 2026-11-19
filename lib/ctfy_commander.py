@@ -525,8 +525,10 @@ def parse_decision(
     if _target_finished(row):
         raise ctfy.CtfyError(f"cannot {action} finished or unsupported target {target!r}")
     if action == "fire":
-        if not _target_active(row) and row.get("status") != "idle":
-            raise ctfy.CtfyError(f"cannot fire non-active, non-idle target {target!r}")
+        if not _target_active(row) and row.get("status") not in {"idle", "parked"}:
+            raise ctfy.CtfyError(
+                f"cannot fire non-active, non-idle, non-parked target {target!r}"
+            )
         return Decision(action, target, 0, note)
     if _target_active(row):
         raise ctfy.CtfyError(f"cannot {action} already-active target {target!r}")
@@ -685,6 +687,7 @@ class Commander:
         try:
             return self.pool.start(
                 decision, challenge, background=decision.action == "hire",
+                interrupt_pending=lambda: self._interrupts > 0,
             ), None
         except Exception as exc:  # noqa: BLE001 - record and continue the loop
             return None, _error_record(exc)
@@ -980,7 +983,8 @@ class WorkerPool:
             "prepare_only": False,
         }
 
-    def start(self, decision: Decision, challenge: dict, *, background: bool) -> dict:
+    def start(self, decision: Decision, challenge: dict, *, background: bool,
+              interrupt_pending=None) -> dict:
         if not self._accepting:
             raise ctfy.CtfyError("worker pool is not accepting new work")
         challenge_id = ctfy.require_id(challenge.get("id"), "challenge_id")
@@ -1069,7 +1073,7 @@ class WorkerPool:
         if background:
             return dict(worker)
 
-        process.wait()
+        self._wait_foreground(challenge_id, process, worker, interrupt_pending)
         completed = [item for item in self.reap() if item["challenge_id"] == challenge_id]
         if completed:
             return completed[0]
@@ -1462,6 +1466,25 @@ class WorkerPool:
                 "id": instance_id, "expires_at": record.get("expires_at"),
             })
         return preserved
+
+    def _wait_foreground(self, target, process, worker, interrupt_pending):
+        """Wait for one foreground worker slice, polling for interrupts.
+
+        Mirrors ``_wait_worker`` but waits for the child to exit on its own
+        bounded slice instead of a fixed deadline. A recorded interrupt
+        terminates the child through the same bounded force path used by
+        cleanup; instance ownership is left for the subsequent interrupt
+        cleanup to preserve.
+        """
+        if interrupt_pending is None:
+            process.wait()
+            return False
+        while process.poll() is None:
+            if interrupt_pending():
+                self._force_process(target, process, worker)
+                return True
+            time.sleep(0.1)
+        return False
 
     def _wait_worker(self, target, process, worker, interrupt_pending):
         """Wait for one worker to finish its slice, escalating on a 2nd interrupt.

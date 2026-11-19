@@ -43,6 +43,20 @@ class DeadlineTests(unittest.TestCase):
             1_767_226_500.0,
         )
 
+    def test_resolve_deadline_accepts_naive_ends_at_as_utc(self):
+        self.assertEqual(
+            ctfy_campaign.resolve_deadline(
+                "2026-01-01T00:30:00", None, now=NOW,
+            ),
+            1_767_227_400.0,
+        )
+        self.assertEqual(
+            ctfy_campaign.resolve_deadline(
+                "2026-01-01T00:30:00", 60, now=NOW,
+            ),
+            1_767_227_400.0,
+        )
+
     def test_resolve_deadline_rejects_missing_invalid_and_past_limits(self):
         cases = (
             (None, None),

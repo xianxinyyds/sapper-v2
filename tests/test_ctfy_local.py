@@ -703,6 +703,27 @@ class ResolveCampaignTests(unittest.TestCase):
         self.assertEqual(manifest["stall_minutes"], 30)
         self.assertTrue((self.runs / "competition-1" / "campaign.json").is_file())
 
+    def test_resolve_campaign_ignores_expired_manifest_and_creates_fresh(self):
+        self.write_campaign("competition-1", NOW - 3600)
+        client = FakeDiscoveryClient([self.competition("competition-1")])
+        store, manifest, competition = ctfy_local._resolve_campaign(
+            client, self.parse("--minutes", "120"), self.runs, now=NOW)
+        self.assertEqual(manifest["competition_id"], "competition-1")
+        self.assertEqual(manifest["deadline"], NOW + 120 * 60)
+        self.assertGreater(manifest["deadline"], NOW)
+        self.assertEqual(competition["id"], "competition-1")
+        self.assertEqual(store.root, self.runs / "competition-1")
+
+    def test_resolve_campaign_explicit_expired_manifest_creates_fresh(self):
+        self.write_campaign("competition-1", NOW - 1)
+        client = FakeDiscoveryClient([self.competition("competition-1")])
+        store, manifest, competition = ctfy_local._resolve_campaign(
+            client, self.parse("--competition", "competition-1", "--minutes", "120"),
+            self.runs, now=NOW)
+        self.assertEqual(manifest["competition_id"], "competition-1")
+        self.assertEqual(manifest["deadline"], NOW + 120 * 60)
+        self.assertEqual(competition["id"], "competition-1")
+
 
 class PlayCommandTests(unittest.TestCase):
     def setUp(self):
@@ -740,6 +761,35 @@ class PlayCommandTests(unittest.TestCase):
         signals_cls.assert_called_once_with(fake_commander)
         fake_signals.install.assert_called_once()
         fake_signals.restore.assert_called_once()
+        fake_commander.run.assert_called_once()
+
+    def test_play_expired_manifest_smoke_test_creates_fresh_campaign(self):
+        self.write_campaign("competition-1", NOW - 3600)
+        fake_client = FakeDiscoveryClient([{
+            "id": "competition-1", "title": "competition-1", "phase": "running",
+            "is_registered": True, "challenge_count": 3,
+            "ends_at": "2030-01-01T00:00:00Z",
+        }])
+        captured = {}
+        fake_commander = mock.Mock()
+        fake_commander.run.return_value = 0
+
+        def make_commander(store, client, competition, args, **kwargs):
+            captured["store"] = store
+            captured["competition"] = competition
+            return fake_commander
+
+        args = ctfy_local.build_parser().parse_args(["play", "--minutes", "120"])
+        with mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client), \
+                mock.patch.object(ctfy_local.time, "time", return_value=NOW), \
+                mock.patch("ctfy_commander.Commander", side_effect=make_commander), \
+                mock.patch.object(ctfy_local, "_PlaySignals", return_value=mock.Mock()):
+            rc = ctfy_local.play(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["store"].load()["deadline"], NOW + 120 * 60)
+        self.assertGreater(captured["store"].load()["deadline"], NOW)
+        self.assertEqual(captured["competition"]["id"], "competition-1")
         fake_commander.run.assert_called_once()
 
 
