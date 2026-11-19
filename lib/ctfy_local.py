@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
 import ctfy
+import ctfy_campaign
 
 
 _FORWARDED_ENV = (
@@ -420,6 +424,164 @@ def run_local(args) -> int:
     return outcome["container_exit_code"] if outcome["container_exit_code"] is not None else 0
 
 
+def _runs_root() -> Path:
+    return Path.cwd() / "runs"
+
+
+def _scan_campaigns(runs: Path) -> dict[str, Path]:
+    """Map competition_id to campaign root for resumable manifests."""
+    result = {}
+    try:
+        paths = sorted(runs.glob("*/campaign.json"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+            continue
+        competition_id = manifest.get("competition_id")
+        if not isinstance(competition_id, str) or not competition_id.strip():
+            continue
+        deadline = manifest.get("deadline")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline):
+            continue
+        result[competition_id] = path.parent
+    return result
+
+
+def _competition_by_id(client, competition_id: str) -> dict:
+    try:
+        for competition in client.list_competitions():
+            if isinstance(competition, dict) \
+                    and competition.get("id") == competition_id:
+                return competition
+    except ctfy.CtfyError:
+        pass
+    return {"id": competition_id}
+
+
+def _resolve_campaign(client, args, runs: Path, *, now: float):
+    import ctfy_commander
+
+    manifests = _scan_campaigns(runs)
+    competition_id = args.competition
+    if competition_id:
+        competition_id = ctfy.require_id(competition_id, "competition_id")
+    else:
+        if len(manifests) == 1:
+            competition_id = next(iter(manifests))
+        elif len(manifests) > 1:
+            raise ctfy.CtfyError(
+                "multiple resumable campaigns exist; pass --competition to choose one"
+            )
+    if competition_id and competition_id in manifests:
+        store = ctfy_campaign.CampaignStore(manifests[competition_id])
+        return store, store.load(), _competition_by_id(client, competition_id)
+
+    competitions = client.list_competitions(phase="running")
+    competition = ctfy_commander.select_competition(competitions, competition_id)
+    competition_id = competition["id"]
+    store = ctfy_campaign.CampaignStore(runs / competition_id)
+    with store.lock():
+        manifest = store.load()
+        if manifest:
+            return store, manifest, _competition_by_id(client, competition_id)
+        deadline = ctfy_campaign.resolve_deadline(
+            competition.get("ends_at"), args.minutes, now=now,
+        )
+        manifest = ctfy_campaign.make_campaign(
+            competition, deadline=deadline, stall_minutes=args.stall_minutes,
+            max_workers=args.max_workers, now=now,
+        )
+        store.save(manifest)
+    return store, manifest, competition
+
+
+class _PlaySignals:
+    def __init__(self, commander):
+        self.commander = commander
+        self._old_handlers = {}
+
+    def install(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._old_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+
+    def _handle(self, signum, frame):
+        self.commander.interrupt()
+
+    def restore(self):
+        for signum, handler in self._old_handlers.items():
+            signal.signal(signum, handler)
+
+
+def play(args, *, client=None) -> int:
+    if client is None:
+        client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
+    import ctfy_commander
+
+    store, manifest, competition = _resolve_campaign(
+        client, args, _runs_root(), now=time.time(),
+    )
+    commander = ctfy_commander.Commander(
+        store, client, competition, args, poll_seconds=args.poll_seconds,
+    )
+    signals = _PlaySignals(commander)
+    signals.install()
+    try:
+        with store.lock(blocking=False):
+            return commander.run()
+    finally:
+        signals.restore()
+
+
+def cleanup(args, *, client=None) -> int:
+    if client is None:
+        client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
+    competition_id = ctfy.require_id(args.competition, "competition_id")
+    store = ctfy_campaign.CampaignStore(_runs_root() / competition_id)
+    stopped = []
+    failed = []
+    with store.lock():
+        state = store.load()
+        if not state:
+            raise ctfy.CtfyError(
+                f"no campaign manifest for competition {competition_id}"
+            )
+        instances = state.get("instances", {})
+        if not isinstance(instances, dict):
+            instances = {}
+        changed = False
+        for instance_id, record in list(instances.items()):
+            if not isinstance(instance_id, str) or not isinstance(record, dict):
+                continue
+            if record.get("created_by_campaign") is not True:
+                continue
+            if record.get("closed") is True or record.get("status") in {
+                    "stopped", "expired", "failed", "error"}:
+                continue
+            try:
+                client.stop_instance(instance_id)
+            except ctfy.CtfyError:
+                failed.append(instance_id)
+                continue
+            record["closed"] = True
+            record["status"] = "stopped"
+            stopped.append(instance_id)
+            changed = True
+        if changed:
+            store.save(state)
+    print(json.dumps(
+        {"competition_id": competition_id, "stopped": stopped, "failed": failed},
+        ensure_ascii=False,
+    ))
+    return 0
+
+
 def _list_challenges(args) -> int:
     client = ctfy.CtfyClient(args.platform_url, os.environ.get("CTFY_TOKEN", ""))
     competition = client._segment(args.competition, "competition_id")
@@ -446,6 +608,16 @@ def _stop(args) -> int:
     return 0
 
 
+def _add_worker_options(parser) -> None:
+    parser.add_argument("--image", default="sapper-ctfy:local-test")
+    parser.add_argument("--engine", type=Path)
+    parser.add_argument("--add-host", action="append", default=[], metavar="HOST:IP")
+    parser.add_argument("--max-turns", type=_positive, default=12)
+    parser.add_argument("--dispatch-timeout", type=_positive, default=300)
+    parser.add_argument("--startup-timeout", type=_positive, default=300)
+    parser.add_argument("--ttl", type=_positive)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -466,17 +638,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("challenge_id")
     run.add_argument("--competition", required=True)
     run.add_argument("--work-dir", type=Path)
-    run.add_argument("--image", default="sapper-ctfy:local-test")
-    run.add_argument("--engine", type=Path)
-    run.add_argument("--add-host", action="append", default=[], metavar="HOST:IP")
+    _add_worker_options(run)
     run.add_argument("--minutes", type=_positive, default=165)
-    run.add_argument("--max-turns", type=_positive, default=12)
-    run.add_argument("--dispatch-timeout", type=_positive, default=300)
-    run.add_argument("--startup-timeout", type=_positive, default=300)
-    run.add_argument("--ttl", type=_positive)
     run.add_argument("--keep-instance", action="store_true")
     run.add_argument("--prepare-only", action="store_true")
     run.set_defaults(func=run_local)
+    play_parser = sub.add_parser("play", help="autonomously run a CTFY campaign")
+    play_parser.add_argument("--competition", default="")
+    play_parser.add_argument("--minutes", type=_positive)
+    play_parser.add_argument("--stall-minutes", type=_positive, default=30)
+    play_parser.add_argument("--max-workers", type=_positive, default=2)
+    play_parser.add_argument("--poll-seconds", type=_positive, default=30)
+    _add_worker_options(play_parser)
+    play_parser.set_defaults(func=play)
+    cleanup_parser = sub.add_parser(
+        "cleanup", help="stop campaign-owned leftover instances")
+    cleanup_parser.add_argument("--competition", required=True)
+    cleanup_parser.set_defaults(func=cleanup)
     return parser
 
 

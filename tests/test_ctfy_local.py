@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import ctfy  # noqa: E402
+import ctfy_commander  # noqa: E402
 import ctfy_local  # noqa: E402
 
 
@@ -559,6 +561,244 @@ class CtfyLocalRunTests(unittest.TestCase):
         )
         saved = json.loads((self.work / "handoff.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["submissions"], merged)
+
+
+NOW = 1_800_000_000.0
+
+
+class FakeDiscoveryClient:
+    def __init__(self, competitions=()):
+        self.competitions = [dict(item) for item in competitions]
+        self.discovery_calls = 0
+        self.phases = []
+
+    def list_competitions(self, phase=None):
+        self.discovery_calls += 1
+        self.phases.append(phase)
+        return [dict(item) for item in self.competitions]
+
+
+class FakeStopClient:
+    def __init__(self):
+        self.stopped = []
+        self.started = False
+
+    def stop_instance(self, instance_id):
+        self.stopped.append(instance_id)
+
+    def start_instance(self, *args, **kwargs):
+        self.started = True
+        raise AssertionError("cleanup must never start an instance")
+
+
+class PlayParserTests(unittest.TestCase):
+    def test_play_needs_no_challenge_id_and_defaults_limits(self):
+        args = ctfy_local.build_parser().parse_args(["play"])
+        self.assertEqual(args.command, "play")
+        self.assertFalse(hasattr(args, "challenge_id"))
+        self.assertEqual(args.competition, "")
+        self.assertIsNone(args.minutes)
+        self.assertEqual(args.stall_minutes, 30)
+        self.assertEqual(args.max_workers, 2)
+        self.assertEqual(args.poll_seconds, 30)
+
+    def test_play_accepts_worker_and_budget_options(self):
+        args = ctfy_local.build_parser().parse_args([
+            "play", "--competition", "comp-1", "--minutes", "120",
+            "--stall-minutes", "10", "--max-workers", "4", "--poll-seconds", "5",
+            "--image", "custom:image", "--engine", "/tmp/engine",
+            "--add-host", "gw.internal:192.0.2.1", "--max-turns", "5",
+            "--dispatch-timeout", "9", "--startup-timeout", "7", "--ttl", "60",
+        ])
+        self.assertEqual(args.competition, "comp-1")
+        self.assertEqual(args.minutes, 120)
+        self.assertEqual(args.stall_minutes, 10)
+        self.assertEqual(args.max_workers, 4)
+        self.assertEqual(args.poll_seconds, 5)
+        self.assertEqual(args.image, "custom:image")
+        self.assertEqual(args.engine, Path("/tmp/engine"))
+        self.assertEqual(args.add_host, ["gw.internal:192.0.2.1"])
+        self.assertEqual(args.max_turns, 5)
+        self.assertEqual(args.dispatch_timeout, 9)
+        self.assertEqual(args.startup_timeout, 7)
+        self.assertEqual(args.ttl, 60)
+
+    def test_cleanup_parser_requires_competition(self):
+        args = ctfy_local.build_parser().parse_args(
+            ["cleanup", "--competition", "comp-1"])
+        self.assertEqual(args.competition, "comp-1")
+        with self.assertRaises(SystemExit):
+            ctfy_local.build_parser().parse_args(["cleanup"])
+
+
+class ResolveCampaignTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runs = Path(self.tmp.name) / "runs"
+
+    def competition(self, competition_id="competition-1", **overrides):
+        value = {
+            "id": competition_id, "title": competition_id, "phase": "running",
+            "is_registered": True, "challenge_count": 3,
+            "ends_at": "2030-01-01T00:00:00Z",
+        }
+        value.update(overrides)
+        return value
+
+    def write_campaign(self, competition_id, deadline, **extra):
+        root = self.runs / competition_id
+        root.mkdir(parents=True, exist_ok=True)
+        state = {
+            "schema_version": 1, "competition_id": competition_id,
+            "competition_title": competition_id, "created_at": NOW,
+            "deadline": deadline, "stall_minutes": 30, "max_workers": 2,
+            "challenges": {}, "workers": {}, "instances": {},
+        }
+        state.update(extra)
+        (root / "campaign.json").write_text(json.dumps(state), encoding="utf-8")
+        return root
+
+    def parse(self, *extra):
+        return ctfy_local.build_parser().parse_args(["play", *extra])
+
+    def test_resolve_campaign_reopens_single_existing_manifest(self):
+        original_deadline = NOW + 12345.0
+        self.write_campaign("competition-a", original_deadline)
+        client = FakeDiscoveryClient([
+            self.competition("competition-a"),
+            self.competition("competition-b"),
+        ])
+        store, manifest, competition = ctfy_local._resolve_campaign(
+            client, self.parse(), self.runs, now=NOW)
+        self.assertEqual(manifest["competition_id"], "competition-a")
+        self.assertEqual(manifest["deadline"], original_deadline)
+        self.assertEqual(competition["id"], "competition-a")
+        self.assertEqual(store.root, self.runs / "competition-a")
+
+    def test_resolve_campaign_multiple_manifests_require_competition(self):
+        self.write_campaign("competition-a", NOW + 3600)
+        self.write_campaign("competition-b", NOW + 3600)
+        client = FakeDiscoveryClient([])
+        with self.assertRaisesRegex(ctfy.CtfyError, "--competition"):
+            ctfy_local._resolve_campaign(client, self.parse(), self.runs, now=NOW)
+
+    def test_resolve_campaign_explicit_id_picks_manifest_over_discovery(self):
+        self.write_campaign("competition-a", NOW + 1111)
+        self.write_campaign("competition-b", NOW + 2222)
+        client = FakeDiscoveryClient([])
+        store, manifest, competition = ctfy_local._resolve_campaign(
+            client, self.parse("--competition", "competition-b"), self.runs, now=NOW)
+        self.assertEqual(manifest["competition_id"], "competition-b")
+        self.assertEqual(manifest["deadline"], NOW + 2222)
+        self.assertNotIn("running", client.phases)
+
+    def test_resolve_campaign_fresh_discovery_creates_manifest(self):
+        client = FakeDiscoveryClient([self.competition("competition-1")])
+        store, manifest, competition = ctfy_local._resolve_campaign(
+            client, self.parse("--minutes", "120"), self.runs, now=NOW)
+        self.assertEqual(manifest["competition_id"], "competition-1")
+        self.assertEqual(manifest["deadline"], NOW + 120 * 60)
+        self.assertEqual(manifest["max_workers"], 2)
+        self.assertEqual(manifest["stall_minutes"], 30)
+        self.assertTrue((self.runs / "competition-1" / "campaign.json").is_file())
+
+
+class PlayCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runs = Path(self.tmp.name) / "runs"
+
+    def write_campaign(self, competition_id, deadline):
+        root = self.runs / competition_id
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "campaign.json").write_text(json.dumps({
+            "schema_version": 1, "competition_id": competition_id,
+            "competition_title": competition_id, "created_at": NOW,
+            "deadline": deadline, "stall_minutes": 30, "max_workers": 2,
+            "challenges": {}, "workers": {}, "instances": {},
+        }), encoding="utf-8")
+        return root
+
+    def test_play_constructs_commander_installs_and_restores_signals(self):
+        self.write_campaign("competition-a", NOW + 3600)
+        fake_client = FakeDiscoveryClient([])
+        fake_commander = mock.Mock()
+        fake_commander.run.return_value = 7
+        fake_signals = mock.Mock()
+        args = ctfy_local.build_parser().parse_args(["play"])
+        with mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client), \
+                mock.patch("ctfy_commander.Commander",
+                           return_value=fake_commander) as commander_cls, \
+                mock.patch.object(ctfy_local, "_PlaySignals",
+                                  return_value=fake_signals) as signals_cls:
+            rc = ctfy_local.play(args)
+        self.assertEqual(rc, 7)
+        commander_cls.assert_called_once()
+        signals_cls.assert_called_once_with(fake_commander)
+        fake_signals.install.assert_called_once()
+        fake_signals.restore.assert_called_once()
+        fake_commander.run.assert_called_once()
+
+
+class CleanupCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runs = Path(self.tmp.name) / "runs"
+
+    def write_campaign(self, competition_id, instances):
+        root = self.runs / competition_id
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "campaign.json").write_text(json.dumps({
+            "schema_version": 1, "competition_id": competition_id,
+            "competition_title": competition_id, "created_at": NOW,
+            "deadline": NOW + 3600, "stall_minutes": 30, "max_workers": 2,
+            "challenges": {}, "workers": {}, "instances": instances,
+        }), encoding="utf-8")
+        return root
+
+    def test_cleanup_command_stops_only_owned_leftover_instances(self):
+        self.write_campaign("competition-1", {
+            "owned-1": {"challenge_id": "c1", "created_by_campaign": True},
+            "owned-closed": {"challenge_id": "c2", "created_by_campaign": True,
+                             "closed": True, "status": "stopped"},
+            "reused-1": {"challenge_id": "c3", "created_by_campaign": False},
+        })
+        fake_client = FakeStopClient()
+        args = ctfy_local.build_parser().parse_args(
+            ["cleanup", "--competition", "competition-1"])
+        with mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = ctfy_local.cleanup(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake_client.stopped, ["owned-1"])
+        self.assertFalse(fake_client.started)
+        saved = json.loads(
+            (self.runs / "competition-1" / "campaign.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["instances"]["owned-1"]["closed"])
+
+    def test_cleanup_command_missing_manifest_fails(self):
+        fake_client = FakeStopClient()
+        args = ctfy_local.build_parser().parse_args(
+            ["cleanup", "--competition", "competition-1"])
+        with mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client):
+            with self.assertRaises(ctfy.CtfyError):
+                ctfy_local.cleanup(args)
+        self.assertEqual(fake_client.stopped, [])
+
+
+class PlaySignalTests(unittest.TestCase):
+    def test_signal_handler_invokes_commander_interrupt(self):
+        commander = mock.Mock()
+        signals = ctfy_local._PlaySignals(commander)
+        signals._handle(signal.SIGINT, None)
+        signals._handle(signal.SIGTERM, None)
+        self.assertEqual(commander.interrupt.call_count, 2)
 
 
 if __name__ == "__main__":

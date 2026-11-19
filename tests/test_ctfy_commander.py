@@ -1398,5 +1398,195 @@ class WorkerSignalTests(PoolTestCase):
         self.assertNotIn("sk-proj-fakeSecret123", stderr.getvalue())
 
 
+class SelectCompetitionTests(unittest.TestCase):
+    def competition(self, competition_id="competition-1", **overrides):
+        value = {
+            "id": competition_id, "title": competition_id, "phase": "running",
+            "is_registered": True, "challenge_count": 3,
+        }
+        value.update(overrides)
+        return value
+
+    def test_select_competition_auto_selects_single_candidate(self):
+        selected = ctfy_commander.select_competition([self.competition()])
+        self.assertEqual(selected["id"], "competition-1")
+
+    def test_select_competition_filters_non_running_unregistered_empty(self):
+        competitions = [
+            self.competition("upcoming", phase="upcoming"),
+            self.competition("unregistered", is_registered=False),
+            self.competition("empty", challenge_count=0),
+            self.competition("missing-count", challenge_count=None),
+            self.competition("nonnumeric", challenge_count="three"),
+        ]
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(competitions)
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition([])
+
+    def test_select_competition_multiple_candidates_need_explicit_id(self):
+        competitions = [self.competition("a"), self.competition("b")]
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(competitions)
+        selected = ctfy_commander.select_competition(competitions, "b")
+        self.assertEqual(selected["id"], "b")
+
+    def test_select_competition_explicit_id_must_be_a_visible_candidate(self):
+        competitions = [
+            self.competition("a"),
+            self.competition("upcoming", phase="upcoming"),
+        ]
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(competitions, "upcoming")
+        with self.assertRaises(ctfy.CtfyError):
+            ctfy_commander.select_competition(competitions, "missing")
+
+
+class FakePool:
+    def __init__(self):
+        self.cleanups = []
+        self.starts = []
+        self.fires = []
+        self.reaps = 0
+        self.outcome = {
+            "challenge_id": "challenge-1", "status": "completed",
+            "work_dir": "/tmp/attempt", "instance_id": "instance-1",
+            "attempt_minutes": 10, "closed": [],
+        }
+
+    def reap(self):
+        self.reaps += 1
+        return []
+
+    def start(self, decision, challenge, background=False):
+        self.starts.append((decision.action, decision.target, background))
+        return dict(self.outcome)
+
+    def fire(self, target):
+        self.fires.append(target)
+        return {"target": target, "status": "parked", "closed": [], "preserved": []}
+
+    def cleanup(self, reason):
+        self.cleanups.append(reason)
+        return {"reason": reason, "closed": [], "preserved": [], "workers": {}}
+
+
+class LoopClient:
+    def __init__(self, challenges=(), instances=()):
+        self.challenges = copy.deepcopy(list(challenges))
+        self.instances = copy.deepcopy(list(instances))
+        self.list_challenges_calls = 0
+        self.list_instances_calls = 0
+        self.error = None
+
+    def list_challenges(self, competition_id):
+        self.list_challenges_calls += 1
+        if self.error is not None:
+            raise self.error
+        return copy.deepcopy(self.challenges)
+
+    def list_instances(self, challenge_id=""):
+        self.list_instances_calls += 1
+        if self.error is not None:
+            raise self.error
+        return copy.deepcopy(self.instances)
+
+
+class CampaignLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "campaign"
+        self.store = ctfy_campaign.CampaignStore(self.root)
+
+    def commander(self, *, client=None, pool=None, deadline=None):
+        self.store.save({
+            "schema_version": 1, "competition_id": "competition-1",
+            "competition_title": "Test", "created_at": NOW,
+            "deadline": NOW + 3600 if deadline is None else deadline,
+            "stall_minutes": 30, "max_workers": 2,
+            "challenges": {}, "workers": {}, "instances": {},
+        })
+        return ctfy_commander.Commander(
+            self.store, client, {"id": "competition-1"}, {}, pool=pool,
+            model="fake-model", template=Path("unused"), poll_seconds=0,
+        )
+
+    def test_campaign_loop_refreshes_decides_records_and_cleans_up(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+        decisions = iter([
+            ctfy_commander.Decision("work", "challenge-1", 10, "lead; flag{test-secret}"),
+            ctfy_commander.Decision("stop", "", 0, "all done"),
+        ])
+        with mock.patch.object(ctfy_commander, "request_decision",
+                               side_effect=lambda *a, **k: next(decisions)):
+            self.assertEqual(commander.run(), 0)
+        self.assertEqual(pool.starts, [("work", "challenge-1", False)])
+        self.assertEqual(pool.cleanups, ["stop"])
+        self.assertGreaterEqual(pool.reaps, 1)
+        self.assertEqual(client.list_challenges_calls, 2)
+        self.assertEqual(client.list_instances_calls, 2)
+        lines = (self.store.root / "decisions.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("flag{test-secret}", "\n".join(lines))
+        self.assertIn("challenge-1", self.store.load()["challenges"])
+
+    def test_campaign_loop_deadline_stops_without_deciding(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool, deadline=0.0)
+        with mock.patch.object(ctfy_commander, "request_decision") as decision_mock:
+            self.assertEqual(commander.run(), 0)
+        decision_mock.assert_not_called()
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["deadline"])
+
+    def test_campaign_loop_finished_board_stops_without_work(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[
+            challenge("solved", my_team_fully_solved=True),
+            challenge("closed", closed=True),
+            challenge("awd", is_qa_only=False, network_topology="awd"),
+        ])
+        commander = self.commander(client=client, pool=pool)
+        with mock.patch.object(ctfy_commander, "request_decision") as decision_mock:
+            self.assertEqual(commander.run(), 0)
+        decision_mock.assert_not_called()
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["stop"])
+
+    def test_campaign_loop_model_failure_backs_off_without_work(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        commander = self.commander(client=client, pool=pool)
+        sleeps = []
+        with mock.patch.object(ctfy_commander, "request_decision",
+                               side_effect=RuntimeError("offline")), \
+                mock.patch.object(ctfy_commander.time, "sleep",
+                                  side_effect=sleeps.append):
+            self.assertEqual(commander.run(), 2)
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["model_error"])
+        self.assertEqual(len(sleeps), 2)
+        self.assertTrue(all(delay <= 60 for delay in sleeps))
+
+    def test_campaign_loop_infra_failure_backs_off_then_infra_error(self):
+        pool = FakePool()
+        client = LoopClient(challenges=[challenge()])
+        client.error = ctfy.CtfyError("platform down", transport=True)
+        commander = self.commander(client=client, pool=pool)
+        sleeps = []
+        with mock.patch.object(ctfy_commander.time, "sleep",
+                               side_effect=sleeps.append):
+            self.assertEqual(commander.run(), 2)
+        self.assertEqual(pool.starts, [])
+        self.assertEqual(pool.cleanups, ["infra_error"])
+        self.assertEqual(client.list_challenges_calls, 3)
+        self.assertEqual(client.list_instances_calls, 0)
+        self.assertEqual(len(sleeps), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

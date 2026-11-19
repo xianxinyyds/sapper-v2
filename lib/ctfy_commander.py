@@ -48,6 +48,60 @@ _BOARD_FIELDS = (
     "stalled_decisions", "unsupported", "status",
 )
 
+_MODEL_ERROR_RETRIES = 3
+_INFRA_ERROR_RETRIES = 3
+_BACKOFF_BASE = 10.0
+_MAX_BACKOFF = 60.0
+_DECISION_TIMEOUT = 120
+_DECISION_RESULT_FIELDS = (
+    "challenge_id", "status", "work_dir", "instance_id", "attempt_minutes",
+    "closed", "preserved", "target", "cancel_after_slice", "workers",
+)
+
+
+def select_competition(competitions: list[dict], competition_id: str = "") -> dict:
+    """Choose the one running, registered competition with visible challenges."""
+    if not isinstance(competitions, list):
+        raise ctfy.CtfyError("competition list must be a list")
+    candidates = []
+    for competition in competitions:
+        if not isinstance(competition, dict):
+            continue
+        if competition.get("phase") != "running":
+            continue
+        if competition.get("is_registered") is not True:
+            continue
+        challenge_count = competition.get("challenge_count")
+        if type(challenge_count) is not int or isinstance(challenge_count, bool) \
+                or challenge_count <= 0:
+            continue
+        candidates.append(competition)
+    if competition_id:
+        competition_id = ctfy.require_id(competition_id, "competition_id")
+        matches = [
+            competition for competition in candidates
+            if competition.get("id") == competition_id
+        ]
+        if len(matches) != 1:
+            raise ctfy.CtfyError(
+                f"competition {competition_id!r} is not a unique running, "
+                "registered competition with visible challenges"
+            )
+        return matches[0]
+    if len(candidates) != 1:
+        names = ", ".join(
+            f"{competition.get('id', '')} "
+            f"({competition.get('title') or competition.get('name', '')})"
+            for competition in candidates
+        )
+        raise ctfy.CtfyError(
+            f"expected exactly one running registered competition with visible "
+            f"challenges, found {len(candidates)}"
+            + (f": {names}" if names else "")
+            + ("; pass --competition to choose one" if candidates else "")
+        )
+    return candidates[0]
+
 
 def _number(value, default=0.0):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -504,6 +558,176 @@ def request_decision(
     )
     payload = sapper.extract_json_object(envelope.get("result", ""))
     return parse_decision(payload, rows, now=now, deadline=deadline)
+
+
+class Commander:
+    """Autonomous campaign loop: refresh, decide, execute, persist, repeat.
+
+    AI decides strategy; deterministic code enforces targets, slices, capacity,
+    and ownership. Model/API failures never start a new target: they back off
+    with a bounded delay and then enter model_error/infra_error cleanup.
+    """
+
+    def __init__(self, store, client, competition, run_args, *,
+                 model: str = "", template: Path | None = None,
+                 poll_seconds: int = 30, decision_timeout: int = _DECISION_TIMEOUT,
+                 pool=None):
+        self.store = store
+        self.client = client
+        self.competition = competition
+        self.competition_id = ctfy.require_id(competition.get("id"), "competition_id")
+        self.run_args = run_args
+        self.model = model or os.environ.get("LLM_MODEL") \
+            or os.environ.get("SAPPER_MODEL", "")
+        if not self.model:
+            raise ctfy.CtfyError(
+                "campaign needs LLM_MODEL or SAPPER_MODEL to decide strategy",
+            )
+        self.template = Path(template) if template is not None else \
+            Path(__file__).resolve().parent.parent / "templates" / "ctfy" / "command.md"
+        self.poll_seconds = poll_seconds
+        self.decision_timeout = decision_timeout
+        self.pool = pool if pool is not None else WorkerPool(
+            store, client, competition, run_args,
+        )
+        self._interrupted = False
+
+    def interrupt(self) -> None:
+        self._interrupted = True
+        self.pool.cleanup("interrupt")
+
+    def _deadline(self) -> float:
+        deadline = _timestamp(self.store.load().get("deadline"))
+        if deadline is None:
+            raise ctfy.CtfyError("campaign manifest has no valid deadline")
+        return deadline
+
+    def _refresh(self):
+        return self.client.list_challenges(self.competition_id), \
+            self.client.list_instances()
+
+    def _decision_timeout(self, deadline: float, now: float) -> int:
+        remaining = max(1, int(deadline - now))
+        return max(1, min(self.decision_timeout, remaining))
+
+    def _backoff(self, remaining: float, attempts: int) -> None:
+        delay = min(_MAX_BACKOFF, _BACKOFF_BASE * (2 ** (attempts - 1)))
+        if remaining <= 0:
+            return
+        time.sleep(min(delay, max(0.0, remaining)))
+
+    def _poll(self, deadline: float) -> None:
+        if self.poll_seconds <= 0:
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(float(self.poll_seconds), remaining))
+
+    @staticmethod
+    def _no_viable_work(rows: list[dict]) -> bool:
+        return not any(
+            row.get("status") in {"idle", "parked", "active"} for row in rows
+        )
+
+    @staticmethod
+    def _challenge_by_id(challenges: list[dict], target: str) -> dict:
+        matches = [item for item in challenges if item.get("id") == target]
+        if len(matches) != 1:
+            raise ctfy.CtfyError(
+                f"decision target {target!r} is not a unique platform challenge",
+            )
+        return matches[0]
+
+    def _execute(self, decision: Decision, challenges: list[dict]):
+        if decision.action == "stop":
+            return {"stopped": True}, None
+        if decision.action == "reject":
+            return {"rejected": True}, None
+        if decision.action == "fire":
+            try:
+                return self.pool.fire(decision.target), None
+            except Exception as exc:  # noqa: BLE001 - record and continue the loop
+                return None, _error_record(exc)
+        try:
+            challenge = self._challenge_by_id(challenges, decision.target)
+        except ctfy.CtfyError as exc:
+            return None, _error_record(exc)
+        try:
+            return self.pool.start(
+                decision, challenge, background=decision.action == "hire",
+            ), None
+        except Exception as exc:  # noqa: BLE001 - record and continue the loop
+            return None, _error_record(exc)
+
+    def _record_decision(self, decision: Decision, now: float, outcome, error) -> None:
+        result = None
+        if isinstance(outcome, dict):
+            result = {
+                key: outcome[key] for key in _DECISION_RESULT_FIELDS if key in outcome
+            }
+        record = {
+            "at": now,
+            "action": decision.action,
+            "target": decision.target,
+            "minutes": decision.minutes,
+            "note": _redact(decision.note),
+        }
+        if result:
+            record["result"] = _redact(result)
+        if error:
+            record["error"] = error
+        self.store.append_decision(record)
+
+    def run(self) -> int:
+        deadline = self._deadline()
+        consecutive_model = 0
+        consecutive_infra = 0
+        while True:
+            if self._interrupted:
+                return 130
+            now = time.time()
+            if now >= deadline:
+                self.pool.cleanup("deadline")
+                return 0
+            try:
+                challenges, instances = self._refresh()
+            except Exception:  # noqa: BLE001 - platform unavailability backoff
+                consecutive_infra += 1
+                consecutive_model = 0
+                if consecutive_infra >= _INFRA_ERROR_RETRIES:
+                    self.pool.cleanup("infra_error")
+                    return 2
+                self._backoff(deadline - now, consecutive_infra)
+                continue
+            consecutive_infra = 0
+            self.pool.reap()
+            state = self.store.load()
+            rows = build_board(challenges, instances, state, now=now)
+            self.store.save(state)
+            if self._no_viable_work(rows):
+                self.pool.cleanup("stop")
+                return 0
+            try:
+                decision = request_decision(
+                    rows, deadline=deadline, model=self.model,
+                    timeout=self._decision_timeout(deadline, now),
+                    template=self.template, now=now,
+                )
+            except Exception:  # noqa: BLE001 - model unavailability backoff
+                consecutive_model += 1
+                if consecutive_model >= _MODEL_ERROR_RETRIES:
+                    self.pool.cleanup("model_error")
+                    return 2
+                self._backoff(deadline - now, consecutive_model)
+                continue
+            consecutive_model = 0
+            outcome, error = self._execute(decision, challenges)
+            self._record_decision(decision, now, outcome, error)
+            if decision.action == "stop":
+                self.pool.cleanup("stop")
+                return 0
+            self._poll(deadline)
 
 
 _WORKER_RUNNING_STATUSES = {"ready", "running"}
