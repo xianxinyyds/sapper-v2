@@ -25,15 +25,17 @@ class OpsScriptTests(unittest.TestCase):
             self.assertNotIn(token, text)
 
     def test_watchdog_detects_hangs_and_restarts(self):
-        path = ROOT / "scripts" / "ctfy-watchdog.sh"
+        wrapper = ROOT / "scripts" / "ctfy-watchdog.sh"
+        subprocess.run(["bash", "-n", str(wrapper)], check=True)
+        self.assertIn("ctfy_watchdog.py",
+                      wrapper.read_text(encoding="utf-8"))
+        path = ROOT / "scripts" / "ctfy_watchdog.py"
         text = path.read_text(encoding="utf-8")
-        subprocess.run(["bash", "-n", str(path)], check=True)
-        self.assertIn("heartbeat", text)
-        self.assertIn("lslocks", text)
-        self.assertIn("kill -TERM", text)
-        self.assertIn("kill -KILL", text)
-        self.assertIn("ctfy_local.py play", text)
-        self.assertIn("systemctl start --no-block", text)
+        compile(text, str(path), "exec")
+        for marker in (
+                "heartbeat_state", "lock_is_free", "find_play_pids",
+                "lock_holders", "os.kill", "systemctl", "start", "--no-block"):
+            self.assertIn(marker, text)
 
     def test_engine_normalizes_gateway_path_and_finishes_bounded(self):
         path = ROOT / "openai_http_engine.py"

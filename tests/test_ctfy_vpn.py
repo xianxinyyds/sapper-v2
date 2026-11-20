@@ -43,14 +43,15 @@ class VpnTests(unittest.TestCase):
         self.patch.stop()
         self.tmp.cleanup()
 
-    def test_interface_name_is_safe(self):
+    def test_interface_name_is_safe_and_deterministic(self):
+        name = ctfy_vpn.interface_name("d631cd0d-5202-4e13-b2a7-6c36bcf07e2e")
+        self.assertRegex(name, r"^ctfy-[0-9a-f]{8}$")
         self.assertEqual(
-            ctfy_vpn.interface_name("d631cd0d-5202-4e13-b2a7-6c36bcf07e2e"),
-            "ctfy-d631cd0d52",
-        )
-        self.assertLessEqual(
-            len(ctfy_vpn.interface_name("a" * 64)), 15)
-        self.assertEqual(ctfy_vpn.interface_name("../../etc"), "ctfy-etc")
+            name, ctfy_vpn.interface_name("d631cd0d-5202-4e13-b2a7-6c36bcf07e2e"))
+        self.assertLessEqual(len(ctfy_vpn.interface_name("a" * 64)), 15)
+        self.assertNotEqual(
+            ctfy_vpn.interface_name("../../etc"),
+            name)
 
     def test_simple_instances_need_no_vpn(self):
         self.assertIsNone(ctfy_vpn.ensure_vpn(FakeClient(), {"id": "i1"}))
@@ -69,22 +70,24 @@ class VpnTests(unittest.TestCase):
         ]
         with mock.patch.object(ctfy_vpn, "_run", side_effect=results) as run:
             name = ctfy_vpn.ensure_vpn(client, engagement_instance())
-        self.assertEqual(name, "ctfy-d631cd0d52")
+        expected = ctfy_vpn.interface_name("d631cd0d-5202-4e13-b2a7-6c36bcf07e2e")
+        self.assertEqual(name, expected)
         self.assertEqual(len(client.downloads), 1)
-        config = self.dir / "ctfy-d631cd0d52.conf"
+        config = self.dir / f"{expected}.conf"
         self.assertTrue(config.is_file())
         self.assertEqual(config.stat().st_mode & 0o777, 0o600)
         down = run.call_args_list[0].args[0]
         up = run.call_args_list[1].args[0]
         self.assertEqual(down[:2], ["wg", "show"])
-        self.assertEqual(up, ["wg-quick", "up", "ctfy-d631cd0d52"])
+        self.assertEqual(up, ["wg-quick", "up", expected])
 
     def test_existing_interface_is_reused_without_download(self):
         client = FakeClient()
         ok = subprocess.CompletedProcess(["wg"], 0, "", "")
         with mock.patch.object(ctfy_vpn, "_run", return_value=ok):
             name = ctfy_vpn.ensure_vpn(client, engagement_instance())
-        self.assertEqual(name, "ctfy-d631cd0d52")
+        self.assertEqual(
+            name, ctfy_vpn.interface_name("d631cd0d-5202-4e13-b2a7-6c36bcf07e2e"))
         self.assertEqual(client.downloads, [])
 
     def test_failed_bringup_removes_the_config(self):
@@ -92,6 +95,7 @@ class VpnTests(unittest.TestCase):
         results = [
             subprocess.CompletedProcess(["wg"], 1, "", ""),
             subprocess.CompletedProcess(["wg-quick"], 1, "", "boom"),
+            subprocess.CompletedProcess(["wg"], 1, "", ""),
         ]
         with mock.patch.object(ctfy_vpn, "_run", side_effect=results):
             with self.assertRaisesRegex(ctfy.CtfyError, "boom"):

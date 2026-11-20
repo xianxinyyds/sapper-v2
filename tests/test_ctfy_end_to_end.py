@@ -281,9 +281,9 @@ print(json.dumps({{"result": json.dumps(decision)}}))
         self.assertEqual(
             self.platform.submissions[-1]["answer"], "FLAG{local-integration}")
         attempt = next((self.project / "runs").rglob("wg_at_run.txt"))
-        self.assertIn("if_ctfy-instance1", attempt.read_text(encoding="utf-8"))
+        self.assertRegex(attempt.read_text(encoding="utf-8"), r"if_ctfy-[0-9a-f]{8}")
         self.assertIn("instance-1", self.platform.deleted)
-        self.assertFalse((self.wg / "if_ctfy-instance1").exists())
+        self.assertEqual(list(self.wg.glob("if_ctfy-*")), [])
         self.assertGreater((self.project / "runs" / COMPETITION / "heartbeat").stat().st_size, 0)
 
     def test_launcher_runs_the_campaign_without_manual_setup(self):

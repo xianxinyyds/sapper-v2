@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1531,6 +1532,26 @@ class WorkerSignalTests(PoolTestCase):
         )
         self.assertNotIn("token-secret", stderr.getvalue())
         self.assertNotIn("sk-proj-fakeSecret123", stderr.getvalue())
+
+
+class ExpiredInstanceTests(PoolTestCase):
+    def test_expired_record_is_not_reused_by_a_worker(self):
+        state = self.store.load()
+        state["instances"]["old-instance"] = {
+            "challenge_id": "challenge-1", "status": "ready",
+            "created_by_campaign": False, "expires_at": time.time() - 60,
+        }
+        self.store.save(state)
+        with mock.patch.object(ctfy_commander.subprocess, "Popen",
+                               side_effect=self._popen):
+            self.pool.start(self.decision("challenge-1"),
+                            self.challenge_map["challenge-1"], background=True)
+        argv, _ = self.popen_calls[-1]
+        attempt = Path(argv[argv.index("--attempt") + 1])
+        config = json.loads((attempt / "worker.json").read_text(encoding="utf-8"))
+        self.assertIsNone(config["instance_id"])
+        state = self.store.load()
+        self.assertEqual(state["instances"]["old-instance"]["status"], "expired")
 
 
 class HeartbeatTests(unittest.TestCase):

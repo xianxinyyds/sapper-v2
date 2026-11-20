@@ -2,6 +2,8 @@
 # Autonomous CTFY campaign launcher. One prompt, no manual per-instance setup.
 set -euo pipefail
 
+HOME=${HOME:-/root}
+export HOME
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT=""
 for candidate in "${CTFY_PROJECT:-}" "$PWD" "$SCRIPT_DIR/.."; do
@@ -74,9 +76,10 @@ for path in glob.glob(sys.argv[1] + "/*/campaign.json"):
     except Exception:
         continue
     deadline = state.get("deadline")
-    if isinstance(deadline, (int, float)) and deadline > time.time() \
-            and state.get("challenges"):
-        sys.exit(0)
+    if state.get("challenges"):
+        sys.exit(0)  # work has started; play finishing means the campaign ran
+    if isinstance(deadline, (int, float)) and deadline <= time.time():
+        sys.exit(0)  # the match window is over
 sys.exit(1)
 PY
 }

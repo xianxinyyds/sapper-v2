@@ -51,6 +51,28 @@ class EngineTests(unittest.TestCase):
         engine = load_engine(LLM_MODEL="deepseek-flash")
         self.assertEqual(engine.MODEL, "deepseek-flash")
 
+    def test_worker_uses_the_forwarded_llm_api_key(self):
+        engine = load_engine(LLM_API_KEY="platform-key")
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(text_message("ok")).encode()
+
+        def urlopen(request, timeout=None):
+            captured["auth"] = request.get_header("Authorization")
+            return Response()
+
+        with mock.patch.object(engine.urllib.request, "urlopen", side_effect=urlopen):
+            engine.call_model([{"role": "user", "content": "solve"}])
+        self.assertEqual(captured["auth"], "Bearer platform-key")
+
     def test_commander_mode_sends_no_tools(self):
         engine = load_engine(CTFY_ENGINE_NO_TOOLS="1")
         captured = {}
@@ -96,9 +118,12 @@ class EngineTests(unittest.TestCase):
             engine.call_model([{"role": "user", "content": "solve"}])
         self.assertEqual(captured["payload"]["tools"][0]["function"]["name"], "shell")
 
-    def test_repeated_tool_call_ends_with_a_final_answer(self):
+    def test_two_repeats_are_tolerated_three_end_the_loop(self):
         engine = load_engine()
-        replies = [tool_message(call_id="c1"), tool_message(call_id="c2")]
+        replies = [
+            tool_message(call_id="c1"), tool_message(call_id="c2"),
+            tool_message(call_id="c3"), tool_message(call_id="c4"),
+        ]
         out = io.StringIO()
         with mock.patch.object(engine, "call_model", side_effect=replies), \
                 mock.patch.object(engine, "finish_without_tools",

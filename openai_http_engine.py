@@ -14,7 +14,11 @@ BASE = os.environ.get(
     "LLM_BASE_URL", "https://deepseek.llm-next.ctfy.io/v1").rstrip("/")
 if not urllib.parse.urlsplit(BASE).path.strip("/"):
     BASE = BASE + "/v1"
-KEY = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+KEY = (
+    os.environ.get("ANTHROPIC_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("LLM_API_KEY", "")
+)
 MAX_ROUNDS = 16
 # Commander decisions need one JSON object, not an exploration loop.
 TOOLS_ENABLED = os.environ.get("CTFY_ENGINE_NO_TOOLS") != "1"
@@ -126,6 +130,7 @@ def main():
         prompt = args[args.index("--append-system-prompt") + 1] + "\n\n" + prompt
     messages = [{"role": "user", "content": prompt}]
     previous = []
+    repeats = 0
     for _ in range(1, MAX_ROUNDS + 1):
         data = call_model(messages)
         print("model response received", file=sys.stderr)
@@ -139,8 +144,12 @@ def main():
             return 0
         signature = _call_signature(calls)
         if signature and signature == previous:
+            repeats += 1
+        else:
+            repeats = 1
+        if repeats >= 3:
             return finish_without_tools(
-                messages, "the model repeated the same tool call")
+                messages, "the model repeated the same tool call three times")
         previous = signature
         messages.append({
             "role": "assistant",

@@ -26,7 +26,13 @@
      - 心跳正常 → 不做动作。
 7. **启动脚本**
    - 新增 `scripts/ctfy-qualifier-launcher.sh`：单一入口，自动加载 root 专属环境文件、派生网关 `--add-host`、调用 `play`，无任何手工 VPN/实例参数。
-8. 测试：`python3 -m pytest -q tests` → **429 passed, 1145 subtests passed（含全链路集成测试）**。
+8. **审查后追加修复**
+   - 容器内引擎读取 `LLM_API_KEY`，Worker 模型调用不再因空密钥 401。
+   - 看门狗改为 Python 实现：扫描 `/proc` 校验 cwd/cmdline 找到真正的 `play` 进程，丢失心跳时终止并重启；并处理 `lslocks`/`fuser` 兜底。
+   - launcher 与看门狗统一 `HOME`/锁路径默认值；比赛结束后不再空转重试。
+   - 过期实例记录不再被复用；VPN 接口名改为哈希，避免截断冲突；VPN 失败路径清理临时/配置文件。
+   - 引擎重复调用容忍两次、第三次才收尾，避免误杀合法重复命令。
+9. 测试：`python3 -m pytest -q tests` → **440 passed, 1145 subtests passed（含全链路集成测试与看门狗逻辑测试）**。
 
 ## 方案 A：部署修复版（首选）
 
@@ -67,6 +73,8 @@ Environment=CTFY_PROJECT=/root/workspace/sapper-c870444
 Environment=CTFY_ENV_FILE=/root/.config/ctfy/env
 Environment=CTFY_COMPETITION_ID=<初赛ID>
 Environment=CTFY_LOG=/root/workspace/sapper-c870444/runs/qualifier-play.log
+Environment=HOME=/root
+Environment=CTFY_LOCK_FILE=/root/.config/ctfy/qualifier.lock
 ExecStart=/root/bin/ctfy-qualifier.sh
 TimeoutStartSec=11h
 ```

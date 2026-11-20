@@ -2,8 +2,8 @@
 """Automatic WireGuard lifecycle for CTFY engagement instances."""
 from __future__ import annotations
 
+import hashlib
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -14,8 +14,8 @@ _CONFIG_DIR = Path(os.environ.get("CTFY_WG_DIR") or "/etc/wireguard")
 
 def interface_name(instance_id: str) -> str:
     # Linux interface names are limited to 15 characters (IFNAMSIZ - 1).
-    safe = re.sub(r"[^a-z0-9]", "", instance_id.lower())[:10] or "instance"
-    return f"ctfy-{safe}"
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:8]
+    return f"ctfy-{digest}"
 
 
 def _run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -50,15 +50,19 @@ def ensure_vpn(client: ctfy.CtfyClient, instance: dict) -> str | None:
         client.download_vpn_config(instance_id, temporary)
         os.chmod(temporary, 0o600)
         os.replace(temporary, config)
-    except ctfy.CtfyError:
+        result = _run(["wg-quick", "up", name])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:300]
+            raise ctfy.CtfyError(f"cannot bring up WireGuard {name}: {detail}")
+        return name
+    except BaseException:
         temporary.unlink(missing_ok=True)
+        try:
+            if not is_up(name):
+                config.unlink(missing_ok=True)
+        except (OSError, subprocess.SubprocessError):
+            config.unlink(missing_ok=True)
         raise
-    result = _run(["wg-quick", "up", name])
-    if result.returncode != 0:
-        config.unlink(missing_ok=True)
-        detail = (result.stderr or result.stdout).strip()[:300]
-        raise ctfy.CtfyError(f"cannot bring up WireGuard {name}: {detail}")
-    return name
 
 
 def teardown_vpn(name: str) -> None:

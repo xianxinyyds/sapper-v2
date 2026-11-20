@@ -1058,13 +1058,18 @@ class WorkerPool:
         instance_id = matching.get("id") if isinstance(matching, dict) else None
         if instance_id is None:
             for candidate_id, candidate in (state.get("instances") or {}).items():
-                if isinstance(candidate, dict) \
-                        and candidate.get("challenge_id") == challenge_id \
-                        and candidate.get("closed") is not True \
-                        and candidate.get("status") not in {
+                if not isinstance(candidate, dict) \
+                        or candidate.get("challenge_id") != challenge_id \
+                        or candidate.get("closed") is True \
+                        or candidate.get("status") in {
                             "stopped", "expired", "failed", "error"}:
-                    instance_id = candidate_id
-                    break
+                    continue
+                expires_at = _timestamp(candidate.get("expires_at"))
+                if expires_at is not None and expires_at <= now:
+                    candidate["status"] = "expired"
+                    continue
+                instance_id = candidate_id
+                break
         config = self._worker_config(
             challenge_id, decision, attempt, instance_id=instance_id,
         )
