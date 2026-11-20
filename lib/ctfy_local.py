@@ -100,10 +100,6 @@ def build_task(challenge: dict, instance: dict | None, competition_id: str,
                 expires_at, timezone.utc,
             ).isoformat()
     topology = (instance or {}).get("network_topology", "simple")
-    if topology == "engagement":
-        raise ctfy.CtfyError(
-            "local engagement networking is not configured; use a simple or QA challenge"
-        )
     attachments = []
     for attachment in source.get("attachments", []):
         attachment = _object(attachment, "attachment")
@@ -205,6 +201,7 @@ def _docker_command(args, work_dir: Path) -> list[str]:
     )[:60] + f"-{os.getpid()}"
     command = [
         "docker", "run", "--rm", "--name", name,
+        "--network", "host",
         "--mount", f"type=bind,src={work_dir.resolve()},dst=/ctfy/work",
         "--mount", (
             f"type=bind,src={Path(__file__).resolve().parent},"
@@ -310,7 +307,19 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
     owns_instance = False
     try:
         if challenge.get("is_qa_only") is not True:
-            instance = _find_instance(client, challenge_id, competition_id)
+            known_id = getattr(args, "instance_id", None)
+            forced_id = os.environ.get("CTFY_FORCE_INSTANCE_ID", "").strip()
+            forced_challenge = os.environ.get("CTFY_FORCE_CHALLENGE_ID", "").strip()
+            if known_id:
+                instance = client.get_instance(
+                    ctfy.require_id(known_id, "instance_id"),
+                    retry=True, require_questions=True,
+                )
+            elif forced_id and forced_challenge == challenge_id:
+                instance = client.get_instance(
+                    forced_id, retry=True, require_questions=True)
+            else:
+                instance = _find_instance(client, challenge_id, competition_id)
             if instance is None:
                 def track_instance(instance_id):
                     nonlocal pending_instance_id
@@ -324,6 +333,10 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
                 pending_instance_id = None
                 created_instance = True
             ctfy.require_id(instance.get("id"), "instance_id")
+        vpn_interface = None
+        if instance is not None:
+            import ctfy_vpn
+            vpn_interface = ctfy_vpn.ensure_vpn(client, instance)
         task = build_task(
             challenge, instance, competition_id, args.platform_url, args.max_turns,
         )
@@ -353,11 +366,13 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
             "work_dir": str(work_dir), "instance_id": task["target_instance"],
             "created_instance": created_instance, "prepare_only": args.prepare_only,
             "container_exit_code": None, "result": None, "handoff": [],
+            "vpn_interface": vpn_interface,
         }
         if on_event is not None:
             on_event("prepared", {
                 "work_dir": str(work_dir), "instance_id": task["target_instance"],
                 "created_instance": created_instance,
+                "vpn_interface": vpn_interface,
             })
         if args.prepare_only:
             return outcome
@@ -541,6 +556,28 @@ def play(args, *, client=None) -> int:
     store, manifest, competition = _resolve_campaign(
         client, args, _runs_root(), now=time.time(),
     )
+    adopt = getattr(args, "adopt", None) or []
+    if adopt:
+        with store.lock():
+            state = store.load()
+            for spec in adopt:
+                if "=" not in spec:
+                    raise ctfy.CtfyError("--adopt requires CHALLENGE=INSTANCE")
+                challenge_id, instance_id = spec.split("=", 1)
+                challenge_id = ctfy.require_id(challenge_id, "challenge_id")
+                instance_id = ctfy.require_id(instance_id, "instance_id")
+                state.setdefault("instances", {})[instance_id] = {
+                    "challenge_id": challenge_id,
+                    "created_by_campaign": False,
+                    "status": "ready",
+                    "adopted_at": time.time(),
+                }
+            store.save(state)
+    engine = getattr(args, "engine", None)
+    if engine is not None:
+        os.environ["SAPPER_BIN"] = str(Path(engine).resolve())
+        # The commander must answer with one JSON object, not explore with tools.
+        os.environ["CTFY_ENGINE_NO_TOOLS"] = "1"
     commander = ctfy_commander.Commander(
         store, client, competition, args, poll_seconds=args.poll_seconds,
     )
@@ -587,6 +624,12 @@ def cleanup(args, *, client=None) -> int:
             record["status"] = "stopped"
             stopped.append(instance_id)
             changed = True
+            try:
+                import ctfy_vpn
+                ctfy_vpn.teardown_vpn(ctfy_vpn.interface_name(instance_id))
+            except (OSError, ctfy.CtfyError, subprocess.SubprocessError) as exc:
+                sys.stderr.write(
+                    f"ctfy-local: vpn teardown failed for {instance_id}: {exc}\n")
         if changed:
             store.save(state)
     print(json.dumps(
@@ -630,6 +673,7 @@ def _add_worker_options(parser) -> None:
     parser.add_argument("--dispatch-timeout", type=_positive, default=300)
     parser.add_argument("--startup-timeout", type=_positive, default=300)
     parser.add_argument("--ttl", type=_positive)
+    parser.add_argument("--instance-id", default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -663,6 +707,10 @@ def build_parser() -> argparse.ArgumentParser:
     play_parser.add_argument("--stall-minutes", type=_positive, default=30)
     play_parser.add_argument("--max-workers", type=_positive, default=2)
     play_parser.add_argument("--poll-seconds", type=_positive, default=30)
+    play_parser.add_argument(
+        "--adopt", action="append", default=[], metavar="CHALLENGE=INSTANCE",
+        help="record an existing platform instance as reusable, never auto-closed",
+    )
     _add_worker_options(play_parser)
     play_parser.set_defaults(func=play)
     cleanup_parser = sub.add_parser(

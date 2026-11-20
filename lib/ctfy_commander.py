@@ -185,6 +185,9 @@ def _instance_for(challenge: dict, instances: list[dict]) -> dict | None:
 
 
 def _unsupported(challenge: dict, instance: dict | None, task: dict) -> str | None:
+    only = os.environ.get("CTFY_ONLY_CHALLENGE", "").strip()
+    if only and challenge.get("id") != only:
+        return "filtered by operator for this slot"
     if challenge.get("defence") is not None:
         return "defence challenges are unsupported"
     source = instance or challenge
@@ -193,11 +196,9 @@ def _unsupported(challenge: dict, instance: dict | None, task: dict) -> str | No
     if topology in (None, "", "simple") and mode not in (None, "", "simple", "instance", "qa"):
         topology = mode
     normalized = topology.lower() if isinstance(topology, str) else topology
-    if normalized == "engagement":
-        return "engagement networking is unsupported"
     if normalized == "awd" or challenge.get("awd") is True:
         return "AWD challenges are unsupported"
-    if normalized != "simple":
+    if normalized not in {"simple", "engagement"}:
         return f"unknown challenge mode {str(topology)[:80]!r} is unsupported"
     task_mode = task.get("run_mode")
     if task_mode is not None and task_mode not in {"instance", "qa"}:
@@ -627,6 +628,14 @@ class Commander:
             handled += 1
         return 130
 
+    def _heartbeat(self) -> None:
+        """Prove the loop is alive so the host watchdog can detect a hang."""
+        try:
+            (self.store.root / "heartbeat").write_text(
+                str(time.time()) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
     def _deadline(self) -> float:
         deadline = _timestamp(self.store.load().get("deadline"))
         if deadline is None:
@@ -716,6 +725,7 @@ class Commander:
         consecutive_model = 0
         consecutive_infra = 0
         while True:
+            self._heartbeat()
             if self._interrupts:
                 return self._cleanup_interrupts()
             now = time.time()
@@ -724,7 +734,9 @@ class Commander:
                 return 0
             try:
                 challenges, instances = self._refresh()
-            except Exception:  # noqa: BLE001 - platform unavailability backoff
+            except Exception as exc:  # noqa: BLE001 - platform unavailability backoff
+                sys.stderr.write(
+                    f"[ctfy-commander] refresh failed: {_redact(str(exc))}\n")
                 consecutive_infra += 1
                 consecutive_model = 0
                 if self._interrupts:
@@ -750,7 +762,9 @@ class Commander:
                     timeout=self._decision_timeout(deadline, now),
                     template=self.template, now=now,
                 )
-            except Exception:  # noqa: BLE001 - model unavailability backoff
+            except Exception as exc:  # noqa: BLE001 - model unavailability backoff
+                sys.stderr.write(
+                    f"[ctfy-commander] decision failed: {_redact(str(exc))}\n")
                 consecutive_model += 1
                 if self._interrupts:
                     return self._cleanup_interrupts()
@@ -764,6 +778,7 @@ class Commander:
                 return self._cleanup_interrupts()
             outcome, error = self._execute(decision, challenges)
             self._record_decision(decision, now, outcome, error)
+            self._heartbeat()
             if decision.action == "stop":
                 self.pool.cleanup("stop")
                 return 0
@@ -857,7 +872,7 @@ class WorkerPool:
         self._accepting = True
         self._cleanup_reason = None
         self._interrupts = 0
-        self._capacity_blocked = False
+        self._capacity_blocked_until = 0.0
         self._last_instances = []
 
     def _competition_instances(self, instances):
@@ -962,7 +977,7 @@ class WorkerPool:
                     return attempt
         return self._new_attempt(challenge["id"])
 
-    def _worker_config(self, challenge_id, decision, attempt):
+    def _worker_config(self, challenge_id, decision, attempt, instance_id=None):
         engine = self.run_args.get("engine")
         add_host = self.run_args.get("add_host", [])
         return {
@@ -971,6 +986,7 @@ class WorkerPool:
             ),
             "competition": self.competition_id,
             "challenge_id": challenge_id,
+            "instance_id": instance_id,
             "work_dir": str(attempt),
             "image": self.run_args.get("image", "sapper-ctfy:local-test"),
             "engine": str(engine) if engine is not None else None,
@@ -992,8 +1008,9 @@ class WorkerPool:
             raise ctfy.CtfyError("worker decision does not match its challenge")
         self.reap()
         self.recover()
-        if self._capacity_blocked:
-            raise ctfy.CtfyError("platform capacity rejection is paused pending reconciliation")
+        if time.time() < self._capacity_blocked_until:
+            raise ctfy.CtfyError(
+                "platform capacity rejection is paused pending reconciliation")
         instances = self._last_instances
         matching = self._matching_instances(instances, challenge_id)
         state = self.store.load()
@@ -1038,7 +1055,19 @@ class WorkerPool:
         records = state.setdefault("challenges", {})
         record = records.setdefault(challenge_id, {})
         attempt = self._choose_attempt(record, challenge, matching)
-        config = self._worker_config(challenge_id, decision, attempt)
+        instance_id = matching.get("id") if isinstance(matching, dict) else None
+        if instance_id is None:
+            for candidate_id, candidate in (state.get("instances") or {}).items():
+                if isinstance(candidate, dict) \
+                        and candidate.get("challenge_id") == challenge_id \
+                        and candidate.get("closed") is not True \
+                        and candidate.get("status") not in {
+                            "stopped", "expired", "failed", "error"}:
+                    instance_id = candidate_id
+                    break
+        config = self._worker_config(
+            challenge_id, decision, attempt, instance_id=instance_id,
+        )
         _atomic_json(attempt / "worker.json", config)
         argv = [
             sys.executable, str(Path(__file__).resolve()), "worker",
@@ -1152,6 +1181,11 @@ class WorkerPool:
         record["closed"] = True
         record["status"] = "stopped"
         self.store.save(state)
+        try:
+            import ctfy_vpn
+            ctfy_vpn.teardown_vpn(ctfy_vpn.interface_name(instance_id))
+        except (OSError, ctfy.CtfyError, subprocess.SubprocessError):
+            pass
         return True
 
     def _finalize(self, target, *, outcome=None, recovery=False, error=None):
@@ -1211,7 +1245,7 @@ class WorkerPool:
                     "capacity", "instance_limit", "max_instances", "quota",
                     "resource_limit", "too many instances",
             )):
-                self._capacity_blocked = True
+                self._capacity_blocked_until = time.time() + 300
         elif errors:
             worker["error"] = errors[-1]
         summary = _result_summary(attempt)
@@ -1298,7 +1332,7 @@ class WorkerPool:
 
     def fire(self, target: str) -> dict:
         target = ctfy.require_id(target, "challenge_id")
-        self._capacity_blocked = False
+        self._capacity_blocked_until = 0.0
         self.reap()
         state = self.store.load()
         worker = state.setdefault("workers", {}).get(target)
@@ -1595,6 +1629,7 @@ def _worker_namespace(config, challenge_id, attempt):
         dispatch_timeout=int(config.get("dispatch_timeout", 300)),
         startup_timeout=int(config.get("startup_timeout", 300)),
         ttl=config.get("ttl"),
+        instance_id=config.get("instance_id"),
         prepare_only=False,
         keep_instance=True,
     )

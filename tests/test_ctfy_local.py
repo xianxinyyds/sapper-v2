@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -61,7 +62,8 @@ class FakeClient:
             return [self.instance]
         return []
 
-    def get_instance(self, instance_id):
+    def get_instance(self, instance_id, **kwargs):
+        self.events.append(("get", instance_id))
         return self.instance
 
     def start_instance(self, challenge_id, competition_id, ttl=None, **kwargs):
@@ -153,12 +155,25 @@ class CtfyLocalTaskTests(unittest.TestCase):
         with self.assertRaisesRegex(ctfy.CtfyError, "another"):
             ctfy_local.prepare_work_dir(FakeClient(), self.work, other_competition)
 
-    def test_engagement_requires_explicit_network_support(self):
-        with self.assertRaisesRegex(ctfy.CtfyError, "networking"):
-            ctfy_local.build_task(
-                challenge(is_qa_only=False), instance(network_topology="engagement"),
-                "competition-1", "http://platform", 3,
+    def test_engagement_builds_a_task_and_delegates_vpn_to_the_worker(self):
+        target = instance(network_topology="engagement")
+        task = ctfy_local.build_task(
+            challenge(is_qa_only=False), target,
+            "competition-1", "http://platform", 3,
+        )
+        self.assertEqual(task["run_mode"], "instance")
+        self.assertEqual(task["target_endpoints"][0]["url"],
+                         "https://target.example:443")
+        args = ctfy_local.build_parser().parse_args([
+            "run", "challenge-1", "--competition", "competition-1",
+            "--work-dir", str(self.work), "--prepare-only", "--keep-instance",
+        ])
+        with mock.patch("ctfy_vpn.ensure_vpn", return_value="ctfy-instance1") as ensure:
+            outcome = ctfy_local.run_challenge(
+                args, client=FakeClient(challenge(is_qa_only=False), target),
             )
+        ensure.assert_called_once()
+        self.assertEqual(outcome["vpn_interface"], "ctfy-instance1")
 
     def test_handoff_uses_the_matching_grader_once_per_candidate(self):
         for mode in ("instance", "qa"):
@@ -353,10 +368,11 @@ class CtfyLocalRunTests(unittest.TestCase):
                     "work_dir": str(self.work), "instance_id": "instance-1",
                     "created_instance": created, "prepare_only": True,
                     "container_exit_code": None, "result": None, "handoff": [],
+                    "vpn_interface": None,
                 })
                 self.assertEqual(events, [("prepared", {
                     "work_dir": str(self.work), "instance_id": "instance-1",
-                    "created_instance": created,
+                    "created_instance": created, "vpn_interface": None,
                 })])
                 self.assertNotIn("stop", [event[0] for event in client.events])
 
@@ -381,7 +397,7 @@ class CtfyLocalRunTests(unittest.TestCase):
 
         self.assertEqual(set(outcome), {
             "work_dir", "instance_id", "created_instance", "prepare_only",
-            "container_exit_code", "result", "handoff",
+            "container_exit_code", "result", "handoff", "vpn_interface",
         })
         self.assertEqual(outcome["work_dir"], str(self.work))
         self.assertEqual(outcome["instance_id"], "instance-1")
@@ -393,10 +409,21 @@ class CtfyLocalRunTests(unittest.TestCase):
         self.assertEqual([name for name, _ in events], ["prepared", "container"])
         self.assertEqual(events[0][1], {
             "work_dir": str(self.work), "instance_id": "instance-1",
-            "created_instance": True,
+            "created_instance": True, "vpn_interface": None,
         })
         self.assertEqual(events[1][1], {"name": container_names[0]})
         self.assertNotIn("stop", [event[0] for event in client.events])
+
+    def test_known_instance_id_is_reused_when_listing_is_unavailable(self):
+        client = FakeClient(challenge(is_qa_only=False), instance())
+        client.list_instances = mock.Mock(return_value=[])
+        args = self.args("--prepare-only", "--keep-instance",
+                         "--instance-id", "instance-1")
+        outcome = ctfy_local.run_challenge(args, client=client)
+        self.assertEqual(outcome["instance_id"], "instance-1")
+        self.assertFalse(outcome["created_instance"])
+        client.list_instances.assert_not_called()
+        self.assertNotIn("start", [event[0] for event in client.events])
 
     def test_reused_instance_is_preserved_on_worker_error_without_keep(self):
         client = FakeClient(challenge(is_qa_only=False), instance())
@@ -762,6 +789,41 @@ class PlayCommandTests(unittest.TestCase):
         fake_signals.install.assert_called_once()
         fake_signals.restore.assert_called_once()
         fake_commander.run.assert_called_once()
+
+    def test_play_routes_commander_decisions_through_the_engine(self):
+        self.write_campaign("competition-a", NOW + 3600)
+        fake_client = FakeDiscoveryClient([])
+        fake_commander = mock.Mock()
+        fake_commander.run.return_value = 0
+        args = ctfy_local.build_parser().parse_args([
+            "play", "--engine", str(ROOT / "openai_http_engine.py"),
+        ])
+        with mock.patch.dict("os.environ", {}, clear=False), \
+                mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client), \
+                mock.patch("ctfy_commander.Commander", return_value=fake_commander), \
+                mock.patch.object(ctfy_local, "_PlaySignals", return_value=mock.Mock()):
+            self.assertEqual(ctfy_local.play(args), 0)
+            self.assertEqual(
+                os.environ["SAPPER_BIN"], str((ROOT / "openai_http_engine.py").resolve()))
+            self.assertEqual(os.environ["CTFY_ENGINE_NO_TOOLS"], "1")
+
+    def test_play_can_adopt_an_existing_instance_for_reuse(self):
+        root = self.write_campaign("competition-a", NOW + 3600)
+        fake_client = FakeDiscoveryClient([])
+        fake_commander = mock.Mock()
+        fake_commander.run.return_value = 0
+        args = ctfy_local.build_parser().parse_args([
+            "play", "--adopt", "challenge-1=instance-1",
+        ])
+        with mock.patch.object(ctfy_local, "_runs_root", return_value=self.runs), \
+                mock.patch.object(ctfy_local.ctfy, "CtfyClient", return_value=fake_client), \
+                mock.patch("ctfy_commander.Commander", return_value=fake_commander), \
+                mock.patch.object(ctfy_local, "_PlaySignals", return_value=mock.Mock()):
+            self.assertEqual(ctfy_local.play(args), 0)
+        state = json.loads((root / "campaign.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["instances"]["instance-1"]["challenge_id"], "challenge-1")
+        self.assertFalse(state["instances"]["instance-1"]["created_by_campaign"])
 
     def test_play_expired_manifest_smoke_test_creates_fresh_campaign(self):
         self.write_campaign("competition-1", NOW - 3600)

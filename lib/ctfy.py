@@ -277,6 +277,12 @@ class CtfyClient:
             f"/api/v1/instances/{instance}/attachments/{filename}", destination,
         )
 
+    def download_vpn_config(self, instance_id: str, destination: Path) -> None:
+        instance = self._segment(instance_id, "instance_id")
+        self._download_to_path(
+            f"/api/v1/instances/{instance}/vpn-config", destination,
+        )
+
     def download_challenge_attachment(self, challenge_id: str, name: str,
                                       destination: Path) -> None:
         challenge = self._segment(challenge_id, "challenge_id")

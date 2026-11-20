@@ -286,11 +286,12 @@ class BoardTests(unittest.TestCase):
         self.assertIsNone(by_id["solved"]["unsupported"])
         self.assertEqual(by_id["closed"]["status"], "closed")
         self.assertIsNone(by_id["closed"]["unsupported"])
-        for challenge_id in ("engagement", "defence", "awd", "unknown"):
+        self.assertEqual(by_id["engagement"]["status"], "idle")
+        self.assertIsNone(by_id["engagement"]["unsupported"])
+        for challenge_id in ("defence", "awd", "unknown"):
             with self.subTest(challenge_id=challenge_id):
                 self.assertEqual(by_id[challenge_id]["status"], "unsupported")
                 self.assertTrue(by_id[challenge_id]["unsupported"])
-        self.assertIn("engagement", by_id["engagement"]["unsupported"])
         self.assertIn("defence", by_id["defence"]["unsupported"])
         self.assertIn("AWD", by_id["awd"]["unsupported"])
         self.assertIn("unknown", by_id["unknown"]["unsupported"])
