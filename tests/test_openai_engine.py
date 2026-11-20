@@ -52,7 +52,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.MODEL, "deepseek-flash")
 
     def test_worker_uses_the_forwarded_llm_api_key(self):
-        engine = load_engine(LLM_API_KEY="platform-key")
+        engine = load_engine(
+            LLM_API_KEY="platform-key",
+            ANTHROPIC_API_KEY="", OPENAI_API_KEY="",
+        )
         captured = {}
 
         class Response:

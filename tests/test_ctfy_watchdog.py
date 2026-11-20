@@ -101,6 +101,32 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn(["systemctl", "start", "--no-block",
                        "ctfy-qualifier.service"], calls)
 
+    def test_a_just_started_campaign_without_heartbeat_is_not_killed(self):
+        campaign = self.runs / "c1"
+        campaign.mkdir()
+        (campaign / "campaign.json").write_text("{}", encoding="utf-8")
+        lock = self.root / "qualifier.lock"
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        killed = []
+        env = {
+            "CTFY_PROJECT": str(self.project),
+            "CTFY_RUNS_ROOT": str(self.runs),
+            "CTFY_LOCK_FILE": str(lock),
+            "CTFY_WINDOW_START": "0000",
+            "CTFY_WINDOW_END": "2359",
+        }
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(watchdog, "find_play_pids",
+                                      return_value=[4242]), \
+                    mock.patch.object(watchdog.os, "kill",
+                                      side_effect=lambda pid, sig: killed.append(pid)):
+                self.assertEqual(watchdog.main(), 0)
+        finally:
+            os.close(fd)
+        self.assertEqual(killed, [])
+
     def test_stale_campaign_kills_only_verified_play_pids(self):
         campaign = self.runs / "c1"
         campaign.mkdir()

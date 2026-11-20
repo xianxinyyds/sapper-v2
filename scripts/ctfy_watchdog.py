@@ -129,6 +129,11 @@ def main(argv=None) -> int:
     if state == "fresh":
         log("campaign healthy")
         return 0
+    if state == "missing":
+        # A campaign that just started has not written its first heartbeat
+        # yet; never kill it based on absence alone.
+        log("campaign starting (no heartbeat yet); leaving state alone")
+        return 0
 
     pids = find_play_pids(project)
     if not pids:
@@ -154,7 +159,9 @@ def main(argv=None) -> int:
     time.sleep(1)
     if lock_is_free(lock):
         systemctl("reset-failed", service)
-        systemctl("start", "--no-block", service)
+        # A killed launcher can leave the oneshot unit nominally active; a
+        # restart guarantees a fresh ExecStart.
+        systemctl("restart", "--no-block", service)
     return 0
 
 
