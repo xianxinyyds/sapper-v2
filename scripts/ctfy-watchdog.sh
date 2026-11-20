@@ -31,6 +31,9 @@ play_pid_for_lock() {
   local pid
   pid=$(lslocks 2>/dev/null \
     | awk -v f="$LOCK" '$0 ~ f {print $2; exit}')
+  if [[ -z "$pid" ]] && command -v fuser >/dev/null 2>&1; then
+    pid=$(fuser "$LOCK" 2>/dev/null | awk '{print $1; exit}')
+  fi
   [[ -n "$pid" ]] || return 1
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "lib/ctfy_local.py play" \
     || return 1
