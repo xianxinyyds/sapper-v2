@@ -65,7 +65,16 @@ journalctl -u ctfy-qualifier -f
 - 测试后已清理：临时 unit、初赛 `runs/` 目录、启动日志、锁文件；平台无本 campaign 实例。
 - 最终状态：仅保留 `ctfy-qualifier.timer`（下次 `2026-11-20 10:00:00 CST`）与对应 service，初赛无任何历史 campaign/decisions 残留。
 
-## 7. 已知边界
+## 7. 中断与重连机制
+
+- **单题 Worker 崩溃**：campaign 循环在每轮 `reap()` 中回收并记录结果；AI 可重新 `work/hire` 同一题，旧 attempt 与新实例隔离，不会把旧动态 flag 带到新实例。
+- **模型网关瞬时故障**：决策调用有 3 次有界退避；持续失败停止分配新题并进入可恢复的 `model_error`，保留实例。
+- **`play` 进程异常退出**：启动器内部最多重试 40 次（每次间隔 30 秒）；只有在“看板已出现题目且 play 正常结束”时才认为比赛结束。
+- **整个 campaign 进程被 OOM/外部杀掉**：`ctfy-qualifier-watchdog.timer` 每 5 分钟幂等调用同一启动器。`flock` 保证不会并发；主进程存活时立即退出，进程已死时从 `campaign.json` 恢复（活的 deadline、实例对账、旧 attempt 隔离）。窗口外（非 10:00–20:05）自动不动作。
+- **主机重启**：两个 timer 均为 `Persistent=true`，错过触发会在恢复后补跑；service `After=docker.service` 等待 Docker。
+- **SSH 断开**：不影响 systemd 中的比赛进程。
+
+## 8. 已知边界
 
 - 初选赛开始前无法验证真实题目实例的完整“拉题→附件→解题→判分”链路；该链路此前已在 Cut the Clock 上由 Agent 自主解出并以平台 `answered_correctly=true` 验证。
 - 模型决策质量不纳入代码测试；测试验证的是边界、安全与状态机。
