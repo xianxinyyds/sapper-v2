@@ -54,7 +54,18 @@ journalctl -u ctfy-qualifier -f
 
 停止：首次 `SIGINT` 保留实例并有序收尾；第二次中断进入有界强制路径。比赛结束后可用 `cleanup --competition` 关闭本 campaign 创建的遗留实例。
 
-## 6. 已知边界
+## 6. 最终版本与定时启动核验（赛前）
+
+- 容器运行时以只读方式挂载宿主 `lib/` 到 `/opt/sapper/lib`。实测宿主与容器内以下文件 SHA-256 完全一致：
+  `ctfy_run.py`、`ctfy_commander.py`、`ctfy_local.py`。
+- 镜像内 `templates/ctfy/reason.md`、`explore.md`、`verify.md` 与宿主哈希完全一致，无需重建镜像。
+- 用一个 8 秒后触发的临时 systemd 定时任务实测真实启动链路：
+  定时器触发 → 启动器加载凭据 → 网关预检 `gateway ok` → 调用 `play --competition <初赛>`。
+  赛前比赛尚未运行，`play` 安全退出且未创建实例，符合预期。
+- 测试后已清理：临时 unit、初赛 `runs/` 目录、启动日志、锁文件；平台无本 campaign 实例。
+- 最终状态：仅保留 `ctfy-qualifier.timer`（下次 `2026-11-20 10:00:00 CST`）与对应 service，初赛无任何历史 campaign/decisions 残留。
+
+## 7. 已知边界
 
 - 初选赛开始前无法验证真实题目实例的完整“拉题→附件→解题→判分”链路；该链路此前已在 Cut the Clock 上由 Agent 自主解出并以平台 `answered_correctly=true` 验证。
 - 模型决策质量不纳入代码测试；测试验证的是边界、安全与状态机。
