@@ -1533,6 +1533,19 @@ class WorkerSignalTests(PoolTestCase):
         self.assertNotIn("sk-proj-fakeSecret123", stderr.getvalue())
 
 
+class HeartbeatTests(unittest.TestCase):
+    def test_heartbeat_file_is_written_for_the_watchdog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ctfy_campaign.CampaignStore(Path(tmp))
+            commander = ctfy_commander.Commander(
+                store, mock.Mock(), {"id": "competition-1"},
+                argparse.Namespace(), model="deepseek-v4-pro", pool=mock.Mock(),
+            )
+            commander._heartbeat()
+            value = float((Path(tmp) / "heartbeat").read_text(encoding="utf-8"))
+            self.assertGreater(value, 0)
+
+
 class SelectCompetitionTests(unittest.TestCase):
     def competition(self, competition_id="competition-1", **overrides):
         value = {
