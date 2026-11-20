@@ -2,12 +2,22 @@
 # Autonomous CTFY campaign launcher. One prompt, no manual per-instance setup.
 set -euo pipefail
 
-PROJECT=${CTFY_PROJECT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT=""
+for candidate in "${CTFY_PROJECT:-}" "$PWD" "$SCRIPT_DIR/.."; do
+  if [[ -n "$candidate" && -f "$candidate/lib/ctfy_local.py" ]]; then
+    PROJECT=$(cd "$candidate" && pwd)
+    break
+  fi
+done
+: "${PROJECT:?set CTFY_PROJECT to the sapper checkout (lib/ctfy_local.py not found)}"
 ENV_FILE=${CTFY_ENV_FILE:-$HOME/.config/ctfy/env}
 LOG=${CTFY_LOG:-$PROJECT/runs/qualifier-play.log}
 
-mkdir -p "$PROJECT/runs"
-exec 9>"${CTFY_LOCK_FILE:-$HOME/.config/ctfy/qualifier.lock}"
+mkdir -p "$PROJECT/runs" "$(dirname "${CTFY_LOG:-$PROJECT/runs/qualifier-play.log}")"
+LOCK_FILE=${CTFY_LOCK_FILE:-$HOME/.config/ctfy/qualifier.lock}
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "ctfy-qualifier: another run holds the lock" >&2
   exit 0
@@ -42,7 +52,7 @@ args=(
   --image "${CTFY_IMAGE:-sapper-ctfy-web-test:latest}"
   --max-turns "${CTFY_MAX_TURNS:-16}"
   --dispatch-timeout "${CTFY_DISPATCH_TIMEOUT:-1800}"
-  --engine "$PROJECT/openai_http_engine.py"
+  --engine "${CTFY_ENGINE:-$PROJECT/openai_http_engine.py}"
   --add-host "$GW_HOST:$GW_IP"
 )
 if [[ -n "${CTFY_COMPETITION_ID:-}" ]]; then

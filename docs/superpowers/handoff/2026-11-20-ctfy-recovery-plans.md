@@ -1,7 +1,7 @@
-# CTFY 初赛：修复版与回退版行动方案
+# CTFY 初赛：方案 A 修复与本地验证
 
 日期：2026-11-20
-适用：VPS 网络恢复后立即执行。两个方案互斥，按决策规则选择。
+适用：VPS 网络恢复后立即部署方案 A。方案 B 已放弃。
 
 ## 本次本地修复（相对比赛时的失败版本）
 
@@ -26,7 +26,7 @@
      - 心跳正常 → 不做动作。
 7. **启动脚本**
    - 新增 `scripts/ctfy-qualifier-launcher.sh`：单一入口，自动加载 root 专属环境文件、派生网关 `--add-host`、调用 `play`，无任何手工 VPN/实例参数。
-8. 测试：`python3 -m pytest -q tests` → **416 passed, 1145 subtests passed**。
+8. 测试：`python3 -m pytest -q tests` → **429 passed, 1145 subtests passed（含全链路集成测试）**。
 
 ## 方案 A：部署修复版（首选）
 
@@ -50,22 +50,40 @@
    - `wg show` 出现 `ctfy-<instance>`。
 7. **验收标准**：AI 决策 → Worker 启动 → 自动建 VPN → 目标 HTTP 可达 → 平台出现提交/进度；或至少 Worker 连续运行而非秒退。
 
-## 方案 B：回退稳定版（昨日未加调度系统的版本）
+### systemd 单元（方案 A 部署用）
 
-回退点：`c870444`（“expand CTFY Pwn Reverse and Crypto knowledge bases”）。VPS 上还有 `sapper-c870444.tar.gz` 备份。
+`ctfy-qualifier.service`：
 
-1. 停止并禁用调度单元：
-   `systemctl stop ctfy-qualifier.service ctfy-qualifier-watchdog.timer ctfy-qualifier.timer`
-2. 用备份恢复项目（或本地 `git archive c870444` 上传）。
-3. 不启用定时器；按单题方式运行：
-   `python3 lib/ctfy_local.py run <challenge_id> --competition <id> --image sapper-ctfy-web-test:latest --keep-instance --engine openai_http_engine.py`
-4. 稳定版没有自动 VPN；engagement 题需要人工先建立该实例的 WireGuard 隧道并让容器使用宿主网络。若不想人工操作，应优先选择 QA/直连题，或在方案 A 修复后再启用。
-5. 优点：避开新调度系统的未知缺陷；缺点：不具备“一句话打整场”和自动保活。
+```ini
+[Unit]
+Description=CTFY qualifier autonomous campaign
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/workspace/sapper-c870444
+Environment=CTFY_PROJECT=/root/workspace/sapper-c870444
+Environment=CTFY_ENV_FILE=/root/.config/ctfy/env
+Environment=CTFY_COMPETITION_ID=<初赛ID>
+Environment=CTFY_LOG=/root/workspace/sapper-c870444/runs/qualifier-play.log
+ExecStart=/root/bin/ctfy-qualifier.sh
+TimeoutStartSec=11h
+```
+
+`ctfy-qualifier-watchdog.timer` 每 5 分钟执行 `scripts/ctfy-watchdog.sh`，同样通过
+`Environment=CTFY_PROJECT=...`、`CTFY_SERVICE=ctfy-qualifier.service` 指定对象。
+
+## 方案 B：已放弃
+
+用户已明确：不能全自动解题的回退版没有价值，不再作为比赛方案。
+仅在方案 A 彻底无法运行且需要人工单题兜底时，才由用户显式决定是否临时使用
+`c870444` 快照；默认不执行。
 
 ## 决策规则
 
 - 网络恢复后先执行方案 A，最多尝试 2 次；每次用日志确认失败层（平台/模型/VPN/容器）。
-- 若 2 次仍在 10 分钟内无法让任一 Worker 持续运行，立即执行方案 B，保证至少能用稳定单题路径拿分。
+- 若 2 次仍在 10 分钟内无法让任一 Worker 持续运行，停止自动调度并报告失败层；不再回退方案 B。
 - 任何回退都保留 `runs/` 证据，不删除历史 attempt；只清理测试实例与测试 campaign。
 
 ## 执行前必须确认

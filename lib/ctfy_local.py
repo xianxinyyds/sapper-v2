@@ -440,7 +440,8 @@ def run_local(args) -> int:
 
 
 def _runs_root() -> Path:
-    return Path.cwd() / "runs"
+    override = os.environ.get("CTFY_RUNS_ROOT")
+    return Path(override) if override else Path.cwd() / "runs"
 
 
 def _resumable_campaign(manifest: dict, *, now: float) -> tuple[str, float] | None:

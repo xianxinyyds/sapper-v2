@@ -9,7 +9,7 @@ from pathlib import Path
 
 import ctfy
 
-_CONFIG_DIR = Path("/etc/wireguard")
+_CONFIG_DIR = Path(os.environ.get("CTFY_WG_DIR") or "/etc/wireguard")
 
 
 def interface_name(instance_id: str) -> str:
