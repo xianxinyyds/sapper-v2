@@ -59,6 +59,14 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(
             watchdog.heartbeat_state(self.runs, now=now, stale=900), "stale")
 
+    def test_old_launch_marker_without_manifest_is_stale(self):
+        now = time.time()
+        marker = self.runs / ".launch-start"
+        marker.write_text("1", encoding="utf-8")
+        os.utime(marker, (now - 1000, now - 1000))
+        self.assertEqual(
+            watchdog.heartbeat_state(self.runs, now=now, stale=900), "stale")
+
     def test_missing_heartbeat_with_old_campaign_is_stale(self):
         campaign = self.runs / "c1"
         campaign.mkdir()
@@ -161,6 +169,43 @@ class WatchdogTests(unittest.TestCase):
             os.close(fd)
         self.assertIn((4242, 15), killed)
         self.assertIn((4242, 9), killed)
+
+    def test_stale_campaign_restarts_the_unit_once_the_lock_frees(self):
+        campaign = self.runs / "c1"
+        campaign.mkdir()
+        manifest = campaign / "campaign.json"
+        manifest.write_text("{}", encoding="utf-8")
+        now = time.time()
+        os.utime(manifest, (now - 2000, now - 2000))
+        calls = []
+        env = {
+            "CTFY_PROJECT": str(self.project),
+            "CTFY_RUNS_ROOT": str(self.runs),
+            "CTFY_LOCK_FILE": str(self.root / "qualifier.lock"),
+            "CTFY_WINDOW_START": "0000",
+            "CTFY_WINDOW_END": "2359",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(watchdog, "find_play_pids", return_value=[]), \
+                mock.patch.object(watchdog, "lock_is_free", return_value=False):
+            self.assertEqual(watchdog.main(), 0)
+        self.assertEqual(calls, [])
+
+        calls = []
+        free_values = iter([False, True])
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(watchdog, "find_play_pids",
+                                  return_value=[4242]), \
+                mock.patch.object(watchdog, "lock_is_free",
+                                  side_effect=lambda lock: next(free_values)), \
+                mock.patch.object(watchdog, "lock_holders", return_value=[]), \
+                mock.patch.object(watchdog.time, "sleep"), \
+                mock.patch.object(watchdog.os, "kill"), \
+                mock.patch.object(watchdog.subprocess, "run",
+                                  side_effect=lambda argv, **kw: calls.append(argv)):
+            self.assertEqual(watchdog.main(), 0)
+        self.assertIn(["systemctl", "restart", "--no-block",
+                       "ctfy-qualifier.service"], calls)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,9 @@ def heartbeat_state(runs: Path, *, now: float, stale: int) -> str:
         return "fresh" if now - newest <= stale else "stale"
     manifests = list(runs.glob("*/campaign.json")) if runs.is_dir() else []
     if not manifests:
+        marker = runs / ".launch-start"
+        if marker.is_file() and now - marker.stat().st_mtime > stale:
+            return "stale"
         return "missing"
     oldest = min(path.stat().st_mtime for path in manifests)
     return "stale" if now - oldest > stale else "missing"
@@ -129,10 +132,10 @@ def main(argv=None) -> int:
     if state == "fresh":
         log("campaign healthy")
         return 0
-    if state == "missing":
+    if state != "stale":
         # A campaign that just started has not written its first heartbeat
         # yet; never kill it based on absence alone.
-        log("campaign starting (no heartbeat yet); leaving state alone")
+        log(f"campaign {state} (no proven hang); leaving state alone")
         return 0
 
     pids = find_play_pids(project)

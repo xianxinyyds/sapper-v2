@@ -25,6 +25,8 @@ if ! flock -n 9; then
   exit 0
 fi
 
+date +%s >"$PROJECT/runs/.launch-start"
+
 set -a
 . "$ENV_FILE"
 set +a
