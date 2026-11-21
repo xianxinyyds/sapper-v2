@@ -38,6 +38,10 @@ def text_message(text):
     return {"choices": [{"message": {"content": text}}]}
 
 
+def engine_content(message):
+    return load_engine()._content(message)
+
+
 class EngineTests(unittest.TestCase):
     def test_bare_gateway_url_gets_v1(self):
         engine = load_engine(LLM_BASE_URL="https://gateway.example")
@@ -137,6 +141,32 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(engine.main(), 0)
         finish.assert_called_once()
         self.assertIn("repeated", finish.call_args.args[1])
+
+    def test_reasoning_content_is_used_when_content_is_empty(self):
+        self.assertEqual(
+            engine_content({"content": "", "reasoning_content": '{"a": 1}'}),
+            '{"a": 1}',
+        )
+
+    def test_final_answer_requests_the_original_json_contract(self):
+        engine = load_engine()
+        captured = {}
+
+        def model(messages, *, tools=True):
+            if tools:
+                return tool_message(command="echo x")
+            captured["prompt"] = messages[-1]["content"]
+            return text_message('{"action": "work"}')
+
+        outs = io.StringIO()
+        with mock.patch.object(engine, "call_model", side_effect=model), \
+                mock.patch.object(engine, "run_tool", return_value="ok"), \
+                mock.patch.object(sys, "stdin", io.StringIO("return JSON")), \
+                redirect_stdout(outs):
+            self.assertEqual(engine.main(), 0)
+        self.assertIn("ONLY the single JSON object", captured["prompt"])
+        self.assertEqual(json.loads(outs.getvalue()),
+                         {"result": '{"action": "work"}'})
 
     def test_round_limit_ends_with_a_final_answer(self):
         engine = load_engine()

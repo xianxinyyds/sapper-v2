@@ -52,7 +52,7 @@ _MODEL_ERROR_RETRIES = 3
 _INFRA_ERROR_RETRIES = 3
 _BACKOFF_BASE = 10.0
 _MAX_BACKOFF = 60.0
-_DECISION_TIMEOUT = 120
+_DECISION_TIMEOUT = 300
 _DECISION_RESULT_FIELDS = (
     "challenge_id", "status", "work_dir", "instance_id", "attempt_minutes",
     "closed", "preserved", "target", "cancel_after_slice", "workers",

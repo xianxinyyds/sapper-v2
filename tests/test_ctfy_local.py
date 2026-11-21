@@ -376,6 +376,14 @@ class CtfyLocalRunTests(unittest.TestCase):
                 })])
                 self.assertNotIn("stop", [event[0] for event in client.events])
 
+    def test_docker_command_runs_the_solver_entrypoint_on_host_network(self):
+        command = ctfy_local._docker_command(self.args(), self.work)
+        joined = " ".join(command)
+        self.assertIn("--network host", joined)
+        self.assertIn(
+            "--entrypoint /usr/local/bin/sapper-entrypoint", joined)
+        self.assertEqual(command[-1], "sapper-ctfy:local-test")
+
     def test_structured_run_challenge_returns_result_handoff_and_events(self):
         client = FakeClient(challenge(is_qa_only=False), instance(status="starting"))
         events = []

@@ -202,6 +202,7 @@ def _docker_command(args, work_dir: Path) -> list[str]:
     command = [
         "docker", "run", "--rm", "--name", name,
         "--network", "host",
+        "--entrypoint", "/usr/local/bin/sapper-entrypoint",
         "--mount", f"type=bind,src={work_dir.resolve()},dst=/ctfy/work",
         "--mount", (
             f"type=bind,src={Path(__file__).resolve().parent},"
@@ -391,6 +392,16 @@ def run_challenge(args: argparse.Namespace, *, client: ctfy.CtfyClient | None = 
         })
         if engine is not None:
             env["SAPPER_BIN"] = "/ctfy/work/.ctfy-engine"
+        # The image's solver runs as uid 1000; host-created attempt files are
+        # root-owned, so hand the bind mount to the container user first.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            try:
+                subprocess.run(
+                    ["chown", "-R", "1000:1000", str(work_dir)],
+                    capture_output=True, timeout=30, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
         command = _docker_command(args, work_dir)
         container_name = command[command.index("--name") + 1]
         if on_event is not None:

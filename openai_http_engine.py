@@ -88,7 +88,13 @@ def _content(message):
     if isinstance(text, list):
         text = "".join(
             part.get("text", "") for part in text if isinstance(part, dict))
-    return text if isinstance(text, str) else ""
+    if not isinstance(text, str):
+        text = ""
+    if not text.strip():
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str):
+            text = reasoning
+    return text
 
 
 def _call_signature(calls):
@@ -106,14 +112,18 @@ def finish_without_tools(messages, reason):
     final_messages = list(messages) + [{
         "role": "user",
         "content": (
-            "Stop calling tools. Based on everything above, reply now with "
-            "your final answer as plain text. If the task is not solved, "
-            "state the current concrete status, the last useful output, and "
-            "the most promising next step."
+            "Stop calling tools. Return ONLY the single JSON object that the "
+            "original instructions require. No prose, no markdown fences, no "
+            "status summary. If the original instructions ask for a decision "
+            "or an intent, emit exactly that JSON now."
         ),
     }]
     data = call_model(final_messages, tools=False)
     text = _content(data["choices"][0]["message"]).strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
     if not text:
         text = (
             "The model produced no final text. Last status: tool loop "
